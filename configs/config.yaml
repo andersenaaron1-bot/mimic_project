@@ -1,0 +1,19 @@
+defaults:
+  - data: meds_mimic_iv
+  - tokenization: triplet # or eic, later -> custom
+  - train: base
+  - model: hier_mvp
+
+data:
+  root: ${oc.env:DATA_DIR, ./data}
+  num_workers: 4
+  batch_size: 8
+
+out:
+  dir: ${oc.env:OUT_DIR, ./outputs}
+
+trainer:
+  max_steps: 1000
+  eval_every: 200
+  ckpt_every: 200
+  seed: 7

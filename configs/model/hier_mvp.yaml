@@ -1,0 +1,8 @@
+d_model: 256
+n_heads: 8
+n_layers_l0: 4
+n_layers_l1: 2
+window: 128
+use_alibi: true
+use_rope: false
+global_tokens: 8

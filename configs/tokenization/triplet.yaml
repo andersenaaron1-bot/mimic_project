@@ -1,0 +1,12 @@
+tokenizer:
+  family: triplet
+  d_code: 256
+  d_time: 64
+  d_model: 512
+  value:
+    z_dim: 64
+    cvae_ckpt: /dss/dssfs04/PROJECT/checkpoints/value_cvae.pt
+    n_vars: ${data.vocab_size}      # or explicit integer
+    use_dt_prev: true
+    use_age: true
+    use_sex: true

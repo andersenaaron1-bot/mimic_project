@@ -1,0 +1,8 @@
+optimizer:
+  name: adamw
+  lr: 3e-4
+  weight_decay: 0.01
+scheduler:
+  name: cosine
+  warmup_steps: 200
+mixed_precision: bf16
