@@ -17,8 +17,8 @@ class ValueEventsDataset(IterableDataset):
       - value:   standardized numeric value (float)
       - var_id:  integer code id for the measurement variable
       - dt_prev: hours since previous event of the same var within subject (float)
-      - age:     subject age (float) if available, else 0.0
-      - sex:     1.0 for male / 0.0 otherwise (if available)
+      - age:     subject age in years at the event time (if derivable, else 0.0)
+      - sex:     1.0 for male / 0.0 otherwise (if derivable)
     """
     def __init__(
         self,
@@ -35,7 +35,7 @@ class ValueEventsDataset(IterableDataset):
             raise ImportError("meds_reader is not installed. `pip install meds_reader`")
 
         # open meds_reader database
-        self.db = mr.SubjectDatabase(meds_reader_db)  # API
+        self.db = mr.SubjectDatabase(meds_reader_db)
         self.include_code_fn = include_code_fn
         self.allowed_var_ids = allowed_var_ids
         self.shuffle_subjects = shuffle_subjects
@@ -75,29 +75,51 @@ class ValueEventsDataset(IterableDataset):
             self.code2id[code_str] = vid
         return vid
 
+    def _infer_sex_and_birth(self, subj) -> (float, Optional[float]):
+        """
+        Infer a subject-level sex (1.0 male / 0.0 otherwise) and a birth
+        timestamp (seconds since epoch) from meds_reader events.
+        """
+        sex_val = 0.0  # default: non-male
+        birth_ts = None
+
+        for ev in subj.events:
+            code_str = getattr(ev, "code", None)
+
+            # Sex encoded as code (e.g., "GENDER//M" / "GENDER//F")
+            if isinstance(code_str, str) and code_str.startswith("GENDER//"):
+                last = code_str.split("//")[-1].strip().upper()
+                if last.startswith("M"):
+                    sex_val = 1.0
+                elif last.startswith("F"):
+                    sex_val = 0.0
+
+            if birth_ts is None and isinstance(code_str, str) and code_str == "MEDS_BIRTH":
+                t = getattr(ev, "time", None)
+                if t is not None and hasattr(t, "timestamp"):
+                    birth_ts = t.timestamp()
+
+        return sex_val, birth_ts
+
     def _subject_iter(self, subj) -> Iterator[Dict[str, Any]]:
-        # meds_reader.Subject → has `.events` (already sorted by time, per MEDS spec)
+        """
+        Iterate over a meds_reader.Subject and yield per-event samples.
+
+        - subj.events is already sorted by time according to MEDS spec.
+        - sex is subject-level (from attribute or GENDER code).
+        - age is computed per-event from MEDS_BIRTH if possible.
+        """
         last_time_by_var: Dict[int, float] = {}
 
-        # age/sex from first event if present
-        age_val = 0.0
-        sex_val = 0.0
-        if len(subj.events) > 0:
-            e0 = subj.events[0]
-            age_attr = getattr(e0, "age_years", None)
-            sex_attr = getattr(e0, "sex", None)
-            age_val = float(age_attr) if isinstance(age_attr, (int, float)) else 0.0
-            if isinstance(sex_attr, str):
-                sex_val = 1.0 if sex_attr.strip().lower().startswith("m") else 0.0
+        # Subject-level sex + birth time
+        sex_val, birth_ts = self._infer_sex_and_birth(subj)
 
         for ev in subj.events:
             # time
             t = getattr(ev, "time", None)
-            if t is None:
+            if t is None or not hasattr(t, "timestamp"):
                 continue
-            # convert datetime→hours (float)
-            # use POSIX seconds for diffs; we only need deltas
-            t_secs = t.timestamp() if hasattr(t, "timestamp") else float("nan")
+            t_secs = t.timestamp()
             if not math.isfinite(t_secs):
                 continue
 
@@ -112,7 +134,7 @@ class ValueEventsDataset(IterableDataset):
             if self.allowed_var_ids is not None and var_id not in self.allowed_var_ids:
                 continue
 
-            # numeric value (MEDS optional property name is "numeric_value")
+            # numeric value
             v = getattr(ev, "numeric_value", None)
             if v is None or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
                 continue
@@ -124,7 +146,19 @@ class ValueEventsDataset(IterableDataset):
                 dt_prev = max(0.0, (t_secs - last_time_by_var[var_id]) / 3600.0)
             last_time_by_var[var_id] = t_secs
 
-            yield {"value": v, "var_id": var_id, "dt_prev": dt_prev, "age": age_val, "sex": sex_val}
+            # age in years at this event (if birth time known)
+            if birth_ts is not None:
+                age_years = max(0.0, (t_secs - birth_ts) / (3600.0 * 24.0 * 365.25))
+            else:
+                age_years = 0.0
+
+            yield {
+                "value": v,
+                "var_id": var_id,
+                "dt_prev": dt_prev,
+                "age": age_years,
+                "sex": sex_val,
+            }
 
     def __iter__(self):
         ids = list(self.subject_ids)
@@ -132,7 +166,6 @@ class ValueEventsDataset(IterableDataset):
             random.shuffle(ids)
         for sid in ids:
             subj = self.db[int(sid)]
-            # subj.events: Sequence[Event]
             yield from self._subject_iter(subj)
 
 
@@ -144,4 +177,3 @@ def collate_value_batch(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     sex = torch.tensor([b["sex"] for b in batch], dtype=torch.float32)
 
     return {"value": value, "var_id": var_id, "dt_prev": dt_prev, "age": age, "sex": sex}
-
