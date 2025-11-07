@@ -62,12 +62,12 @@ class ResidualVQ(nn.Module):
 
     def forward(
         self,
-        z: torch.Tensor,                                # [B, T, D]
-        restrict_ids: Optional[List[torch.Tensor]] = None  # list[L] of [N, K_top]
+        z: torch.Tensor,                                                     # [B, T, D]
+        restrict_ids: Optional[List[torch.Tensor]] = None                    # list[L] of [N, K_top]
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, Any]]:
         B, T, D = z.shape
         N = B * T
-        r = z.reshape(N, D)          # current residual
+        r = z.reshape(N, D)                                                  # current residual
         z_hat = torch.zeros_like(r)
 
         all_idx: List[torch.Tensor] = []

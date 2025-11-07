@@ -36,6 +36,7 @@ class ValueDiscretizer(nn.Module):
       - Per-level attention shortlist computed from the *current residual*.
       - Residual VQ with straight-through estimator.
       - Loss = VQ(codebook + beta*commit) + λ_soft * soft(residual) - λ_e * global-usage-entropy.
+
     Returns:
       indices: [B,T,L]  (discrete codes per level)
       z_hat:   [B,T,D]  (quantized reconstruction)
@@ -70,8 +71,11 @@ class ValueDiscretizer(nn.Module):
 
     def forward(self, z: torch.Tensor) -> Dict[str, Any]:
         """
-        z: [B,T,D] CVAE latent. (Detach upstream if CVAE is frozen.)
+        z: [B,T,D] CVAE latent. (CVAE should be frozen; we detach z here to be safe.)
         """
+        # make sure we never propagate gradients back into the CVAE
+        z = z.detach()
+
         # 1) Per-level shortlist from residuals + soft mixtures (q_soft_ℓ)
         topk_ids, soft_mix, attn_stats = self.attn(z)  # lists of length L
 
@@ -88,14 +92,20 @@ class ValueDiscretizer(nn.Module):
             r = r - q_soft
 
         # 4) Final loss: VQ + λ_soft * soft(residual) - λ_e * global-usage-entropy
-        loss = vq_loss \
-             + self.cfg.aux_soft_weight * soft_rec_loss \
-             - self.cfg.aux_entropy_weight * attn_stats["attn_entropy"]
+        loss = (
+            vq_loss
+            + self.cfg.aux_soft_weight * soft_rec_loss
+            - self.cfg.aux_entropy_weight * attn_stats["attn_entropy"]
+        )
 
         stats = {
             **rvq_stats,
-            # attn_entropy is differentiable; attn_entropy_det is safe for logging
-            **{k: (v.detach() if torch.is_tensor(v) else v) for k, v in attn_stats.items() if k != "attn_entropy"},
+            # attn_entropy is used in the loss above; here we store a detached copy for logging
+            **{
+                k: (v.detach() if torch.is_tensor(v) else v)
+                for k, v in attn_stats.items()
+                if k != "attn_entropy"
+            },
             "attn_entropy": attn_stats["attn_entropy"].detach(),
             "vq_loss": vq_loss.detach(),
             "soft_rec": soft_rec_loss.detach(),
@@ -103,18 +113,21 @@ class ValueDiscretizer(nn.Module):
         return {"indices": indices, "z_hat": z_hat, "loss": loss, "stats": stats}
 
 
-# ---- helpers to pack/unpack L indices into one value_state id (base-K) ----
+# ---- helpers to pack/unpack L indices into one value_state id (canonical base-K) ----
 
 def pack_rvq_indices(indices: torch.Tensor, K: int) -> torch.Tensor:
     """
     indices: [B,T,L] with digits in [0, K-1] (least significant at level 0)
     Returns: value_state [B,T] encoding base-K digits.
+
+    Representation:
+      value_state[b,t] = sum_{ℓ=0..L-1} indices[b,t,ℓ] * K^ℓ
     """
     assert indices.dtype in (torch.long, torch.int64)
-    L = indices.shape[-1]
+    B, T, L = indices.shape
     device = indices.device
-    base = torch.cumprod(torch.full((L,), K, device=device, dtype=torch.long), dim=0)
-    base[0] = 1
+    # base = [1, K, K^2, ...]
+    base = K ** torch.arange(L, device=device, dtype=torch.long)  # [L]
     return (indices * base.view(1, 1, L)).sum(dim=-1)  # [B,T]
 
 
@@ -122,9 +135,11 @@ def unpack_rvq_indices(value_state: torch.Tensor, L: int, K: int) -> torch.Tenso
     """
     value_state: [B,T] long
     Returns: indices: [B,T,L] with digits in [0, K-1] (least significant at level 0)
+
+    Inverse of pack_rvq_indices under the same K and L.
     """
     assert value_state.dtype in (torch.long, torch.int64)
     device = value_state.device
-    base = torch.cumprod(torch.full((L,), K, device=device, dtype=torch.long), dim=0)
-    base[0] = 1
-    return (value_state.unsqueeze(-1) // base.view(1, 1, L)) % K  # [B,T,L]
+    base = K ** torch.arange(L, device=device, dtype=torch.long)  # [L]
+    # shape: [B,T,L]
+    return (value_state.unsqueeze(-1) // base.view(1, 1, L)) % K
