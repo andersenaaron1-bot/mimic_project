@@ -5,7 +5,7 @@ import meds_reader as mr   # pip install meds_reader
 
 from .token_types import TokenTriplet, TokenCategory, SpecialToken
 from .event_router import classify_code_to_category
-from src.ehr_hier.tokenizers.base_encoder import EventTokenEncoder
+from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 
 
 def build_subject_timeline(

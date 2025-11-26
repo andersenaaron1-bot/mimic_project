@@ -19,7 +19,6 @@ class TokenCategory(IntEnum):
 class SpecialToken(IntEnum):
     """
     Global special tokens that live in the same vocabulary as everything else.
-    You’ll decide their actual IDs in your global vocab, but this is a common scheme.
     """
     PAD   = 0
     PT_CLS = 1   # patient/episode-level CLS token

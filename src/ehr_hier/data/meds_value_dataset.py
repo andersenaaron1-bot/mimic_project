@@ -4,6 +4,7 @@ import pandas as pd
 import torch
 from torch.utils.data import IterableDataset
 
+
 try:
     import meds_reader as mr  # pip install meds_reader
 except Exception:
@@ -26,9 +27,11 @@ class ValueEventsDataset(IterableDataset):
         split: Optional[str] = "train",       # "train"|"tuning"|"held_out"|None
         splits_parquet: Optional[str] = None, # path to MEDS metadata/subject_splits.parquet (recommended)
         codes_parquet: Optional[str] = None,  # path to MEDS metadata/codes.parquet (recommended)
+        strict_codes: bool = True,
         include_code_fn: Optional[Callable[[str], bool]] = None,
         allowed_var_ids: Optional[Set[int]] = None,
         shuffle_subjects: bool = True,
+        fixed_code2id: dict[str, int] | None = None,
     ):
         super().__init__()
         if mr is None:
@@ -39,6 +42,8 @@ class ValueEventsDataset(IterableDataset):
         self.include_code_fn = include_code_fn
         self.allowed_var_ids = allowed_var_ids
         self.shuffle_subjects = shuffle_subjects
+        self.strict_codes = strict_codes
+        self.codes_parquet = codes_parquet
 
         # subject split filtering (recommended)
         self.subject_ids = list(self.db)  # iterable of subject_ids
@@ -54,7 +59,11 @@ class ValueEventsDataset(IterableDataset):
                 self.subject_ids = [sid for sid in self.subject_ids if int(sid) in keep]
 
         # code → id mapping (for stable integer var_ids)
-        self.code2id: Dict[str, int] = {}
+        self.strict_codes = strict_codes
+        if fixed_code2id is not None:
+            self.code2id = dict(fixed_code2id)  # freeze
+        else:
+            self.code2id: Dict[str, int] = {}
         if codes_parquet is not None and pathlib.Path(codes_parquet).exists():
             df_codes = pd.read_parquet(codes_parquet)
             code_col = "code" if "code" in df_codes.columns else "text"
@@ -71,6 +80,10 @@ class ValueEventsDataset(IterableDataset):
     def _get_var_id(self, code_str: str) -> int:
         vid = self.code2id.get(code_str)
         if vid is None:
+            if self.strict_codes:
+                # unknown code → skip by signaling 0 (caller should ignore)
+                return 0
+            # else: dynamically grow (demo mode)
             vid = len(self.code2id) + 1
             self.code2id[code_str] = vid
         return vid
@@ -130,15 +143,19 @@ class ValueEventsDataset(IterableDataset):
             if self.include_code_fn is not None and not self.include_code_fn(code_str):
                 continue
 
-            var_id = self._get_var_id(str(code_str))
-            if self.allowed_var_ids is not None and var_id not in self.allowed_var_ids:
-                continue
-
             # numeric value
             v = getattr(ev, "numeric_value", None)
             if v is None or not isinstance(v, (int, float)) or not math.isfinite(float(v)):
                 continue
             v = float(v)
+
+            var_id = self._get_var_id(str(code_str))
+            if var_id <= 0:
+                continue  # unknown code when strict
+            if self.allowed_var_ids is not None and var_id not in self.allowed_var_ids:
+                continue
+
+
 
             # delta-time since previous same var (in hours)
             dt_prev = 0.0
@@ -177,3 +194,5 @@ def collate_value_batch(batch: List[Dict[str, Any]]) -> Dict[str, torch.Tensor]:
     sex = torch.tensor([b["sex"] for b in batch], dtype=torch.float32)
 
     return {"value": value, "var_id": var_id, "dt_prev": dt_prev, "age": age, "sex": sex}
+
+

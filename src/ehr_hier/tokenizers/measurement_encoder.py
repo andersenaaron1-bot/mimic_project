@@ -2,125 +2,89 @@ from dataclasses import dataclass
 from typing import Dict, Any, List, Optional
 from datetime import datetime
 import math
-
 import torch
 import torch.nn as nn
 
 from src.ehr_hier.models.value_encoders.cvae import ValueCVAE, ValueCVAEConfig
 from src.ehr_hier.tokenizers.value_tokenizer import (
-    ValueDiscretizer,
-    TokenizerConfig,
-    pack_rvq_indices,
+    ValueDiscretizer, TokenizerConfig, pack_rvq_indices,
 )
 from src.ehr_hier.data.token_types import TokenTriplet, TokenCategory
 
 
 @dataclass
 class MeasurementEncoderConfig:
-    """
-    Config for measurement → value token encoding.
-    """
     cvae_ckpt: str
     tokenizer_ckpt: str
-
-    # dimensions / codebook
-    z_dim: int = 64
-    num_codebooks: int = 2     # L
-    codebook_size: int = 256   # K
-
-    # var vocabulary size and mapping
-    n_vars: int = 200000
-
-    # per-var normalization (same as used for CVAE training)
-    mean_by_var: torch.Tensor = None   # shape [max_var_id+1]
-    std_by_var: torch.Tensor = None    # shape [max_var_id+1]
-
-    # code → var_id mapping (string MEDS code → integer var_id)
-    code2id: Dict[str, int] = None
-
-    # global token vocab offset for measurement value tokens
-    # e.g. if you reserve 0–999 for specials & other types,
-    # you can start measurement value tokens at 1000.
+    # per-var normalization (same artifact used in training)
+    mean_by_var: torch.Tensor
+    std_by_var: torch.Tensor
+    # frozen mapping (same as training)
+    code2id: Dict[str, int]
+    # global vocab layout
     value_token_offset: int = 0
 
-    # how to interpret sex
+    # normalization hyperparams (match training)
+    value_clip: float = 8.0
+    max_dt_prev_hours: float = 24.0 * 7 * 4   # 4 weeks
+    max_age_years: float = 100.0
     male_prefix: str = "m"
 
 
 class MeasurementTokenEncoder(nn.Module):
-    """
-    Event-level encoder for MEDS measurement events.
-
-    For each measurement event with a numeric_value:
-      - standardizes value using per-var mean/std,
-      - computes z via frozen cVAE encoder,
-      - discretizes z via frozen ValueDiscretizer (RVQ),
-      - packs RVQ indices into a single value_state id in [0, K^L-1],
-      - maps to a global token id: value_token_offset + (1 + value_state),
-      - returns a single TokenTriplet with category=MEASUREMENT.
-
-    dt_hours (time since previous emitted token) is supplied from outside
-    (timeline builder); CVAE’s dt_prev (time since previous same-variable
-    measurement) is tracked internally per subject.
-    """
     category: TokenCategory = TokenCategory.MEASUREMENT
 
     def __init__(self, cfg: MeasurementEncoderConfig):
         super().__init__()
         self.cfg = cfg
 
-        assert cfg.mean_by_var is not None and cfg.std_by_var is not None, \
-            "mean_by_var and std_by_var must be provided"
-        assert cfg.code2id is not None, "code2id mapping must be provided"
+        assert cfg.mean_by_var is not None and cfg.std_by_var is not None
+        assert isinstance(cfg.code2id, dict) and len(cfg.code2id) > 0
 
-        # register normalization as buffers so they move with .to(device)
+        # register stats as buffers so .to(device) works
         self.register_buffer("mean_by_var", cfg.mean_by_var.float())
         self.register_buffer("std_by_var", cfg.std_by_var.float())
 
-        # simple Python dict is fine for code2id; we don't register as buffer
         self.code2id: Dict[str, int] = cfg.code2id
 
-        # ---- load frozen cVAE ----
-        cvae_cfg = ValueCVAEConfig(
-            z_dim=cfg.z_dim,
-            var_emb_dim=64,
-            hidden=128,
-            use_dt_prev=True,
-            use_age=True,
-            use_sex=True,
-        )
-        self.cvae = ValueCVAE(n_vars=cfg.n_vars, cfg=cvae_cfg)
-        ckpt = torch.load(cfg.cvae_ckpt, map_location="cpu")
-        self.cvae.load_state_dict(ckpt["state_dict"], strict=False)
+        # ---- load cVAE exactly as trained ----
+        cvae_ckpt = torch.load(cfg.cvae_ckpt, map_location="cpu")
+        if "cfg" in cvae_ckpt:
+            cvae_cfg = ValueCVAEConfig(**cvae_ckpt["cfg"])
+        else:
+            # last resort; better to always save cfg in ckpt
+            raise ValueError("cVAE checkpoint missing cfg; please save training cfg into ckpt")
+
+        # n_vars must match checkpoint var_emb
+        n_vars_ckpt = cvae_ckpt["state_dict"]["var_emb.weight"].shape[0]
+        self.cvae = ValueCVAE(n_vars=n_vars_ckpt, cfg=cvae_cfg)
+        self.cvae.load_state_dict(cvae_ckpt["state_dict"], strict=True)
         self.cvae.eval()
         for p in self.cvae.parameters():
             p.requires_grad = False
 
-        # ---- load frozen tokenizer (RVQ) ----
+        # ---- load tokenizer (RVQ) exactly as trained ----
         tok_ckpt = torch.load(cfg.tokenizer_ckpt, map_location="cpu")
-        tcfg = TokenizerConfig(
-            d_val=cfg.z_dim,
-            num_codebooks=cfg.num_codebooks,
-            codebook_size=cfg.codebook_size,
-            beta_commit=tok_ckpt.get("cfg", {}).get("beta_commit", 0.25),
-            attn_topk=tok_ckpt.get("cfg", {}).get("attn_topk", 8),
-            attn_temp=tok_ckpt.get("cfg", {}).get("attn_temp", 0.5),
-            aux_soft_weight=tok_ckpt.get("cfg", {}).get("aux_soft_weight", 0.05),
-            aux_entropy_weight=tok_ckpt.get("cfg", {}).get("aux_entropy_weight", 0.01),
-        )
-        self.tokenizer = ValueDiscretizer(tcfg)
-        self.tokenizer.load_state_dict(tok_ckpt["state_dict"], strict=False)
+        if "cfg" in tok_ckpt:
+            tok_cfg = TokenizerConfig(**tok_ckpt["cfg"])
+        else:
+            # fallback if older tokenizer ckpt
+            tok_cfg = TokenizerConfig(d_val=cvae_cfg.z_dim)
+        self.tokenizer = ValueDiscretizer(tok_cfg)
+        self.tokenizer.load_state_dict(tok_ckpt["state_dict"], strict=True)
         self.tokenizer.eval()
         for p in self.tokenizer.parameters():
             p.requires_grad = False
 
-        # internal state for dt_prev per var (per subject)
+        # per-subject dt_prev state
         self._last_time_by_var: Dict[int, datetime] = {}
 
+        # precompute K^L for range checks (optional)
+        self._K = self.tokenizer.cfg.codebook_size
+        self._L = self.tokenizer.cfg.num_codebooks
+        self._KpowL = self._K ** self._L
+
     def reset_state(self):
-        """
-        Call this at the start of each subject to reset dt_prev tracking.
-        """
         self._last_time_by_var.clear()
 
     @torch.no_grad()
@@ -128,48 +92,51 @@ class MeasurementTokenEncoder(nn.Module):
         if not isinstance(t, datetime):
             return 0.0
         prev = self._last_time_by_var.get(var_id)
-        if prev is None:
-            dt_prev = 0.0
-        else:
-            dt_prev = max(0.0, (t - prev).total_seconds() / 3600.0)
+        dt = 0.0 if prev is None else max(0.0, (t - prev).total_seconds() / 3600.0)
         self._last_time_by_var[var_id] = t
-        return dt_prev
+        return dt
 
     @torch.no_grad()
-    def _standardize_value(self, value: float, var_id: int) -> float:
-        if var_id < 0 or var_id >= self.mean_by_var.shape[0]:
+    def _value_z(self, v_raw: float, var_id: int) -> float:
+        # safe indexing
+        if var_id <= 0 or var_id >= self.mean_by_var.shape[0]:
             return 0.0
         m = float(self.mean_by_var[var_id].item())
         s = float(self.std_by_var[var_id].item())
         if not math.isfinite(s) or s <= 0.0:
             s = 1.0
-        return (float(value) - m) / s
+        z = (float(v_raw) - m) / s
+        # clip exactly like training
+        z = max(-self.cfg.value_clip, min(self.cfg.value_clip, z))
+        return z
+
+    @torch.no_grad()
+    def _norm_dt_prev(self, dt_hours: float) -> float:
+        h = max(0.0, min(float(dt_hours), self.cfg.max_dt_prev_hours))
+        return math.log1p(h)
+
+    @torch.no_grad()
+    def _norm_age(self, age_years: Optional[float]) -> float:
+        if age_years is None or not math.isfinite(float(age_years)):
+            return 0.0
+        a = max(0.0, min(float(age_years), self.cfg.max_age_years))
+        return a / self.cfg.max_age_years
+
+    @torch.no_grad()
+    def _norm_sex(self, sex_attr: Optional[str]) -> float:
+        if not isinstance(sex_attr, str):
+            return 0.0
+        return 1.0 if sex_attr.strip().lower().startswith(self.cfg.male_prefix) else 0.0
 
     @torch.no_grad()
     def encode_event(self, ev: Any, dt_hours: float) -> List[TokenTriplet]:
-        """
-        Encode a single MEDS measurement event into one TokenTriplet.
-
-        ev   : meds_reader Event (or wrapper) with attributes:
-                 - code (str)
-                 - numeric_value (float)
-                 - time (datetime)
-                 - age_years (optional)
-                 - sex (optional, 'M'/'F' etc)
-        dt_hours : time since previous emitted token (for transformer time embedding).
-
-        Returns:
-          [] if this event has no usable numeric_value or code mapping,
-          or [TokenTriplet] for a valid measurement.
-        """
         code = getattr(ev, "code", None)
         if code is None:
             return []
 
-        code_str = str(code)
-        var_id = self.code2id.get(code_str)
-        if var_id is None:
-            # unknown code → skip
+        var_id = self.code2id.get(str(code))
+        if var_id is None or var_id <= 0:
+            # unknown measurement code under strict mapping → skip
             return []
 
         v_raw = getattr(ev, "numeric_value", None)
@@ -182,53 +149,41 @@ class MeasurementTokenEncoder(nn.Module):
         if not math.isfinite(v_raw):
             return []
 
-        # standardize using precomputed mean/std
-        v_std = self._standardize_value(v_raw, var_id)
+        zval = self._value_z(v_raw, var_id)
 
-        # dt_prev for CVAE conditioning (time since previous same-var event)
         t_ev = getattr(ev, "time", None)
         dt_prev = self._compute_dt_prev(var_id, t_ev)
+        dt_prev_n = self._norm_dt_prev(dt_prev)
 
-        # optional age/sex for conditioning
-        age_attr = getattr(ev, "age_years", None)
-        sex_attr = getattr(ev, "sex", None)
-
-        age = float(age_attr) if isinstance(age_attr, (int, float)) else 0.0
-        sex = 0.0
-        if isinstance(sex_attr, str):
-            sex = 1.0 if sex_attr.strip().lower().startswith(self.cfg.male_prefix) else 0.0
+        age_n = self._norm_age(getattr(ev, "age_years", None))
+        sex_n = self._norm_sex(getattr(ev, "sex", None))
 
         device = next(self.cvae.parameters()).device
-
-        # prepare single-sample tensors [B=1, T=1]
-        value_std = torch.tensor([[v_std]], dtype=torch.float32, device=device)
+        # shape [1, 1] for each field to match encode_mu’s flattening
+        value_std = torch.tensor([[zval]], dtype=torch.float32, device=device)
         var_id_t  = torch.tensor([[var_id]], dtype=torch.long, device=device)
-        dt_prev_t = torch.tensor([[dt_prev]], dtype=torch.float32, device=device)
-        age_t     = torch.tensor([[age]], dtype=torch.float32, device=device)
-        sex_t     = torch.tensor([[sex]], dtype=torch.float32, device=device)
+        dt_prev_t = torch.tensor([[dt_prev_n]], dtype=torch.float32, device=device)
+        age_t     = torch.tensor([[age_n]], dtype=torch.float32, device=device)
+        sex_t     = torch.tensor([[sex_n]], dtype=torch.float32, device=device)
 
-        # latent z via frozen cVAE encoder
         z = self.cvae.encode_mu(
             value_std=value_std,
             var_id=var_id_t,
             dt_prev=dt_prev_t,
             age=age_t,
             sex=sex_t,
-        )  # [1,1,z_dim]
+        )  # [1,1,D]
 
-        # discretize z via tokenizer
-        out = self.tokenizer(z)  # {'indices': [1,1,L], ...}
-        indices = out["indices"]           # [1,1,L]
-        vs = pack_rvq_indices(indices, K=self.cfg.codebook_size)  # [1,1]
-        value_state = int(vs[0, 0].item())  # 0 .. K^L-1
+        out = self.tokenizer(z)                       # indices: [1,1,L]
+        vs = pack_rvq_indices(out["indices"], self._K)  # [1,1] in [0..K^L-1]
+        value_state = int(vs[0, 0].item())
+        # final measurement token id (reserve 0 at value-state level for PAD)
+        value_state_id = 1 + value_state              # [1..K^L]
+        assert 1 <= value_state_id <= self._KpowL, "value_state_id out of range"
 
-        # map to global token id for measurements
-        # 0 is reserved for PAD at value_state level, so we use 1+value_state
-        value_state_id = 1 + value_state
-        global_token_id = self.cfg.value_token_offset + value_state_id
-
+        token_id = self.cfg.value_token_offset + value_state_id
         triplet = TokenTriplet(
-            value_id=global_token_id,
+            value_id=token_id,
             category_id=int(TokenCategory.MEASUREMENT),
             dt_hours=float(dt_hours),
         )
