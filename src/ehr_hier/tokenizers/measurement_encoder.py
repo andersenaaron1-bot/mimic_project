@@ -7,9 +7,9 @@ import torch.nn as nn
 
 from src.ehr_hier.models.value_encoders.cvae import ValueCVAE, ValueCVAEConfig
 from src.ehr_hier.tokenizers.value_tokenizer import (
-    ValueDiscretizer, TokenizerConfig, pack_rvq_indices,
+    ValueDiscretizer, TokenizerConfig,
 )
-from src.ehr_hier.data.token_types import TokenTriplet, TokenCategory
+from src.ehr_hier.data.token_types import EventToken, TokenCategory
 
 
 @dataclass
@@ -22,7 +22,10 @@ class MeasurementEncoderConfig:
     # frozen mapping (same as training)
     code2id: Dict[str, int]
     # global vocab layout
-    value_token_offset: int = 0
+    value_token_offset: int = 0  # legacy (used as RVQ base if rvq_token_offset not set)
+    code_token_offset: int = 900  # rough default from SCHEMA_TOKENS
+    rvq_token_offset: int = 100   # rough default from SCHEMA_TOKENS
+    rvq_codebook_stride: Optional[int] = None
 
     # normalization hyperparams (match training)
     value_clip: float = 8.0
@@ -129,7 +132,7 @@ class MeasurementTokenEncoder(nn.Module):
         return 1.0 if sex_attr.strip().lower().startswith(self.cfg.male_prefix) else 0.0
 
     @torch.no_grad()
-    def encode_event(self, ev: Any, dt_hours: float) -> List[TokenTriplet]:
+    def encode_event(self, ev: Any, dt_hours: float) -> List[EventToken]:
         code = getattr(ev, "code", None)
         if code is None:
             return []
@@ -175,16 +178,35 @@ class MeasurementTokenEncoder(nn.Module):
         )  # [1,1,D]
 
         out = self.tokenizer(z)                       # indices: [1,1,L]
-        vs = pack_rvq_indices(out["indices"], self._K)  # [1,1] in [0..K^L-1]
-        value_state = int(vs[0, 0].item())
-        # final measurement token id (reserve 0 at value-state level for PAD)
-        value_state_id = 1 + value_state              # [1..K^L]
-        assert 1 <= value_state_id <= self._KpowL, "value_state_id out of range"
+        indices = out["indices"][0, 0]                # [L]
 
-        token_id = self.cfg.value_token_offset + value_state_id
-        triplet = TokenTriplet(
-            value_id=token_id,
-            category_id=int(TokenCategory.MEASUREMENT),
-            dt_hours=float(dt_hours),
-        )
-        return [triplet]
+        # Token 0: code token for the measurement variable
+        code_token_id = self.cfg.code_token_offset + int(var_id)
+        tokens: List[EventToken] = [
+            EventToken(
+                value_id=code_token_id,
+                category_id=int(TokenCategory.MEASUREMENT),
+                t_from_start_hours=0.0,
+                dt_from_prev_hours=float(dt_hours),
+                cat_attrs={"var_id": int(var_id)},
+                num_attrs={"z": float(zval)},
+            )
+        ]
+
+        # Tokens 1..L: one per RVQ codebook
+        stride = self.cfg.rvq_codebook_stride or self._K
+        rvq_base = self.cfg.rvq_token_offset if self.cfg.rvq_token_offset is not None else self.cfg.value_token_offset
+        for i, idx in enumerate(indices):
+            token_id = rvq_base + i * stride + int(idx.item())
+            tokens.append(
+                EventToken(
+                    value_id=token_id,
+                    category_id=int(TokenCategory.MEASUREMENT),
+                    t_from_start_hours=0.0,
+                    dt_from_prev_hours=0.0,
+                    cat_attrs={"var_id": int(var_id), "codebook": i},
+                    num_attrs={},
+                )
+            )
+
+        return tokens

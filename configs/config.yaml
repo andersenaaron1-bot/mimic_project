@@ -17,3 +17,10 @@ trainer:
   eval_every: 200
   ckpt_every: 200
   seed: 7
+
+structural_events:
+  map_path: ${oc.env:STRUCT_EVENT_MAP}
+  top_k: 50
+  percentile: 0.9
+  window_hook: window_boundary
+  attach_med_numeric: true

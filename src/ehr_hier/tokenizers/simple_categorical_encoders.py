@@ -1,59 +1,35 @@
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Dict, List, Optional, Iterable, Set
-from collections import OrderedDict
+from typing import Dict, List, Optional, Set
 
-from src.ehr_hier.data.token_types import TokenTriplet, TokenCategory
-
-
-@dataclass
-class CategoryVocab:
-    """
-    A tiny per-category codebook living in a reserved global ID range.
-
-    Global ID = offset + index
-      - index=1 is reserved for <UNK>
-      - known codes start at index=2
-    """
-    offset: int
-    codes2idx: Dict[str, int]           # must NOT include index 1; we add UNK
-    unk_token: str = "<UNK>"
-    unk_index: int = 1
-
-    def with_unk(self) -> "CategoryVocab":
-        if self.unk_token in self.codes2idx:
-            return self
-        # shift nothing; we assume user began indexing at 2
-        merged = OrderedDict([(self.unk_token, self.unk_index)])
-        merged.update(self.codes2idx)
-        self.codes2idx = merged
-        return self
-
-    def encode(self, code: Optional[str]) -> int:
-        idx = self.codes2idx.get(str(code), self.unk_index)
-        return self.offset + idx
+from src.ehr_hier.data.token_types import EventToken, TokenCategory
+from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 
 
 class SimpleCategoricalEncoder:
     """
     Minimal EventTokenEncoder for non-measurement categories.
     Emits ONE token per event; unknown codes map to category-specific UNK.
-
-    Use distinct offsets per category to avoid clashes with measurement tokens.
     """
     def __init__(self, category: TokenCategory, vocab: CategoryVocab):
         self.category = category
-        self.vocab = vocab.with_unk()
+        self.vocab = vocab
 
     def reset_state(self) -> None:
         return None  # stateless
 
-    def encode_event(self, ev, dt_hours: float) -> List[TokenTriplet]:
+    def encode_event(self, ev, dt_hours: float) -> List[EventToken]:
         code = getattr(ev, "code", None)
         gid = self.vocab.encode(code)
-        return [TokenTriplet(value_id=gid,
-                             category_id=int(self.category),
-                             dt_hours=float(dt_hours))]
+        return [
+            EventToken(
+                value_id=gid,
+                category_id=int(self.category),
+                t_from_start_hours=0.0,
+                dt_from_prev_hours=float(dt_hours),
+                cat_attrs={},
+                num_attrs={},
+            )
+        ]
 
 
 class OtherNoOpEncoder:
@@ -62,16 +38,21 @@ class OtherNoOpEncoder:
     Helpful when you want counts but no tokens.
     """
     category = TokenCategory.OTHER
+
     def reset_state(self) -> None:
         return None
-    def encode_event(self, ev, dt_hours: float) -> List[TokenTriplet]:
+
+    def encode_event(self, ev, dt_hours: float) -> List[EventToken]:
         return []
 
 
-# src/ehr_hier/tokenizers/simple_categorical_encoders.py (append)
-
-import meds_reader as mr
+# Optional helper when scanning a meds_reader DB ---------------------------
+try:
+    import meds_reader as mr  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    mr = None
 from src.ehr_hier.data.event_router import classify_code_to_category
+
 
 def build_category_vocab_from_db(
     db: mr.SubjectDatabase,
@@ -80,9 +61,11 @@ def build_category_vocab_from_db(
     max_codes: int = 5000,
 ) -> CategoryVocab:
     """
-    Quick & deterministic: collect up to max_codes codes of a category
-    by scanning the DB once, assign indices starting at 2, UNK=1.
+    Quick & deterministic: collect up to max_codes codes of a category,
+    assign indices starting at 1 (reserve 0 for UNK).
     """
+    if mr is None:
+        raise ImportError("meds_reader is required to build category vocab from DB")
     seen: Set[str] = set()
     for sid in db:
         for ev in db[int(sid)].events:
@@ -97,7 +80,11 @@ def build_category_vocab_from_db(
         if len(seen) >= max_codes:
             break
 
-    # stable order
     codes_sorted = sorted(seen)
-    codes2idx = {c: i + 2 for i, c in enumerate(codes_sorted)}  # start at 2
-    return CategoryVocab(offset=offset, codes2idx=codes2idx).with_unk()
+    code2id: Dict[str, int] = {c: i + 1 for i, c in enumerate(codes_sorted)}
+    code2id["<UNK>"] = 0
+    return CategoryVocab(
+        name=target_category.name.lower(),
+        offset=offset,
+        code2id=code2id,
+    )

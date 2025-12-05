@@ -1,0 +1,36 @@
+structural_map:
+  # --- VENTILATION ---
+  "224385": "STRUCT_START_MECH"   # Intubation
+  "227194": "STRUCT_END_MECH"     # Extubation
+
+  # --- RRT / DIALYSIS ---
+  "225802": "STRUCT_START_RRT"    # Dialysis Cath Placed
+  "225441": "STRUCT_START_RRT"    # Hemodialysis Procedure
+  "225803": "STRUCT_END_RRT"      # Dialysis Cath Out
+
+  # --- SHOCK / VASOPRESSORS (Start triggers window) ---
+  "221906": "STRUCT_START_SHOCK"  # Norepinephrine
+  "221289": "STRUCT_START_SHOCK"  # Epinephrine
+  "221749": "STRUCT_START_SHOCK"  # Phenylephrine
+
+  # --- SURGERY ---
+  "225402": "STRUCT_START_REC"    # OR Received (Recovery start)
+
+  # --- ADMISSION ---
+  "ADMISSION": "STRUCT_START_ADM"
+  "DISCHARGE": "STRUCT_END_ADM"
+
+structural_only:
+  - "224385"
+  - "227194"
+  - "225802"
+  - "225441"
+  - "225803"
+
+keep_original:
+  - "221906"
+  - "221289"
+  - "221749"
+  - "225402"
+  - "ADMISSION"
+  - "DISCHARGE"

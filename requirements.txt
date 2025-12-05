@@ -18,3 +18,7 @@ duckdb>=1.1.0
 scikit-learn>=1.5.0
 mlflow>=2.16.0
 wandb>=0.17.0
+
+meds_reader~=0.1.14
+huggingface-hub~=0.35.3
+pytest~=8.4.2

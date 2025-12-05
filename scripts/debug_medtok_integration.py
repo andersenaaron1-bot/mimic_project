@@ -5,14 +5,14 @@ from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
 from src.ehr_hier.tokenizers.measurement_encoder import MeasurementEncoderConfig
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
-from src.ehr_hier.tokenizers.simple_categorical_encoders import CategoryVocab
+from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 
 DB = r"C:\MedsDemo_reader"   # your meds_reader db
 
 def main():
     db = mr.SubjectDatabase(DB)
     # --- stub vocabs for non-diagnosis categories (map everything to UNK)
-    empty_vocab = CategoryVocab(offset=2_000_000, mapping={}).with_unk()
+    empty_vocab = CategoryVocab(name="placeholder", offset=2_000_000, code2id={"<UNK>": 0})
 
     # --- measurement encoder config you already trained
     meas_cfg = MeasurementEncoderConfig(
