@@ -10,8 +10,8 @@ from transformer.loss import AETLossModule
 from transformer.collator import AETHierarchicalCollator
 
 
-# from data.dataset import MEDSDataset  <-- Your Dataset Class
-# from data.vocabulary import GlobalVocabulary <-- Your Vocab Class
+# from data.dataset import MEDSDataset
+# from data.vocabulary import GlobalVocabulary
 
 # --- Configuration ---
 class TrainConfig:
@@ -33,7 +33,7 @@ class TrainConfig:
     log_interval = 100
     save_path = "./checkpoints"
 
-    # Vocab Config (Must match your GlobalVocabulary offsets)
+    # Vocab Config (Must match GlobalVocabulary offsets)
     vocab_config = {
         'total_size': 400000,
         'size_special': 1000,
@@ -101,9 +101,6 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, scal
             'lr': f"{current_lr:.2e}"
         })
 
-        # Optional: Log to WandB
-        # if step % TrainConfig.log_interval == 0:
-        #     wandb.log(loss_logs | {"total_loss": loss.item()})
 
     return total_loss / len(dataloader)
 
@@ -153,7 +150,7 @@ def main():
 
     # --- MOCK DATA LOADER (For Testing the Loop) ---
     print("WARNING: Using Mock Data. Uncomment real data loading above.")
-    from aet.collator import AETHierarchicalCollator  # Just for class ref
+    from transformer.collator import AETHierarchicalCollator  # Just for class ref
     train_loader = [
         {
             'input_ids': torch.randint(0, 400000, (32, 4, 128)),
