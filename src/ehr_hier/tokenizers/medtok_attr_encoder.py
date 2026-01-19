@@ -1,4 +1,5 @@
 from __future__ import annotations
+import re
 from typing import Dict, List, Any, Optional, Iterable, Callable
 
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
@@ -35,19 +36,57 @@ class MedTokenWithAttrsEncoder:
         self.fallback_to_raw = fallback_to_raw
         self.unk_gid = self.base_vocab.offset + self.base_vocab.unk_id
         self._cache: Dict[str, Optional[int]] = {}
+        # START/END/STOP markers from MEDS-style medication/infusion/procedure events
+        self._marker_attr = "event_marker"
+        self._marker_to_id = {"START": 1, "END": 2, "STOP": 3}
 
     def reset_state(self) -> None:
         return None  # stateless
 
-    def _candidate_codes(self, raw_code: Optional[str]) -> List[str]:
+    def _strip_marker(self, raw_code: Optional[str]) -> tuple[Optional[str], Optional[str]]:
+        """
+        Remove MEDS-style start/stop markers while remembering the marker type.
+        Examples:
+            MEDICATION//START//FUROSEMIDE   -> (MEDICATION//FUROSEMIDE, START)
+            INFUSION_END//225158            -> (INFUSION//225158, END)
+            PROCEDURE//STOP//XYZ            -> (PROCEDURE//XYZ, STOP)
+        """
         if raw_code is None:
+            return None, None
+        s = str(raw_code)
+        upper = s.upper()
+
+        # Prefix forms
+        if upper.startswith("INFUSION_START//"):
+            suffix = s[len("INFUSION_START//") :]
+            return f"INFUSION//{suffix}", "START"
+        if upper.startswith("INFUSION_END//"):
+            suffix = s[len("INFUSION_END//") :]
+            return f"INFUSION//{suffix}", "END"
+
+        # Infix markers
+        for marker in ("//START//", "//END//", "//STOP//"):
+            if marker in upper:
+                # strip marker in a case-insensitive way
+                pattern = re.compile(re.escape(marker), re.IGNORECASE)
+                base = pattern.sub("//", s, count=1)
+                label = marker.strip("/").upper()
+                return base, label
+        return s, None
+
+    def _candidate_codes(self, base_code: Optional[str], raw_code: Optional[str]) -> List[str]:
+        if base_code is None and raw_code is None:
             return []
         candidates: List[str] = []
+        canon_input = base_code if base_code is not None else raw_code
         if self.canonicalize_fn:
-            canonicalized = self.canonicalize_fn(raw_code)
+            canonicalized = self.canonicalize_fn(canon_input)
             candidates.extend(ensure_list(canonicalized))
         if self.fallback_to_raw:
-            candidates.append(str(raw_code))
+            if canon_input is not None:
+                candidates.append(str(canon_input))
+            if raw_code is not None and raw_code != canon_input:
+                candidates.append(str(raw_code))
         # dedupe while preserving order
         seen = set()
         uniq = []
@@ -58,15 +97,15 @@ class MedTokenWithAttrsEncoder:
             seen.add(c)
         return uniq
 
-    def _encode_base(self, raw_code: Optional[str]) -> Optional[int]:
-        if raw_code is None:
+    def _encode_base(self, base_code: Optional[str], raw_code: Optional[str]) -> Optional[int]:
+        if base_code is None and raw_code is None:
             return None if self.drop_unknowns else self.unk_gid
 
         cache_key = str(raw_code)
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for cand in self._candidate_codes(raw_code):
+        for cand in self._candidate_codes(base_code, raw_code):
             gid = self.base_vocab.maybe_encode(cand)
             if gid is not None:
                 self._cache[cache_key] = gid
@@ -94,14 +133,15 @@ class MedTokenWithAttrsEncoder:
         return num_attrs
 
     def encode_event(self, ev: Any, dt_hours: float) -> List[EventToken]:
-        code = getattr(ev, "code", None)
-        base_gid = self._encode_base(code)
+        raw_code = getattr(ev, "code", None)
+        base_code, marker = self._strip_marker(raw_code)
+        base_gid = self._encode_base(base_code, raw_code)
         if base_gid is None:
             return []
         cat_attrs = self._encode_categorical_attrs(ev)
         num_attrs = self._encode_numeric_attrs(ev)
 
-        return [
+        tokens = [
             EventToken(
                 value_id=base_gid,
                 category_id=int(self.category),
@@ -111,3 +151,18 @@ class MedTokenWithAttrsEncoder:
                 num_attrs=num_attrs,
             )
         ]
+
+        if marker in self._marker_to_id:
+            marker_id = self._marker_to_id[marker]
+            tokens.append(
+                EventToken(
+                    value_id=self.unk_gid,  # generic marker token in the same category band
+                    category_id=int(self.category),
+                    t_from_start_hours=0.0,
+                    dt_from_prev_hours=0.0,  # immediately after base token
+                    cat_attrs={self._marker_attr: marker_id},
+                    num_attrs={},
+                )
+            )
+
+        return tokens

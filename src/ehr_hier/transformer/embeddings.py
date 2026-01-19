@@ -10,41 +10,27 @@ class ContinuousRotaryPositionalEmbedding(nn.Module):
     this uses continuous time values (0.0, 0.5, 12.2...) to drive the rotation.
     """
 
-    def __init__(self, d_model, max_period=10000.0):
+    def __init__(self, dim: int, max_period: float = 10000.0):
         super().__init__()
-        self.d_model = d_model
-        self.d_head = d_model // 2  # RoPE usually applied to half the dim or pairs
+        assert dim % 2 == 0, "RoPE dimension must be even"
+        self.dim = dim
 
-        # Precompute frequencies: 1 / (10000 ^ (2i / d))
-        # We only compute half because sin/cos pairs share frequency
-        dim_t = torch.arange(0, self.d_model, 2, dtype=torch.float32)
-        inv_freq = 1.0 / (max_period ** (dim_t / self.d_model))
+        dim_t = torch.arange(0, dim, 2, dtype=torch.float32)
+        inv_freq = 1.0 / (max_period ** (dim_t / dim))
         self.register_buffer("inv_freq", inv_freq)
 
-    def forward(self, x, times):
+    def forward(self, x: torch.Tensor, times: torch.Tensor) -> torch.Tensor:
         """
         Args:
-            x: Query or Key tensor of shape (Batch, Seq_Len, Dim)
-            times: Float tensor of shape (Batch, Seq_Len) representing cumulative time.
+            x: Query or Key tensor of shape (Batch*, Seq, Dim)
+            times: Float tensor of shape (Batch*, Seq) representing cumulative time.
         """
-        # 1. Compute angles: time * freq
-        # times: (B, S), inv_freq: (D/2) -> (B, S, D/2)
-        sinusoid_inp = torch.einsum("bs,d->bsd", times, self.inv_freq)
-
-        # 2. Create sin/cos
-        sin = sinusoid_inp.sin()
-        cos = sinusoid_inp.cos()
-
-        # 3. Repeat to match full dimension (D) instead of (D/2)
-        # We interleave: [sin1, sin1, sin2, sin2...] to match the rotation logic
-        sin = torch.repeat_interleave(sin, 2, dim=-1)
-        cos = torch.repeat_interleave(cos, 2, dim=-1)
-
-        # 4. Apply rotation
+        sinusoid_inp = torch.einsum("bs,d->bsd", times, self.inv_freq)  # (B*, S, D/2)
+        sin = torch.repeat_interleave(sinusoid_inp.sin(), 2, dim=-1)
+        cos = torch.repeat_interleave(sinusoid_inp.cos(), 2, dim=-1)
         return (x * cos) + (self._rotate_half(x) * sin)
 
-    def _rotate_half(self, x):
-        """Rotates half the hidden dims of the input."""
+    def _rotate_half(self, x: torch.Tensor) -> torch.Tensor:
         x1 = x[..., 0::2]
         x2 = x[..., 1::2]
         return torch.cat((-x2, x1), dim=-1)
@@ -56,9 +42,24 @@ class AETEmbeddings(nn.Module):
     Fuses the discrete Token Identity with the continuous Numeric Side-Channel.
     """
 
-    def __init__(self, vocab_size, d_model, dropout=0.1):
+    def __init__(
+        self,
+        vocab_size: int,
+        d_model: int,
+        dropout: float = 0.1,
+        *,
+        num_window_types: int = 0,
+        special_type_id: int = 0,
+        exclude_special_from_window_type: bool = True,
+    ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
+
+        self.special_type_id = int(special_type_id)
+        self.exclude_special_from_window_type = bool(exclude_special_from_window_type)
+        self.window_type_embedding = (
+            nn.Embedding(int(num_window_types), d_model) if int(num_window_types) > 0 else None
+        )
 
         # Side-Channel Encoder
         # Projects scalar "value" (e.g., log1p dosage) to vector space
@@ -70,12 +71,14 @@ class AETEmbeddings(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input_ids, numeric_values):
+    def forward(self, input_ids, numeric_values, *, window_type_ids=None, token_type_ids=None):
         """
         Args:
             input_ids: (Batch, Seq) LongTensor
             numeric_values: (Batch, Seq, 1) FloatTensor.
                             Note: Must be 0.0 for tokens without values!
+            window_type_ids: Optional (Batch, Num_Windows) LongTensor of per-window type ids.
+            token_type_ids: Optional (Batch, Num_Windows, Seq) LongTensor of TokenCategory ids.
         """
         # 1. Embed Identity
         x = self.token_embedding(input_ids)
@@ -89,6 +92,15 @@ class AETEmbeddings(nn.Module):
         # For tokens where value=0, val_emb should be close to 0 vector (due to Linear bias init)
         # Ideally, Linear bias should be 0 init, or use Masking if strict 0 is needed.
         x = x + val_emb
+
+        # 4. Window type segment embedding (optional)
+        if self.window_type_embedding is not None and window_type_ids is not None:
+            win_emb = self.window_type_embedding(window_type_ids).unsqueeze(2)  # (B, W, 1, D)
+            if self.exclude_special_from_window_type and token_type_ids is not None:
+                mask = (token_type_ids != self.special_type_id).unsqueeze(-1)  # (B, W, L, 1)
+                x = x + win_emb * mask
+            else:
+                x = x + win_emb
 
         x = self.layer_norm(x)
         x = self.dropout(x)

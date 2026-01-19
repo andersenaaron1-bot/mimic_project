@@ -44,6 +44,7 @@ class TrainConfig:
         'offsets': {
             'SPECIAL': 0,
             'RVQ': 1000,
+            'MEAS': 10000,
             'MED': 30000
         }
     }
@@ -70,7 +71,10 @@ def train_one_epoch(model, dataloader, optimizer, criterion, device, epoch, scal
                 time_ids=inputs['time_ids'],
                 numeric_values=inputs['numeric_values'],
                 token_type_ids=inputs['token_type_ids'],
-                attention_mask=inputs['attention_mask']
+                attention_mask=inputs['attention_mask'],
+                window_start_times=inputs.get('window_start_times', None),
+                window_mask=inputs.get('window_mask', None),
+                window_type_ids=inputs.get('window_type_ids', None),
                 # prev_global_state=None (Assuming independent segments for now)
             )
 
@@ -119,7 +123,10 @@ def validate(model, dataloader, criterion, device):
                     time_ids=inputs['time_ids'],
                     numeric_values=inputs['numeric_values'],
                     token_type_ids=inputs['token_type_ids'],
-                    attention_mask=inputs['attention_mask']
+                    attention_mask=inputs['attention_mask'],
+                    window_start_times=inputs.get('window_start_times', None),
+                    window_mask=inputs.get('window_mask', None),
+                    window_type_ids=inputs.get('window_type_ids', None),
                 )
                 loss, _ = criterion(head_outputs, inputs)
 
@@ -168,8 +175,8 @@ def main():
 
     # 3. Initialize Loss
     # Define custom weights if needed (e.g., Structure is 5x more important)
-    loss_weights = {'struct': 5.0, 'rvq': 1.0, 'med': 1.0, 'val': 1.0}
-    criterion = AETLossModule(vocab_offsets=TrainConfig.vocab_config['offsets'], weights=loss_weights).to(device)
+    loss_weights = {'struct': 5.0, 'rvq': 1.0, 'meas': 1.0, 'med': 1.0, 'val': 1.0}
+    criterion = AETLossModule(vocab_config=TrainConfig.vocab_config, weights=loss_weights).to(device)
 
     # 4. Optimizer
     # Separate weight decay for embeddings/weights vs biases/layernorms

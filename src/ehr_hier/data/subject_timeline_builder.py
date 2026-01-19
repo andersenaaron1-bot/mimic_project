@@ -8,6 +8,28 @@ from .token_types import EventToken, TokenCategory
 from .event_router import classify_code_to_category
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 from src.ehr_hier.data.structural_codes import StructuralCodebook
+from src.ehr_hier.data.demographics import (
+    infer_subject_sex,
+    infer_birth_timestamp,
+    infer_event_age_years,
+)
+
+
+class _EventWithDemographics:
+    """
+    Lightweight view over a meds_reader event that injects per-event demographics.
+    Encoders can access `age_years` and `sex` without relying on the raw event schema.
+    """
+
+    __slots__ = ("_ev", "age_years", "sex")
+
+    def __init__(self, ev: object, *, age_years: float, sex: float) -> None:
+        self._ev = ev
+        self.age_years = float(age_years)
+        self.sex = float(sex)
+
+    def __getattr__(self, name: str):
+        return getattr(self._ev, name)
 
 
 def build_subject_timeline(
@@ -47,7 +69,10 @@ def build_subject_timeline(
     structural_codebook : Optional[StructuralCodebook]
         Optional codebook to force structural tokens for specific codes. Codes listed
         in structural_only will skip medtok tokens; codes listed in keep_original will
-        also emit their original category tokens.
+        also emit their original category tokens. If the codebook specifies
+        boundary_labels/boundary_codes, only those structural tokens will carry
+        window hooks (i.e., create new windows); the remainder act as in-window
+        overlay markers.
 
     Returns
     -------
@@ -56,6 +81,10 @@ def build_subject_timeline(
     """
     subj = db[int(subject_id)]
     events = list(subj.events)  # already time-sorted per MEDS spec
+
+    # Subject-level demographics used by the measurement value tokenizer (CVAE conditions).
+    sex_val = infer_subject_sex(events, default=0.0)
+    birth_ts = infer_birth_timestamp(events)
 
     # establish timeline start (earliest event timestamp if present)
     timeline_start: Optional[datetime] = None
@@ -132,12 +161,16 @@ def build_subject_timeline(
     last_emitted_time: Optional[datetime] = None
 
     for ev in events:
-        code = getattr(ev, "code", None)
+        # Wrap raw event with per-event demographics for downstream encoders.
+        age_years = infer_event_age_years(ev, birth_ts=birth_ts)
+        ev_view = _EventWithDemographics(ev, age_years=age_years, sex=sex_val)
+
+        code = getattr(ev_view, "code", None)
         code_str = str(code) if code is not None else None
         category = classify_code_to_category(code)
         encoder = encoders.get(category)
 
-        t = getattr(ev, "time", None)
+        t = getattr(ev_view, "time", None)
         # dt relative to previous emitted token with a timestamp
         dt_hours = 0.0
         if isinstance(t, datetime) and isinstance(last_emitted_time, datetime):
@@ -150,15 +183,16 @@ def build_subject_timeline(
             label = structural_codebook.code2label.get(code_str, "")
             label_id = struct_label2id.get(label, 0)
             val_id = struct_offset + label_id
+            is_boundary = bool(window_hook_label) and structural_codebook.is_window_boundary(code=code_str, label=label)
             struct_tok = EventToken(
                 value_id=val_id,
                 category_id=int(TokenCategory.STRUCTURAL),
                 t_from_start_hours=_t_from_start_hours(t) if isinstance(t, datetime) else 0.0,
                 dt_from_prev_hours=dt_hours,
-                cat_attrs={"struct_label_id": label_id} if label_id else {},
+                cat_attrs={"struct_label_id": int(label_id)},
                 num_attrs={},
                 raw_time=t if isinstance(t, datetime) else None,
-                window_hook=window_hook_label,
+                window_hook=window_hook_label if is_boundary else None,
             )
             emitted_for_event.append(struct_tok)
 
@@ -178,7 +212,7 @@ def build_subject_timeline(
             continue
 
         # Encoders may return multiple tokens for a single event (e.g., MEDTOK)
-        event_tokens = encoder.encode_event(ev, dt_hours=dt_hours)
+        event_tokens = encoder.encode_event(ev_view, dt_hours=dt_hours)
         should_hook = (
             bool(window_hook_label)
             and code_str is not None

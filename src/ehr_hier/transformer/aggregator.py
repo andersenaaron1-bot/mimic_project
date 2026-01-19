@@ -52,6 +52,7 @@ class AETGlobalAggregator(nn.Module):
             x = layer(x, window_times, padding_mask)
 
         x = self.norm(x)
+        x = x * padding_mask.unsqueeze(-1)
 
         return x
 

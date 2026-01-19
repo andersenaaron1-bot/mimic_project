@@ -4,7 +4,7 @@ import pytest
 from types import SimpleNamespace
 from typing import Dict, List
 
-from src.ehr_hier.data.structural_codes import StructuralCodebook
+from src.ehr_hier.data.structural_codes import StructuralCodebook, load_structural_codebook_yaml
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
@@ -135,3 +135,96 @@ def test_structural_codebook_inserts_token_and_splits_dt():
     assert proc_tok.dt_from_prev_hours == 0.0  # dt consumed by structural token
     assert struct_tok.value_id == struct_vocab.offset + codebook.label2id()["or_procedure"]
     assert proc_tok.t_from_start_hours == pytest.approx(0.0)
+
+
+def test_structural_codebook_can_emit_overlay_without_window_hook():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [
+        SimpleNamespace(code="EVT_BOUNDARY", time=t0),
+        SimpleNamespace(code="EVT_OVERLAY", time=t0 + timedelta(hours=1)),
+    ]
+    db = DummyDB({1: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0})
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    codebook = StructuralCodebook(
+        code2label={
+            "EVT_BOUNDARY": "STRUCT_START_ADM",
+            "EVT_OVERLAY": "STRUCT_START_MECH",
+        },
+        boundary_labels={"STRUCT_START_ADM"},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=1,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        structural_codebook=codebook,
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 2
+    boundary_tok, overlay_tok = tokens
+    assert boundary_tok.window_hook == "episode"
+    assert overlay_tok.window_hook is None
+    # Ensure struct_label_id is present even when it's 0.
+    assert boundary_tok.cat_attrs.get("struct_label_id") == codebook.label2id()["STRUCT_START_ADM"]
+    assert overlay_tok.cat_attrs.get("struct_label_id") == codebook.label2id()["STRUCT_START_MECH"]
+
+
+def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifiers(tmp_path):
+    yaml_fp = tmp_path / "structural_codes.yaml"
+    yaml_fp.write_text(
+        "\n".join(
+            [
+                "structural_map:",
+                "  EVT_BOUNDARY: STRUCT_START_ADM",
+                "window_boundary_labels:",
+                "  - STRUCT_START_ADM",
+                "soft_signifiers:",
+                "  - CPR_EVENT",
+            ]
+        ),
+        encoding="utf-8",
+    )
+
+    codebook = load_structural_codebook_yaml(str(yaml_fp))
+    assert codebook.code2label["EVT_BOUNDARY"] == "STRUCT_START_ADM"
+    assert codebook.boundary_labels == {"STRUCT_START_ADM"}
+    assert codebook.code2label["CPR_EVENT"].startswith("SOFT::")
+
+
+def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():
+    t_birth = datetime(2000, 1, 1, 0, 0, 0)
+    t_meas = datetime(2020, 1, 1, 0, 0, 0)
+    events = [
+        # MEDS demographic conventions used by ValueEventsDataset
+        SimpleNamespace(code="MEDS_BIRTH", time=t_birth),
+        SimpleNamespace(code="GENDER//M", time=t_birth),
+        # Actual measurement event
+        SimpleNamespace(code="LAB//GLUCOSE", time=t_meas),
+    ]
+    db = DummyDB({3: DummySubject(events)})
+
+    class CaptureEncoder(DummyEncoder):
+        def __init__(self):
+            super().__init__(TokenCategory.MEASUREMENT, 123)
+            self.seen = []
+
+        def encode_event(self, ev, dt_hours: float):
+            self.seen.append((getattr(ev, "age_years", None), getattr(ev, "sex", None)))
+            return super().encode_event(ev, dt_hours)
+
+    meas_enc = CaptureEncoder()
+
+    _ = build_subject_timeline(
+        db,
+        subject_id=3,
+        encoders={TokenCategory.MEASUREMENT: meas_enc},
+    )
+
+    assert len(meas_enc.seen) == 1
+    age_years, sex = meas_enc.seen[0]
+    assert sex == pytest.approx(1.0)
+    assert age_years == pytest.approx(20.0, rel=1e-6)

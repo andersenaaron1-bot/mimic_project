@@ -179,7 +179,6 @@ def main():
     print("mapping size:", len(code2id))
     print("split:", args.split, "splits_parquet:", args.splits_parquet)
 
-    # Optional: spot check a few codes exist in the mapping
     for i, k in enumerate(list(code2id.keys())[:5]):
         print("map sample:", i, k, "->", code2id[k])
 
@@ -191,7 +190,7 @@ def main():
         codes_parquet=None,
         shuffle_subjects=False,
         fixed_code2id=code2id,
-        strict_codes=False,
+        strict_codes=True,
     )
     ds = ValueEventsDataset(
         meds_reader_db=args.meds_reader_db,
@@ -200,7 +199,7 @@ def main():
         codes_parquet=None,
         shuffle_subjects=True,
         fixed_code2id=code2id,
-        strict_codes=False,
+        strict_codes=True,
     )
     print(f"subjects in split: {len(ds.subject_ids)}")
 

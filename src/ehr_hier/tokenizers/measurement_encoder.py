@@ -126,10 +126,25 @@ class MeasurementTokenEncoder(nn.Module):
         return a / self.cfg.max_age_years
 
     @torch.no_grad()
-    def _norm_sex(self, sex_attr: Optional[str]) -> float:
-        if not isinstance(sex_attr, str):
+    def _norm_sex(self, sex_attr: Optional[object]) -> float:
+        if sex_attr is None:
             return 0.0
-        return 1.0 if sex_attr.strip().lower().startswith(self.cfg.male_prefix) else 0.0
+
+        # Training pipeline uses numeric {0,1}; accept that at inference too.
+        if isinstance(sex_attr, (bool, int, float)):
+            try:
+                v = float(sex_attr)
+            except (TypeError, ValueError):
+                return 0.0
+            if not math.isfinite(v):
+                return 0.0
+            return 1.0 if v >= 0.5 else 0.0
+
+        if isinstance(sex_attr, str):
+            s = sex_attr.strip().lower()
+            return 1.0 if s.startswith(self.cfg.male_prefix) else 0.0
+
+        return 0.0
 
     @torch.no_grad()
     def encode_event(self, ev: Any, dt_hours: float) -> List[EventToken]:

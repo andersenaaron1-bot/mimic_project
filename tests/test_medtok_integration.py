@@ -278,3 +278,52 @@ def test_medtok_metadata_bundle(monkeypatch, tiny_vocabs):
     # Unknown attr fallback: values missing in vocab land on UNK id and 0.0 norm
     assert second.cat_attrs["freq"] == med_attr_vocabs["freq"].encode("QD")
     assert second.num_attrs["dosage"] == pytest.approx(med_numeric_attrs["dosage"].normalize(5.0))
+
+
+def test_medtok_start_stop_markers(monkeypatch, tiny_vocabs):
+    diag_vocab, proc_vocab, med_vocab, struct_vocab, med_attr_vocabs, med_numeric_attrs = tiny_vocabs
+
+    # Patch measurement encoder out
+    monkeypatch.setattr(meas_mod, "MeasurementTokenEncoder", DummyMeasurementEncoder)
+    import src.ehr_hier.tokenizers.base_encoder as base_enc
+    monkeypatch.setattr(base_enc, "MeasurementTokenEncoder", DummyMeasurementEncoder)
+
+    encoders = build_base_encoders(
+        meas_cfg=SimpleNamespace(),
+        diag_vocab=diag_vocab,
+        proc_vocab=proc_vocab,
+        med_vocab=med_vocab,
+        struct_vocab=struct_vocab,
+        med_attr_vocabs=None,
+        med_numeric_attrs=None,
+    )
+
+    start = dt.datetime(2024, 1, 1, 0, 0, 0)
+    events = [
+        FakeEvent("MEDICATION//START//NDC//00000-0000", start),
+        FakeEvent("MEDICATION//STOP//NDC//00000-0000", start + dt.timedelta(hours=2)),
+    ]
+    db = FakeDB({7: FakeSubject(events)})
+
+    tokens = build_subject_timeline(db, subject_id=7, encoders=encoders)
+
+    # Two tokens per event: base med + marker
+    assert len(tokens) == 4
+    assert all(t.category_id == int(TokenCategory.MEDICATION) for t in tokens)
+
+    base_id = med_vocab.offset + med_vocab.code2id["NDC//00000-0000"]
+    marker_id = med_vocab.offset + med_vocab.unk_id
+
+    # First event
+    assert tokens[0].value_id == base_id
+    assert tokens[0].dt_from_prev_hours == 0.0
+    assert tokens[1].value_id == marker_id
+    assert tokens[1].dt_from_prev_hours == 0.0
+    assert tokens[1].cat_attrs.get("event_marker") == 1  # START
+
+    # Second event (dt progresses)
+    assert tokens[2].value_id == base_id
+    assert tokens[2].dt_from_prev_hours == 2.0
+    assert tokens[3].value_id == marker_id
+    assert tokens[3].dt_from_prev_hours == 0.0
+    assert tokens[3].cat_attrs.get("event_marker") == 3  # STOP

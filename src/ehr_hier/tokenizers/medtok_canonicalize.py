@@ -95,7 +95,8 @@ def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
     """
     if code is None:
         return []
-    s = str(code).upper()
+    raw = str(code)
+    s = raw.upper()
     # MEDS-style prefixes: PROCEDURE//ICD//9//<code>, PROCEDURE//ICD//10//<code>, PROCEDURE//CPT//<code>
     if s.startswith("PROCEDURE//ICD//9//"):
         icd9 = s.split("//")[-1]
@@ -109,6 +110,9 @@ def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
         return [f"CPT//{cpt}", cpt]
 
     cands: List[str] = []
+    # Drop leading PROCEDURE// if present to allow regex matches
+    if s.startswith("PROCEDURE//"):
+        s = s.split("//", 1)[1]
     m = _ICD10PCS_RE.search(s)
     if m:
         pcs = m.group(1)
@@ -146,8 +150,21 @@ def canonicalize_medication_code(code: Optional[str]) -> List[str]:
     """
     if code is None:
         return []
-    s = str(code).upper()
+    raw = str(code)
+    s = raw.upper()
     cands: List[str] = []
+
+    # If MEDICATION/INFUSION prefixes are present, peel them to focus on the core token.
+    # Handle forms like MEDICATION//START//INSULIN, INFUSION//225158, MEDICATION//NDC//0000-0000.
+    core = raw
+    parts = raw.split("//")
+    if parts and parts[0].upper() in {"MEDICATION", "INFUSION"}:
+        tail_parts = [p for p in parts[1:] if p and p.upper() not in {"START", "END", "STOP"}]
+        if tail_parts:
+            core = tail_parts[-1]
+        else:
+            core = parts[-1]
+    core_upper = str(core).upper()
 
     m = _RXNORM_RE.search(s)
     if m:
@@ -167,12 +184,23 @@ def canonicalize_medication_code(code: Optional[str]) -> List[str]:
             ]
         )
 
-    # As a fallback, capture standalone numeric codes that might be RxNorm
+    # As a fallback, capture standalone numeric codes that might be RxNorm (favor core token)
+    if not cands:
+        m = _NUMERIC_RE.search(core_upper)
+        if m:
+            num = m.group(1)
+            cands.extend([f"RXNORM//{num}", num])
     if not cands:
         m = _NUMERIC_RE.search(s)
         if m:
             num = m.group(1)
             cands.extend([f"RXNORM//{num}", num])
+
+    # Also try the core token itself (name or code) before the raw string
+    if core and core not in cands:
+        cands.append(str(core))
+    if raw and raw not in cands:
+        cands.append(str(raw))
 
     return list(dict.fromkeys(cands))
 

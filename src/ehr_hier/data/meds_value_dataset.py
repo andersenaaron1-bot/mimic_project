@@ -4,6 +4,12 @@ import pandas as pd
 import torch
 from torch.utils.data import IterableDataset
 
+from src.ehr_hier.data.demographics import (
+    infer_subject_sex,
+    infer_birth_timestamp,
+    infer_event_age_years,
+)
+
 
 try:
     import meds_reader as mr  # pip install meds_reader
@@ -61,10 +67,10 @@ class ValueEventsDataset(IterableDataset):
         # code → id mapping (for stable integer var_ids)
         self.strict_codes = strict_codes
         if fixed_code2id is not None:
-            self.code2id = dict(fixed_code2id)  # freeze
-        else:
-            self.code2id: Dict[str, int] = {}
-        if codes_parquet is not None and pathlib.Path(codes_parquet).exists():
+            # Frozen mapping (preferred): keep exactly what was used to train the cVAE.
+            self.code2id = dict(fixed_code2id)
+        elif codes_parquet is not None and pathlib.Path(codes_parquet).exists():
+            # Fallback: build mapping from MEDS metadata/codes.parquet.
             df_codes = pd.read_parquet(codes_parquet)
             code_col = "code" if "code" in df_codes.columns else "text"
             id_col = "code_id" if "code_id" in df_codes.columns else None
@@ -90,28 +96,13 @@ class ValueEventsDataset(IterableDataset):
 
     def _infer_sex_and_birth(self, subj) -> (float, Optional[float]):
         """
-        Infer a subject-level sex (1.0 male / 0.0 otherwise) and a birth
-        timestamp (seconds since epoch) from meds_reader events.
+        Infer subject-level sex (1.0 male / 0.0 otherwise) and birth timestamp
+        (seconds since epoch) using MEDS conventions, with fallbacks for
+        alternative event schemas.
         """
-        sex_val = 0.0  # default: non-male
-        birth_ts = None
-
-        for ev in subj.events:
-            code_str = getattr(ev, "code", None)
-
-            # Sex encoded as code (e.g., "GENDER//M" / "GENDER//F")
-            if isinstance(code_str, str) and code_str.startswith("GENDER//"):
-                last = code_str.split("//")[-1].strip().upper()
-                if last.startswith("M"):
-                    sex_val = 1.0
-                elif last.startswith("F"):
-                    sex_val = 0.0
-
-            if birth_ts is None and isinstance(code_str, str) and code_str == "MEDS_BIRTH":
-                t = getattr(ev, "time", None)
-                if t is not None and hasattr(t, "timestamp"):
-                    birth_ts = t.timestamp()
-
+        events = getattr(subj, "events", [])
+        sex_val = infer_subject_sex(events, default=0.0)
+        birth_ts = infer_birth_timestamp(events)
         return sex_val, birth_ts
 
     def _subject_iter(self, subj) -> Iterator[Dict[str, Any]]:
@@ -164,10 +155,7 @@ class ValueEventsDataset(IterableDataset):
             last_time_by_var[var_id] = t_secs
 
             # age in years at this event (if birth time known)
-            if birth_ts is not None:
-                age_years = max(0.0, (t_secs - birth_ts) / (3600.0 * 24.0 * 365.25))
-            else:
-                age_years = 0.0
+            age_years = infer_event_age_years(ev, birth_ts=birth_ts)
 
             yield {
                 "value": v,
