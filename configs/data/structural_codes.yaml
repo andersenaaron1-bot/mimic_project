@@ -50,7 +50,6 @@ window_boundary_labels:
   - "STRUCT_END_OR"
   - "STRUCT_END_ADM"
 
-# Optional: ensure these rare-but-critical events emit structural markers.
 soft_signifiers:
   - "CPR_EVENT"
   - "DEFIB_EVENT"

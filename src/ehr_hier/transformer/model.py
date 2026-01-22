@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from .embeddings import AETEmbeddings, ContinuousRotaryPositionalEmbedding
 from .encoder import AETLocalEncoder
@@ -16,6 +17,17 @@ class AdaptiveEpisodicTransformer(nn.Module):
         """
         super().__init__()
         self.config = config
+        self.vocab_config = dict(vocab_config)
+
+        window_markers_cfg = dict(self.vocab_config.get("window_markers", {}) or {})
+        self.window_marker_type_offset = int(window_markers_cfg.get("type_token_offset", 0))
+        self.window_marker_num_types = int(window_markers_cfg.get("num_types", 0))
+        self.window_marker_end_token_id = window_markers_cfg.get("end_token_id", None)
+        self.window_marker_end_mode = str(window_markers_cfg.get("end_mode", "end_token"))
+
+        offsets_cfg = dict(self.vocab_config.get("offsets", {}) or {})
+        self.special_token_offset = int(offsets_cfg.get("SPECIAL", 0))
+        self.size_special = int(self.vocab_config.get("size_special", 0))
 
         num_window_types = int(
             getattr(
@@ -25,6 +37,8 @@ class AdaptiveEpisodicTransformer(nn.Module):
             )
         )
         self.num_window_types = max(0, num_window_types)
+        if self.window_marker_num_types <= 0:
+            self.window_marker_num_types = self.num_window_types
 
         # 1. The Time Engine (Shared cRoPE)
         # We share it because Time is Time, whether Local or Global.
@@ -57,9 +71,35 @@ class AdaptiveEpisodicTransformer(nn.Module):
             nn.Linear(config.d_model, self.num_window_types) if self.num_window_types > 0 else None
         )
 
+        # 5c. Aux Head: Predict window duration/density from (history + current type).
+        self.window_len_head = (
+            nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 2),
+            )
+            if bool(getattr(config, "enable_window_len_head", False))
+            else None
+        )
+        self.window_type_control_embedding = (
+            nn.Embedding(self.num_window_types, config.d_model) if self.num_window_types > 0 else None
+        )
+
+        # 5d. Global→Local transition bias (optional).
+        # This biases the logits of window-transition marker tokens (WIN_END or WIN_<TYPE>)
+        # based on predicted window duration/density and next-window-type prior.
+        self.enable_transition_bias = bool(getattr(config, "enable_transition_bias", False))
+        self.transition_prior_scale = nn.Parameter(torch.tensor(1.0))
+        self.transition_hazard_scale = nn.Parameter(torch.tensor(1.0))
+
         # 6. Global-to-Local Projection (Optional but recommended)
         # Helps adapt the global context before adding it to local tokens
         self.context_adapter = nn.Linear(config.d_model, config.d_model)
+        self.global_fusion_mode = str(getattr(config, "global_fusion_mode", "add")).lower()
+        if self.global_fusion_mode not in {"add", "film"}:
+            raise ValueError(f"Unsupported global_fusion_mode={self.global_fusion_mode!r}; expected 'add' or 'film'.")
+        self.exclude_special_from_global_fusion = bool(getattr(config, "exclude_special_from_global_fusion", False))
+        self.context_film = nn.Linear(config.d_model, 2 * config.d_model) if self.global_fusion_mode == "film" else None
 
     def forward(
             self,
@@ -127,7 +167,18 @@ class AdaptiveEpisodicTransformer(nn.Module):
             shifted_context[:, 1:, :] = global_context[:, :-1, :]
 
         # Late fusion: condition all token predictions in window[w] on context up to w-1.
-        fused_representation = local_hidden + shifted_context.unsqueeze(2)
+        if self.global_fusion_mode == "film" and self.context_film is not None:
+            gamma_beta = self.context_film(shifted_context)  # (B,W,2D)
+            gamma, beta = gamma_beta.chunk(2, dim=-1)
+            gamma = torch.tanh(gamma)
+            fused_representation = local_hidden * (1.0 + gamma.unsqueeze(2)) + beta.unsqueeze(2)
+        else:
+            fused_representation = local_hidden + shifted_context.unsqueeze(2)
+
+        if self.exclude_special_from_global_fusion and token_type_ids is not None:
+            mask = (token_type_ids != int(getattr(self.config, "special_type_id", 0))).unsqueeze(-1)
+            fused_representation = torch.where(mask, fused_representation, local_hidden)
+
         fused_representation = fused_representation * attention_mask.unsqueeze(-1)
 
         # --- PHASE 4: Prediction Heads ---
@@ -135,6 +186,76 @@ class AdaptiveEpisodicTransformer(nn.Module):
         logits_dict = self.heads(fused_representation)
         if self.next_window_type_head is not None:
             logits_dict["logits_next_window_type"] = self.next_window_type_head(global_states)  # (B, W, K)
+
+        # --- PHASE 4b: Duration/Density prediction + transition bias (optional) ---
+        if self.window_len_head is not None:
+            control_ctx = shifted_context
+            if window_type_ids is not None and self.window_type_control_embedding is not None:
+                safe_ids = window_type_ids.clamp(min=0, max=max(0, self.num_window_types - 1))
+                control_ctx = control_ctx + self.window_type_control_embedding(safe_ids)
+
+            raw = self.window_len_head(control_ctx)  # (B, W, 2)
+            # Positive window length priors
+            pred_len_tokens = F.softplus(raw[..., 0]) + 1.0
+            pred_len_hours = F.softplus(raw[..., 1]) + 0.25
+            logits_dict["pred_window_len_tokens"] = pred_len_tokens  # (B, W)
+            logits_dict["pred_window_len_hours"] = pred_len_hours  # (B, W)
+
+        if self.enable_transition_bias and self.size_special > 0:
+            # Compute hazard bias if length head is available; otherwise keep hazard at 0.
+            if self.window_len_head is not None and "pred_window_len_tokens" in logits_dict and "pred_window_len_hours" in logits_dict:
+                pred_len_tokens = logits_dict["pred_window_len_tokens"]  # (B, W)
+                pred_len_hours = logits_dict["pred_window_len_hours"]  # (B, W)
+
+                content_mask = attention_mask.to(dtype=torch.bool)
+                # Exclude SPECIAL (e.g. summaries, window markers) from length/density counting.
+                if token_type_ids is not None:
+                    content_mask = content_mask & (token_type_ids != int(getattr(self.config, "special_type_id", 0)))
+
+                pos = torch.cumsum(content_mask.to(dtype=torch.float32), dim=2)  # (B, W, L)
+                t_rel = time_ids.clamp(min=0.0)  # (B, W, L), hours since window start
+
+                eps = 1e-6
+                prog_tokens = pos / (pred_len_tokens.unsqueeze(-1) + eps)
+                prog_time = t_rel / (pred_len_hours.unsqueeze(-1) + eps)
+                prog = 0.5 * (prog_tokens + prog_time)
+
+                hazard_logit = self.transition_hazard_scale * (prog - 1.0)  # (B, W, L)
+            else:
+                hazard_logit = time_ids.new_zeros((B, W, L))
+
+            logits_struct = logits_dict.get("logits_struct", None)
+            if logits_struct is not None:
+                # Determine which marker tokens to bias.
+                end_mode = self.window_marker_end_mode
+                if end_mode == "next_type" and self.window_marker_num_types > 0 and self.next_window_type_head is not None:
+                    # Bias WIN_<TYPE> token logits (encouraging a transition to a particular next type).
+                    K = int(self.window_marker_num_types)
+                    # Map WIN_<TYPE> global token ids -> local indices within the SPECIAL head.
+                    type_token_ids = self.window_marker_type_offset + torch.arange(K, device=logits_struct.device)
+                    type_local = type_token_ids - int(self.special_token_offset)
+                    valid = (type_local >= 0) & (type_local < int(self.size_special))
+                    if valid.any():
+                        prior = logits_dict.get("logits_next_window_type", None)
+                        if prior is not None and prior.shape[-1] == K:
+                            prior_logp = torch.log_softmax(prior, dim=-1)  # (B, W, K)
+                        else:
+                            prior_logp = logits_struct.new_zeros((B, W, K))
+
+                        type_local_valid = type_local[valid].to(dtype=torch.long)
+                        bias = hazard_logit.unsqueeze(-1) + (self.transition_prior_scale * prior_logp).unsqueeze(2)
+                        logits_struct[..., type_local_valid] = logits_struct[..., type_local_valid] + bias[..., valid]
+
+                else:
+                    # Bias WIN_END token logit (encouraging an end-of-window transition).
+                    end_token_id = (
+                        int(self.window_marker_end_token_id)
+                        if self.window_marker_end_token_id is not None
+                        else int(self.window_marker_type_offset) + int(self.window_marker_num_types)
+                    )
+                    end_local = end_token_id - int(self.special_token_offset)
+                    if 0 <= int(end_local) < int(self.size_special):
+                        logits_struct[..., int(end_local)] = logits_struct[..., int(end_local)] + hazard_logit
 
         # Return final global state for sequence-chunk stitching.
         # Use the last *real* window rather than the padded tail.

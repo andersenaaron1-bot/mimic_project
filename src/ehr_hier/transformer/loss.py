@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+import math
 
 
 class AETLossModule(nn.Module):
@@ -26,7 +28,15 @@ class AETLossModule(nn.Module):
         self.strict_routing = bool(strict_routing)
 
         # Default weights prioritize structure heavily
-        self.weights = weights or {"struct": 5.0, "rvq": 1.0, "meas": 1.0, "med": 1.0, "val": 1.0, "win": 1.0}
+        self.weights = weights or {
+            "struct": 5.0,
+            "rvq": 1.0,
+            "meas": 1.0,
+            "med": 1.0,
+            "val": 1.0,
+            "win": 1.0,
+            "len": 0.0,
+        }
 
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')  # No ignore_index needed if we mask carefully
         self.mse_loss = nn.MSELoss(reduction='none')
@@ -217,5 +227,65 @@ class AETLossModule(nn.Module):
                     pred = logits_next_window_type[:, :-1, :].argmax(dim=-1)
                     acc = (pred == window_type_ids[:, 1:]).to(dtype=torch.float)[transition_mask].mean()
                     logs["acc_next_window_type"] = float(acc.item())
+
+        # --- Auxiliary: window length prediction (token count + elapsed hours) ---
+        pred_len_tokens = head_outputs.get("pred_window_len_tokens", None)
+        pred_len_hours = head_outputs.get("pred_window_len_hours", None)
+        if pred_len_tokens is not None and pred_len_hours is not None:
+            # Require time_ids to compute duration and token_type_ids to exclude SPECIAL markers if present.
+            time_ids = targets_dict.get("time_ids", None)
+            attention_mask = targets_dict.get("attention_mask", None)
+            token_type_ids = targets_dict.get("token_type_ids", None)
+            if time_ids is not None and attention_mask is not None:
+                if pred_len_tokens.shape != pred_len_hours.shape:
+                    raise ValueError(
+                        "pred_window_len_tokens and pred_window_len_hours must have the same shape; "
+                        f"got {tuple(pred_len_tokens.shape)} vs {tuple(pred_len_hours.shape)}"
+                    )
+                if time_ids.ndim != 3:
+                    raise ValueError(f"time_ids must be (B,W,L), got shape {tuple(time_ids.shape)}")
+                if attention_mask.shape != time_ids.shape:
+                    raise ValueError(
+                        f"attention_mask must match time_ids shape; got {tuple(attention_mask.shape)} vs {tuple(time_ids.shape)}"
+                    )
+                B, W, L = time_ids.shape
+                if pred_len_tokens.shape != (B, W):
+                    raise ValueError(f"pred_window_len_* must be (B,W), got {tuple(pred_len_tokens.shape)}")
+
+                win_mask = window_mask.to(dtype=torch.bool) if window_mask is not None else torch.ones((B, W), device=time_ids.device, dtype=torch.bool)
+
+                content_mask = attention_mask.to(dtype=torch.bool)
+                # By convention, TokenCategory.SPECIAL == 0.
+                if token_type_ids is not None:
+                    if token_type_ids.shape != (B, W, L):
+                        raise ValueError(f"token_type_ids must be (B,W,L), got shape {tuple(token_type_ids.shape)}")
+                    content_mask = content_mask & (token_type_ids != 0)
+
+                true_len_tokens = content_mask.to(dtype=torch.float32).sum(dim=2)  # (B,W)
+
+                # Duration as max relative time among content tokens.
+                neg_inf = torch.tensor(float("-inf"), device=time_ids.device, dtype=time_ids.dtype)
+                t_masked = torch.where(content_mask, time_ids, neg_inf)
+                true_len_hours = t_masked.max(dim=2).values  # (B,W)
+                true_len_hours = torch.where(torch.isfinite(true_len_hours), true_len_hours, torch.zeros_like(true_len_hours))
+                true_len_hours = true_len_hours.clamp(min=0.0)
+
+                # Log-scale regression is more stable across variable density.
+                pred_len_tokens = pred_len_tokens.clamp(min=1.0)
+                pred_len_hours = pred_len_hours.clamp(min=0.0)
+                loss_tokens = F.mse_loss(torch.log1p(pred_len_tokens), torch.log1p(true_len_tokens), reduction="none")
+
+                max_hours = 28.0 * 24.0
+                denom = math.log1p(max_hours)
+                pred_h = torch.log1p(pred_len_hours.clamp(max=max_hours)) / denom
+                true_h = torch.log1p(true_len_hours.clamp(max=max_hours)) / denom
+                loss_hours = F.mse_loss(pred_h, true_h, reduction="none")
+
+                mask = win_mask
+                if mask.any():
+                    loss_len = (loss_tokens[mask].mean() + loss_hours[mask].mean()) * 0.5
+                    w = float(self.weights.get("len", 0.0))
+                    total_loss = total_loss + w * loss_len
+                    logs["loss_window_len"] = float(loss_len.item())
 
         return total_loss, logs

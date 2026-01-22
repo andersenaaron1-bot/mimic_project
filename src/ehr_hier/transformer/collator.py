@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import Dict, List, Literal
 
 import torch
 
@@ -14,7 +14,7 @@ class WindowMarkerConfig:
     Controls insertion of per-window marker tokens.
 
     Marker tokens are inserted *inside* each window sequence during collation:
-      [special_tokens...] [WIN_TYPE] [window_tokens...] [WIN_END]
+      [special_tokens...] [WIN_TYPE] [window_tokens...] [WIN_END or WIN_<NEXT_TYPE>]
 
     Window types are integer class ids in [0, num_types-1]. The WIN_TYPE token id
     is computed as:
@@ -22,6 +22,10 @@ class WindowMarkerConfig:
     """
 
     enabled: bool = True
+    # How to terminate a window sequence:
+    #  - "end_token": append a dedicated WIN_END token id.
+    #  - "next_type": append the *next* window's WIN_<TYPE> token id (last window uses WIN_END).
+    end_mode: Literal["end_token", "next_type"] = "end_token"
     # Global token id offset where WIN_<TYPE> tokens start.
     type_token_offset: int = 10
     # Number of supported window types (including UNK=0 if you use it).
@@ -32,7 +36,7 @@ class WindowMarkerConfig:
     # Fallback type id when a window type cannot be inferred.
     unk_type_id: int = 0
     # Category assigned to marker tokens (affects pooling masks, not routing).
-    marker_category: TokenCategory = TokenCategory.STRUCTURAL
+    marker_category: TokenCategory = TokenCategory.SPECIAL
 
 
 class AETHierarchicalCollator:
@@ -71,6 +75,8 @@ class AETHierarchicalCollator:
         for timeline in batch_timelines:
             special_tokens, events = self._split_special(timeline)
             windows = self._segment_into_windows(events)[: self.max_windows]
+            window_type_ids = [self._infer_window_type_id(w) for w in windows]
+            window_start_abs_times = [float(w[0].t_from_start_hours) if w else 0.0 for w in windows]
 
             subj_ids: List[List[int]] = []
             subj_times: List[List[float]] = []
@@ -81,9 +87,16 @@ class AETHierarchicalCollator:
             subj_window_types: List[int] = []
             subj_window_start_times: List[float] = []
 
-            for window in windows:
+            for wi, window in enumerate(windows):
+                next_type_id = window_type_ids[wi + 1] if wi + 1 < len(window_type_ids) else None
+                next_start_abs = window_start_abs_times[wi + 1] if wi + 1 < len(window_start_abs_times) else None
                 w_ids, w_times, w_vals, w_valmask, w_types, w_type_id, w_start_time = self._process_window(
-                    window, special_tokens
+                    window,
+                    special_tokens,
+                    w_type_id=window_type_ids[wi],
+                    w_start_abs=window_start_abs_times[wi],
+                    next_type_id=next_type_id,
+                    next_start_abs=next_start_abs,
                 )
                 seq_len = len(w_ids)
                 subj_ids.append(w_ids)
@@ -139,14 +152,20 @@ class AETHierarchicalCollator:
         return windows
 
     def _process_window(
-        self, window_tokens: List[EventToken], special_tokens: List[EventToken]
+        self,
+        window_tokens: List[EventToken],
+        special_tokens: List[EventToken],
+        *,
+        w_type_id: int,
+        w_start_abs: float,
+        next_type_id: int | None,
+        next_start_abs: float | None,
     ) -> tuple[List[int], List[float], List[float], List[int], List[int], int, float]:
         if not window_tokens:
             return [], [], [], [], [], int(self.window_markers.unk_type_id), 0.0
 
-        w_start_abs = float(window_tokens[0].t_from_start_hours)
-
-        w_type_id = self._infer_window_type_id(window_tokens)
+        w_start_abs = float(w_start_abs)
+        w_type_id = int(w_type_id)
 
         # Build sequence with optional window markers while preserving the end marker.
         prefix: List[EventToken] = list(special_tokens)
@@ -158,6 +177,7 @@ class AETHierarchicalCollator:
                 if self.window_markers.end_token_id is not None
                 else int(self.window_markers.type_token_offset) + int(self.window_markers.num_types)
             )
+            end_mode = str(getattr(self.window_markers, "end_mode", "end_token"))
 
             prefix.append(
                 EventToken(
@@ -169,16 +189,30 @@ class AETHierarchicalCollator:
                     num_attrs={},
                 )
             )
-            suffix.append(
-                EventToken(
-                    value_id=end_token_id,
-                    category_id=int(self.window_markers.marker_category),
-                    t_from_start_hours=float(window_tokens[-1].t_from_start_hours),
-                    dt_from_prev_hours=0.0,
-                    cat_attrs={},
-                    num_attrs={},
+            if end_mode == "next_type" and next_type_id is not None:
+                next_type_id_int = self._clamp_window_type_id(int(next_type_id))
+                next_token_id = int(self.window_markers.type_token_offset) + int(next_type_id_int)
+                suffix.append(
+                    EventToken(
+                        value_id=next_token_id,
+                        category_id=int(self.window_markers.marker_category),
+                        t_from_start_hours=float(next_start_abs) if next_start_abs is not None else float(window_tokens[-1].t_from_start_hours),
+                        dt_from_prev_hours=0.0,
+                        cat_attrs={"window_type_id": int(next_type_id_int)},
+                        num_attrs={},
+                    )
                 )
-            )
+            else:
+                suffix.append(
+                    EventToken(
+                        value_id=end_token_id,
+                        category_id=int(self.window_markers.marker_category),
+                        t_from_start_hours=float(window_tokens[-1].t_from_start_hours),
+                        dt_from_prev_hours=0.0,
+                        cat_attrs={},
+                        num_attrs={},
+                    )
+                )
 
         budget = max(0, int(self.max_len) - len(prefix) - len(suffix))
         seq: List[EventToken] = prefix + window_tokens[:budget] + suffix

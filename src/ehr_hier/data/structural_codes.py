@@ -50,9 +50,6 @@ class StructuralCodebook:
         """
         Decide whether a structural token should create a new window.
 
-        Semantics:
-          - If boundary_labels/codes are not provided: every structural hit is a boundary.
-          - If provided: boundary if code in boundary_codes OR label in boundary_labels.
         """
         code_str = str(code)
         label_str = str(label)
