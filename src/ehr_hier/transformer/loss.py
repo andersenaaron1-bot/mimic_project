@@ -36,6 +36,8 @@ class AETLossModule(nn.Module):
             "val": 1.0,
             "win": 1.0,
             "len": 0.0,
+            "time": 0.0,
+            "dt": 0.0,
         }
 
         self.ce_loss = nn.CrossEntropyLoss(reduction='none')  # No ignore_index needed if we mask carefully
@@ -287,5 +289,117 @@ class AETLossModule(nn.Module):
                     w = float(self.weights.get("len", 0.0))
                     total_loss = total_loss + w * loss_len
                     logs["loss_window_len"] = float(loss_len.item())
+
+        # --- Auxiliary: window duration NLL (distribution over log1p(hours)) ---
+        pred_dur_mu = head_outputs.get("pred_window_dur_mu", None)
+        pred_dur_sigma = head_outputs.get("pred_window_dur_sigma", None)
+        if pred_dur_mu is not None and pred_dur_sigma is not None:
+            time_ids = targets_dict.get("time_ids", None)
+            attention_mask = targets_dict.get("attention_mask", None)
+            token_type_ids = targets_dict.get("token_type_ids", None)
+            if time_ids is not None and attention_mask is not None:
+                if time_ids.ndim != 3:
+                    raise ValueError(f"time_ids must be (B,W,L), got shape {tuple(time_ids.shape)}")
+                if attention_mask.shape != time_ids.shape:
+                    raise ValueError(
+                        f"attention_mask must match time_ids shape; got {tuple(attention_mask.shape)} vs {tuple(time_ids.shape)}"
+                    )
+                B, W, L = time_ids.shape
+                if pred_dur_mu.shape != (B, W) or pred_dur_sigma.shape != (B, W):
+                    raise ValueError(
+                        "pred_window_dur_mu and pred_window_dur_sigma must be (B,W); "
+                        f"got {tuple(pred_dur_mu.shape)} and {tuple(pred_dur_sigma.shape)} with time_ids={tuple(time_ids.shape)}"
+                    )
+
+                win_mask = window_mask.to(dtype=torch.bool) if window_mask is not None else torch.ones((B, W), device=time_ids.device, dtype=torch.bool)
+
+                content_mask = attention_mask.to(dtype=torch.bool)
+                if token_type_ids is not None:
+                    if token_type_ids.shape != (B, W, L):
+                        raise ValueError(f"token_type_ids must be (B,W,L), got shape {tuple(token_type_ids.shape)}")
+                    # By convention, TokenCategory.SPECIAL == 0.
+                    content_mask = content_mask & (token_type_ids != 0)
+
+                # Duration as max relative time among content tokens.
+                neg_inf = torch.tensor(float("-inf"), device=time_ids.device, dtype=time_ids.dtype)
+                t_masked = torch.where(content_mask, time_ids, neg_inf)
+                true_dur_h = t_masked.max(dim=2).values  # (B,W)
+                true_dur_h = torch.where(torch.isfinite(true_dur_h), true_dur_h, torch.zeros_like(true_dur_h))
+                true_dur_h = true_dur_h.clamp(min=0.0)
+
+                # Only supervise windows that have at least one content token.
+                has_content = content_mask.any(dim=2)
+                mask = win_mask & has_content
+
+                max_hours = 28.0 * 24.0
+                y_true = torch.log1p(true_dur_h.clamp(max=max_hours))
+                sigma = pred_dur_sigma.to(dtype=y_true.dtype).clamp(min=1e-4)
+                mu = pred_dur_mu.to(dtype=y_true.dtype)
+                nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
+
+                if mask.any():
+                    loss_time = nll[mask].mean()
+                    w = float(self.weights.get("time", 0.0))
+                    total_loss = total_loss + w * loss_time
+                    logs["loss_window_dur_nll"] = float(loss_time.item())
+
+        # --- Auxiliary: per-event dt-to-next NLL (distribution over log1p(hours)) ---
+        pred_dt_mu = head_outputs.get("pred_dt_next_mu", None)
+        pred_dt_sigma = head_outputs.get("pred_dt_next_sigma", None)
+        if pred_dt_mu is not None and pred_dt_sigma is not None:
+            time_ids = targets_dict.get("time_ids", None)
+            attention_mask = targets_dict.get("attention_mask", None)
+            token_type_ids = targets_dict.get("token_type_ids", None)
+            if time_ids is not None and attention_mask is not None and token_type_ids is not None:
+                if time_ids.ndim != 3:
+                    raise ValueError(f"time_ids must be (B,W,L), got shape {tuple(time_ids.shape)}")
+                if attention_mask.shape != time_ids.shape:
+                    raise ValueError(
+                        f"attention_mask must match time_ids shape; got {tuple(attention_mask.shape)} vs {tuple(time_ids.shape)}"
+                    )
+                if token_type_ids.shape != time_ids.shape:
+                    raise ValueError(
+                        f"token_type_ids must match time_ids shape; got {tuple(token_type_ids.shape)} vs {tuple(time_ids.shape)}"
+                    )
+                if pred_dt_mu.shape != time_ids.shape or pred_dt_sigma.shape != time_ids.shape:
+                    raise ValueError(
+                        "pred_dt_next_mu and pred_dt_next_sigma must be (B,W,L); "
+                        f"got {tuple(pred_dt_mu.shape)} and {tuple(pred_dt_sigma.shape)} with time_ids={tuple(time_ids.shape)}"
+                    )
+
+                # Only consider content tokens and their next content token.
+                content_mask = attention_mask.to(dtype=torch.bool) & (token_type_ids != 0)
+
+                B, W, L = time_ids.shape
+                N = B * W
+                t = time_ids.reshape(N, L)
+                m = content_mask.reshape(N, L)
+
+                next_t = torch.zeros_like(t)
+                next_exists = torch.zeros((N, L), device=t.device, dtype=torch.bool)
+                last_t = torch.zeros((N,), device=t.device, dtype=t.dtype)
+                has = torch.zeros((N,), device=t.device, dtype=torch.bool)
+                for i in range(L - 1, -1, -1):
+                    next_t[:, i] = last_t
+                    next_exists[:, i] = has
+                    cur = m[:, i]
+                    last_t = torch.where(cur, t[:, i], last_t)
+                    has = has | cur
+
+                dt_h = (next_t - t).clamp(min=0.0).reshape(B, W, L)
+                next_exists = next_exists.reshape(B, W, L)
+                mask = content_mask & next_exists & (dt_h > 0.0)
+
+                if mask.any():
+                    max_hours = 28.0 * 24.0
+                    y_true = torch.log1p(dt_h.clamp(max=max_hours))
+                    mu = pred_dt_mu.to(dtype=y_true.dtype)
+                    sigma = pred_dt_sigma.to(dtype=y_true.dtype).clamp(min=1e-4)
+                    nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
+                    loss_dt = nll[mask].mean()
+
+                    w = float(self.weights.get("dt", 0.0))
+                    total_loss = total_loss + w * loss_dt
+                    logs["loss_dt_nll"] = float(loss_dt.item())
 
         return total_loss, logs

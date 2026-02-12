@@ -36,6 +36,51 @@ class ContinuousRotaryPositionalEmbedding(nn.Module):
         return torch.cat((-x2, x1), dim=-1)
 
 
+class TimeEmbedding(nn.Module):
+    """
+    Additive time embedding for irregular timestamps.
+
+    Intended use:
+      - Compute a normalized scalar time feature from hours:
+            t' = log1p(clamp(t_hours, 0, max_hours)) / log1p(max_hours)
+      - Project t' -> d_model via a small MLP and add to token embeddings.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        max_hours: float = 28.0 * 24.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.max_hours = float(max_hours)
+        self._denom = float(math.log1p(self.max_hours)) if self.max_hours > 0 else 1.0
+
+        self.mlp = nn.Sequential(
+            nn.Linear(1, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    def forward(self, t_hours: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            t_hours: float tensor of shape (...,) in hours.
+        Returns:
+            emb: float tensor of shape (..., d_model)
+        """
+        if t_hours.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+            t_hours = t_hours.to(dtype=torch.float32)
+
+        t = t_hours.clamp(min=0.0, max=self.max_hours)
+        t = torch.log1p(t) / self._denom
+        emb = self.mlp(t.unsqueeze(-1))
+        emb = self.dropout(emb)
+        return emb
+
+
 class AETEmbeddings(nn.Module):
     """
     The Input Adapter.

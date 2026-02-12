@@ -15,7 +15,7 @@ class TokenCategory(IntEnum):
     PROCEDURE   = 3   # procedures (ICD, ICU procedures)
     MEDICATION  = 4   # meds, infusions
     STRUCTURAL  = 5   # admissions, transfers, ICU stays, birth/death
-    OTHER       = 6   # anything else you keep
+    OTHER       = 6   # anything else
 
 
 class SpecialToken(IntEnum):

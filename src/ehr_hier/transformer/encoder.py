@@ -6,6 +6,33 @@ import math
 from src.ehr_hier.data.token_types import TokenCategory
 
 
+def _alibi_slopes(num_heads: int) -> torch.Tensor:
+    """
+    Head-specific slope initialization from the ALiBi paper.
+
+    This returns positive slopes; larger slopes = stronger recency bias.
+    """
+
+    def _slopes_power_of_2(n: int) -> list[float]:
+        start = 2 ** (-2 ** -(math.log2(n) - 3))
+        ratio = start
+        return [start * (ratio ** i) for i in range(n)]
+
+    n = int(num_heads)
+    if n <= 0:
+        raise ValueError(f"num_heads must be > 0, got {num_heads}")
+
+    if math.log2(n).is_integer():
+        slopes = _slopes_power_of_2(n)
+    else:
+        closest = 2 ** math.floor(math.log2(n))
+        slopes = _slopes_power_of_2(closest)
+        slopes_extra = _slopes_power_of_2(2 * closest)[0::2][: n - closest]
+        slopes = slopes + slopes_extra
+
+    return torch.tensor(slopes, dtype=torch.float32)
+
+
 class WindowAttentionPooler(nn.Module):
     """
     Temperature-scaled attention pooling over a window's token hidden states.
@@ -150,7 +177,17 @@ class AETCausalAttention(nn.Module):
     Enforces Causal Masking (Auto-regressive) + Padding Masking.
     """
 
-    def __init__(self, d_model, num_heads, rope_module, dropout=0.1):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        rope_module,
+        dropout=0.1,
+        *,
+        enable_alibi_hours_bias: bool = False,
+        alibi_hours_max: float = 28.0 * 24.0,
+        alibi_hours_slope_scale: float = 1.0,
+    ):
         super().__init__()
         assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
 
@@ -158,6 +195,16 @@ class AETCausalAttention(nn.Module):
         self.num_heads = num_heads
         self.scale = 1.0 / math.sqrt(self.d_head)
         self.rope = rope_module  # Instance of ContinuousRotaryPositionalEmbedding
+        self.enable_alibi_hours_bias = bool(enable_alibi_hours_bias)
+        self.alibi_hours_max = float(alibi_hours_max)
+
+        if self.enable_alibi_hours_bias:
+            slopes = _alibi_slopes(self.num_heads) * float(alibi_hours_slope_scale)
+            # Store inverse-softplus so F.softplus(param) starts at `slopes`.
+            raw = torch.log(torch.expm1(slopes).clamp(min=1e-8))
+            self._alibi_slopes_raw = nn.Parameter(raw)
+        else:
+            self._alibi_slopes_raw = None
 
         # Projections
         self.q_proj = nn.Linear(d_model, d_model)
@@ -193,6 +240,21 @@ class AETCausalAttention(nn.Module):
         # (B, H, S, S)
         attn_weights = torch.matmul(q_rot, k_rot.transpose(-2, -1)) * self.scale
 
+        # 3b. Optional continuous-time ALiBi-style bias (hours).
+        # Bias is negative and grows with time separation, encouraging attention to
+        # recent tokens in *time*, not just in sequence index.
+        if self._alibi_slopes_raw is not None:
+            # (B,S,S) pairwise non-negative time deltas in hours (causal => i>=j).
+            t = times.to(dtype=torch.float32)
+            dt = (t[:, :, None] - t[:, None, :]).clamp(min=0.0)
+            if self.alibi_hours_max > 0:
+                dt = dt.clamp(max=self.alibi_hours_max)
+            log_dt = torch.log1p(dt)  # (B,S,S)
+
+            slopes = F.softplus(self._alibi_slopes_raw).to(device=attn_weights.device, dtype=attn_weights.dtype)  # (H,)
+            bias = -log_dt.to(device=attn_weights.device, dtype=attn_weights.dtype).unsqueeze(1) * slopes.view(1, self.num_heads, 1, 1)
+            attn_weights = attn_weights + bias
+
         # 4. Masking
         # A. Causal Mask (Upper Triangular = -inf)
         causal_mask = torch.triu(torch.ones(S, S, device=x.device), diagonal=1).bool()
@@ -210,7 +272,7 @@ class AETCausalAttention(nn.Module):
         out = torch.matmul(attn_weights, v)  # (B, H, S, d_h)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
         if attention_mask is not None:
-            q_mask = attention_mask[:, None, :, None]  # (B,1,S,1)
+            q_mask = attention_mask.to(dtype=out.dtype)[:, :, None]  # (B,S,1)
             out = out * q_mask
         return self.out_proj(out)
 
@@ -221,9 +283,28 @@ class AETEncoderLayer(nn.Module):
     Input -> LayerNorm -> CausalAttn -> Add -> LayerNorm -> FFN -> Add
     """
 
-    def __init__(self, d_model, num_heads, d_ff, rope_module, dropout=0.1):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff,
+        rope_module,
+        dropout=0.1,
+        *,
+        enable_alibi_hours_bias: bool = False,
+        alibi_hours_max: float = 28.0 * 24.0,
+        alibi_hours_slope_scale: float = 1.0,
+    ):
         super().__init__()
-        self.attn = AETCausalAttention(d_model, num_heads, rope_module, dropout)
+        self.attn = AETCausalAttention(
+            d_model,
+            num_heads,
+            rope_module,
+            dropout,
+            enable_alibi_hours_bias=enable_alibi_hours_bias,
+            alibi_hours_max=alibi_hours_max,
+            alibi_hours_slope_scale=alibi_hours_slope_scale,
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
 
@@ -301,7 +382,10 @@ class AETLocalEncoder(nn.Module):
                 num_heads=config.num_heads,
                 d_ff=config.d_ff,
                 rope_module=rope_module,
-                dropout=config.dropout
+                dropout=config.dropout,
+                enable_alibi_hours_bias=bool(getattr(config, "enable_alibi_hours_bias", False)),
+                alibi_hours_max=float(getattr(config, "alibi_hours_max", 28.0 * 24.0)),
+                alibi_hours_slope_scale=float(getattr(config, "alibi_hours_slope_scale", 1.0)),
             ) for _ in range(config.num_local_layers)
         ])
 

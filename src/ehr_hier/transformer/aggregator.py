@@ -21,7 +21,10 @@ class AETGlobalAggregator(nn.Module):
                 num_heads=config.num_heads,
                 d_ff=config.d_ff,
                 rope_module=rope_module,
-                dropout=config.dropout
+                dropout=config.dropout,
+                enable_alibi_hours_bias=bool(getattr(config, "enable_alibi_hours_bias", False)),
+                alibi_hours_max=float(getattr(config, "alibi_hours_max", 28.0 * 24.0)),
+                alibi_hours_slope_scale=float(getattr(config, "alibi_hours_slope_scale", 1.0)),
             ) for _ in range(config.num_global_layers)
         ])
 
@@ -46,7 +49,7 @@ class AETGlobalAggregator(nn.Module):
 
         # --- 2. Transformer Layers ---
         # Note: We use the same cRoPE module.
-        # window_times represents the "Macro Clock" (When did this window happen?)
+        # window_times represents the "Macro Clock"
 
         for layer in self.layers:
             x = layer(x, window_times, padding_mask)
@@ -62,9 +65,28 @@ class AETGlobalLayer(nn.Module):
     Identical to Local Layer, just naming separation for clarity.
     """
 
-    def __init__(self, d_model, num_heads, d_ff, rope_module, dropout=0.1):
+    def __init__(
+        self,
+        d_model,
+        num_heads,
+        d_ff,
+        rope_module,
+        dropout=0.1,
+        *,
+        enable_alibi_hours_bias: bool = False,
+        alibi_hours_max: float = 28.0 * 24.0,
+        alibi_hours_slope_scale: float = 1.0,
+    ):
         super().__init__()
-        self.attn = AETCausalAttention(d_model, num_heads, rope_module, dropout)
+        self.attn = AETCausalAttention(
+            d_model,
+            num_heads,
+            rope_module,
+            dropout,
+            enable_alibi_hours_bias=enable_alibi_hours_bias,
+            alibi_hours_max=alibi_hours_max,
+            alibi_hours_slope_scale=alibi_hours_slope_scale,
+        )
         self.norm1 = nn.LayerNorm(d_model)
         self.norm2 = nn.LayerNorm(d_model)
         self.ffn = nn.Sequential(

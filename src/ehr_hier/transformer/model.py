@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from .embeddings import AETEmbeddings, ContinuousRotaryPositionalEmbedding
+from .embeddings import AETEmbeddings, ContinuousRotaryPositionalEmbedding, TimeEmbedding
 from .encoder import AETLocalEncoder
 from .aggregator import AETGlobalAggregator
 from .heads import AETOutputHeads
@@ -57,6 +57,18 @@ class AdaptiveEpisodicTransformer(nn.Module):
             exclude_special_from_window_type=True,
         )
 
+        # 2b. Explicit time embedding (optional).
+        # RoPE affects attention *patterns*; an additive time embedding gives the model a
+        # direct per-token time feature to use in MLPs/heads even without attending.
+        self.time_embedding: TimeEmbedding | None = None
+        self.time_embedding_scale: nn.Parameter | None = None
+        if bool(getattr(config, "enable_time_embedding", False)):
+            max_hours = float(getattr(config, "time_embedding_max_hours", 28.0 * 24.0))
+            dropout = float(getattr(config, "time_embedding_dropout", 0.0))
+            scale_init = float(getattr(config, "time_embedding_scale_init", 1.0))
+            self.time_embedding = TimeEmbedding(config.d_model, max_hours=max_hours, dropout=dropout)
+            self.time_embedding_scale = nn.Parameter(torch.tensor(scale_init))
+
         # 3. Local Encoder (The Ribs)
         self.local_encoder = AETLocalEncoder(config, self.rope)
 
@@ -81,6 +93,36 @@ class AdaptiveEpisodicTransformer(nn.Module):
             if bool(getattr(config, "enable_window_len_head", False))
             else None
         )
+
+        # 5c2. Aux Head: Predict a distribution over window duration (hours).
+        # Trained via NLL in the loss module; intended for calibrated generative timing.
+        # Output parameterization:
+        #   y = log1p(window_duration_hours) ~ Normal(mu, sigma)
+        self.window_time_nll_head = (
+            nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 2),
+            )
+            if bool(getattr(config, "enable_window_time_nll_head", False))
+            else None
+        )
+        self.window_time_nll_min_sigma = float(getattr(config, "window_time_nll_min_sigma", 0.1))
+
+        # 5c3. Aux Head: Predict a distribution over *per-event* time-to-next-event (hours).
+        # Intended to support generative temporal sequencing within windows.
+        # Output parameterization:
+        #   y = log1p(dt_next_hours) ~ Normal(mu, sigma)
+        self.event_time_nll_head = (
+            nn.Sequential(
+                nn.Linear(config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 2),
+            )
+            if bool(getattr(config, "enable_event_time_nll_head", False))
+            else None
+        )
+        self.event_time_nll_min_sigma = float(getattr(config, "event_time_nll_min_sigma", 0.1))
         self.window_type_control_embedding = (
             nn.Embedding(self.num_window_types, config.d_model) if self.num_window_types > 0 else None
         )
@@ -92,7 +134,7 @@ class AdaptiveEpisodicTransformer(nn.Module):
         self.transition_prior_scale = nn.Parameter(torch.tensor(1.0))
         self.transition_hazard_scale = nn.Parameter(torch.tensor(1.0))
 
-        # 6. Global-to-Local Projection (Optional but recommended)
+        # 6. Global-to-Local Projection
         # Helps adapt the global context before adding it to local tokens
         self.context_adapter = nn.Linear(config.d_model, config.d_model)
         self.global_fusion_mode = str(getattr(config, "global_fusion_mode", "add")).lower()
@@ -125,6 +167,9 @@ class AdaptiveEpisodicTransformer(nn.Module):
             window_type_ids=window_type_ids,
             token_type_ids=token_type_ids,
         )  # (B, W, L, D)
+
+        if self.time_embedding is not None and self.time_embedding_scale is not None:
+            x = x + (self.time_embedding_scale * self.time_embedding(time_ids))
 
         # B. Local Transformer Pass
         # Returns:
@@ -187,13 +232,22 @@ class AdaptiveEpisodicTransformer(nn.Module):
         if self.next_window_type_head is not None:
             logits_dict["logits_next_window_type"] = self.next_window_type_head(global_states)  # (B, W, K)
 
-        # --- PHASE 4b: Duration/Density prediction + transition bias (optional) ---
-        if self.window_len_head is not None:
+        if self.event_time_nll_head is not None:
+            raw = self.event_time_nll_head(fused_representation)  # (B, W, L, 2)
+            mu = raw[..., 0]
+            sigma = F.softplus(raw[..., 1]) + float(self.event_time_nll_min_sigma)
+            logits_dict["pred_dt_next_mu"] = mu  # (B, W, L) for y=log1p(hours)
+            logits_dict["pred_dt_next_sigma"] = sigma  # (B, W, L)
+
+        # --- PHASE 4b: Duration/Density prediction + transition bias  ---
+        control_ctx = None
+        if self.window_len_head is not None or self.window_time_nll_head is not None:
             control_ctx = shifted_context
             if window_type_ids is not None and self.window_type_control_embedding is not None:
                 safe_ids = window_type_ids.clamp(min=0, max=max(0, self.num_window_types - 1))
                 control_ctx = control_ctx + self.window_type_control_embedding(safe_ids)
 
+        if self.window_len_head is not None and control_ctx is not None:
             raw = self.window_len_head(control_ctx)  # (B, W, 2)
             # Positive window length priors
             pred_len_tokens = F.softplus(raw[..., 0]) + 1.0
@@ -201,11 +255,26 @@ class AdaptiveEpisodicTransformer(nn.Module):
             logits_dict["pred_window_len_tokens"] = pred_len_tokens  # (B, W)
             logits_dict["pred_window_len_hours"] = pred_len_hours  # (B, W)
 
+        if self.window_time_nll_head is not None and control_ctx is not None:
+            raw = self.window_time_nll_head(control_ctx)  # (B, W, 2)
+            mu = raw[..., 0]
+            sigma = F.softplus(raw[..., 1]) + float(self.window_time_nll_min_sigma)
+            logits_dict["pred_window_dur_mu"] = mu  # (B, W) for y=log1p(hours)
+            logits_dict["pred_window_dur_sigma"] = sigma  # (B, W)
+
         if self.enable_transition_bias and self.size_special > 0:
             # Compute hazard bias if length head is available; otherwise keep hazard at 0.
-            if self.window_len_head is not None and "pred_window_len_tokens" in logits_dict and "pred_window_len_hours" in logits_dict:
-                pred_len_tokens = logits_dict["pred_window_len_tokens"]  # (B, W)
-                pred_len_hours = logits_dict["pred_window_len_hours"]  # (B, W)
+            pred_len_tokens = logits_dict.get("pred_window_len_tokens", None)
+            pred_len_hours = logits_dict.get("pred_window_len_hours", None)
+            if pred_len_hours is None:
+                mu = logits_dict.get("pred_window_dur_mu", None)
+                sigma = logits_dict.get("pred_window_dur_sigma", None)
+                if mu is not None and sigma is not None:
+                    # E[exp(y)] = exp(mu + 0.5*sigma^2), with y = log1p(hours).
+                    pred_len_hours = torch.exp(mu + 0.5 * sigma.square()) - 1.0
+                    pred_len_hours = pred_len_hours.clamp(min=0.25)
+
+            if pred_len_hours is not None:
 
                 content_mask = attention_mask.to(dtype=torch.bool)
                 # Exclude SPECIAL (e.g. summaries, window markers) from length/density counting.
@@ -216,9 +285,12 @@ class AdaptiveEpisodicTransformer(nn.Module):
                 t_rel = time_ids.clamp(min=0.0)  # (B, W, L), hours since window start
 
                 eps = 1e-6
-                prog_tokens = pos / (pred_len_tokens.unsqueeze(-1) + eps)
                 prog_time = t_rel / (pred_len_hours.unsqueeze(-1) + eps)
-                prog = 0.5 * (prog_tokens + prog_time)
+                if pred_len_tokens is not None:
+                    prog_tokens = pos / (pred_len_tokens.unsqueeze(-1) + eps)
+                    prog = 0.5 * (prog_tokens + prog_time)
+                else:
+                    prog = prog_time
 
                 hazard_logit = self.transition_hazard_scale * (prog - 1.0)  # (B, W, L)
             else:
