@@ -1,0 +1,34 @@
+ARG PYTHON_VERSION=3.10
+FROM python:${PYTHON_VERSION}-slim
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
+SHELL ["/bin/bash","-lc"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates age zstd openssl \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MEDS_ETL_VERSION=
+ARG INSTALL_CPP=false
+
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    if [ -n "$MEDS_ETL_VERSION" ]; then \
+      PKG="meds_etl==${MEDS_ETL_VERSION}"; \
+    else \
+      PKG="meds_etl"; \
+    fi; \
+    if [ "$INSTALL_CPP" = "true" ]; then \
+      if [ -n "$MEDS_ETL_VERSION" ]; then \
+        PKG="meds_etl[cpp]==${MEDS_ETL_VERSION}"; \
+      else \
+        PKG="meds_etl[cpp]"; \
+      fi; \
+    fi; \
+    pip install "$PKG"
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]
