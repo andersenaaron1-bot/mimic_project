@@ -8,10 +8,13 @@ Build a local container image and convert it to Enroot/Pyxis .sqsh format.
 Usage:
   scripts/build_enroot_image.sh --target train --output /dss/<proj>/containers/ehr-train.sqsh
   scripts/build_enroot_image.sh --target etl   --output /dss/<proj>/containers/meds-etl.sqsh
+  scripts/build_enroot_image.sh --target pipeline-cpu --output /dss/<proj>/containers/ehr-pipeline-cpu.sqsh
+  scripts/build_enroot_image.sh --target train-overlay --output /dss/<proj>/containers/ehr-train-overlay.sqsh
   scripts/build_enroot_image.sh --source-image docker://nvcr.io/nvidia/pytorch:24.10-py3 --output /dss/<proj>/containers/pytorch.sqsh
 
 Options:
-  --target <train|etl>       Use repo Dockerfile presets.
+  --target <train|etl|pipeline-cpu|train-overlay>
+                             Use repo Dockerfile presets.
   --dockerfile <path>        Override Dockerfile path.
   --context <path>           Build context path (default: repo root).
   --tag <name:tag>           Local image tag used during build/import.
@@ -53,6 +56,14 @@ if [[ -n "$TARGET" ]]; then
     etl)
       DOCKERFILE="${DOCKERFILE:-$REPO_ROOT/containers/Dockerfile.etl}"
       IMAGE_TAG="${IMAGE_TAG:-ehr-meds-etl:latest}"
+      ;;
+    pipeline-cpu)
+      DOCKERFILE="${DOCKERFILE:-$REPO_ROOT/containers/Dockerfile.pipeline_cpu}"
+      IMAGE_TAG="${IMAGE_TAG:-ehr-pipeline-cpu:py311}"
+      ;;
+    train-overlay)
+      DOCKERFILE="${DOCKERFILE:-$REPO_ROOT/containers/Dockerfile.train_overlay}"
+      IMAGE_TAG="${IMAGE_TAG:-ehr-train-overlay:24.10-py3}"
       ;;
     *)
       echo "Invalid --target value: $TARGET" >&2

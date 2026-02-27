@@ -18,6 +18,8 @@ Prefer local `.sqsh` images on DSS:
 ```bash
 scripts/build_enroot_image.sh --target train --output /dss/<proj>/containers/ehr-train.sqsh
 scripts/build_enroot_image.sh --target etl   --output /dss/<proj>/containers/meds-etl.sqsh
+scripts/build_enroot_image.sh --target pipeline-cpu --output /dss/<proj>/containers/ehr-pipeline-cpu.sqsh
+scripts/build_enroot_image.sh --target train-overlay --output /dss/<proj>/containers/ehr-train-overlay.sqsh
 ```
 
 Each build also emits `<image>.sha256`.
@@ -104,3 +106,56 @@ sbatch scripts/sbatch_single.sh
 - Encryption mode only adds decrypt/encrypt passes at boundaries.
 - `.sqsh` reuse avoids repeated image pulls and improves startup latency.
 - The same scripts support both encrypted and plaintext workflows via env vars.
+
+## 8. CPU Pipeline Image (meds_reader + timeline/tokenization prep)
+
+Use `containers/Dockerfile.pipeline_cpu` when you want a stable post-ETL image for:
+- `meds_reader_convert`
+- timeline build (`src/ehr_hier/data/compile_dataset.py`)
+- tokenization/CVAE prep scripts in `scripts/`
+
+Preflight example:
+
+```bash
+IMAGE=/dss/<proj>/containers/ehr-pipeline-cpu.sqsh
+RUN_DIR=/dss/<proj>/runs/pipeline_check_$(date +%Y%m%d_%H%M%S)
+mkdir -p "$RUN_DIR"
+
+srun -A default -p lrz-cpu --qos=cpu --cpus-per-task=1 --mem=4G --time=00:10:00 \
+  --container-image="$IMAGE" \
+  --container-mounts="$PWD:/workspace/ehr-hier,$RUN_DIR:/run" \
+  bash -lc 'set -euo pipefail; cd /workspace/ehr-hier; command -v meds_reader_convert; python -c "import meds_reader, torch, pyarrow, polars; print(\"pipeline-cpu preflight OK\")"'
+```
+
+## 9. Remote GPU Image Build (GitHub Actions)
+
+To avoid local CUDA-heavy Docker builds, use the workflow:
+- `.github/workflows/build-train-overlay.yml`
+- Dockerfile: `containers/Dockerfile.train_overlay`
+- Deps: `requirements.train_overlay.txt`
+
+Trigger from GitHub Actions (`workflow_dispatch`) with:
+- `tag` (for example `train-overlay-latest`)
+- `ngc_tag` (for example `24.10-py3`)
+
+The workflow pushes:
+- `ghcr.io/<owner>/ehr-train:<tag>`
+- optional `ghcr.io/<owner>/ehr-train:sha-<commit>`
+
+Use directly on LRZ:
+
+```bash
+IMAGE_REMOTE='docker://ghcr.io#<owner>/ehr-train:train-overlay-latest'
+```
+
+Or import to local `.sqsh` (when `enroot` is available):
+
+```bash
+scripts/build_enroot_image.sh --source-image "$IMAGE_REMOTE" --output /dss/<proj>/containers/ehr-train-overlay.sqsh
+```
+
+This keeps the image stable while your code remains flexible via repo mounts:
+
+```bash
+--container-mounts "$PWD:/workspace/ehr-hier,..."
+```

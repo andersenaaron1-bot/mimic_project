@@ -1,0 +1,26 @@
+ARG NGC_TAG=24.10-py3
+FROM nvcr.io/nvidia/pytorch:${NGC_TAG}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/workspace/.cache/huggingface \
+    XDG_CACHE_HOME=/workspace/.cache \
+    MPLCONFIGDIR=/workspace/.cache/matplotlib
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      git bash ca-certificates age zstd openssl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY requirements.train_overlay.txt /tmp/requirements.train_overlay.txt
+
+RUN python -m pip install --upgrade pip wheel setuptools && \
+    pip install -r /tmp/requirements.train_overlay.txt
+
+WORKDIR /workspace/ehr-hier
+ENTRYPOINT []
+CMD ["/bin/bash"]
