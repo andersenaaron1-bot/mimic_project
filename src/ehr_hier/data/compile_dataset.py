@@ -2,7 +2,7 @@
 Utility to materialize subject timelines to disk for fast training.
 
 This is intentionally minimal: callers must construct encoders/structural codebook
-upstream and pass a meds_reader DB path. We shard outputs as <root>/<prefix>/<sid>.pt.
+upstream and pass a meds_reader DB path. We shard outputs as <root>/<shard>/<sid>.pt.
 """
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ import os
 from functools import partial
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
-from typing import Dict, Optional
+from typing import Dict, Optional, Iterable, List
 
 import torch
 import meds_reader as mr
@@ -29,6 +29,7 @@ def _process_subject(
     encoders: Dict[TokenCategory, EventTokenEncoder],
     codebook: Optional[StructuralCodebook],
     output_dir: str,
+    num_output_shards: int = 100,
     window_hook_label: str = "window_boundary",
     attach_med_numeric: bool = True,
 ) -> bool:
@@ -45,7 +46,8 @@ def _process_subject(
         attach_med_numeric=attach_med_numeric,
     )
 
-    shard_folder = f"{subject_id:02d}"[:2]
+    shard_idx = int(subject_id) % int(num_output_shards)
+    shard_folder = f"{shard_idx:02d}"
     save_path = Path(output_dir) / shard_folder / f"{subject_id}.pt"
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(timeline, save_path)
@@ -59,15 +61,22 @@ def compile_dataset(
     output_dir: str,
     structural_codebook: Optional[StructuralCodebook] = None,
     num_workers: Optional[int] = None,
+    subject_ids: Optional[Iterable[int]] = None,
+    num_output_shards: int = 100,
 ) -> None:
     """
-    Build timelines for all subjects and persist them to disk.
+    Build timelines for selected subjects and persist them to disk.
     """
     if not encoders:
         raise ValueError("encoders must be provided (TokenCategory -> EventTokenEncoder)")
+    if num_output_shards <= 0:
+        raise ValueError("num_output_shards must be > 0")
 
     db = mr.SubjectDatabase(db_path)
-    subject_ids = list(db)
+    if subject_ids is None:
+        subject_id_list: List[int] = [int(sid) for sid in db]
+    else:
+        subject_id_list = [int(sid) for sid in subject_ids]
 
     workers = num_workers if num_workers is not None else max(1, cpu_count() - 2)
     worker_fn = partial(
@@ -76,24 +85,26 @@ def compile_dataset(
         encoders=encoders,
         codebook=structural_codebook,
         output_dir=output_dir,
+        num_output_shards=num_output_shards,
     )
 
     os.makedirs(output_dir, exist_ok=True)
     with Pool(processes=workers) as pool:
         results = list(
             tqdm(
-                pool.imap_unordered(worker_fn, subject_ids),
-                total=len(subject_ids),
+                pool.imap_unordered(worker_fn, subject_id_list),
+                total=len(subject_id_list),
                 desc="compiling timelines",
             )
         )
 
     ok = sum(results)
-    print(f"compiled {ok}/{len(subject_ids)} subjects -> {output_dir}")
+    print(f"compiled {ok}/{len(subject_id_list)} subjects -> {output_dir}")
 
 
 if __name__ == "__main__":
     raise SystemExit(
         "compile_dataset is a library entrypoint; construct encoders externally "
-        "and call compile_dataset(db_path=..., encoders=..., output_dir=...)."
+        "and call compile_dataset(db_path=..., encoders=..., output_dir=..., "
+        "subject_ids=..., num_output_shards=...)."
     )

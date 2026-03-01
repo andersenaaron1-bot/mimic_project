@@ -3,8 +3,7 @@
 This document is the contract between tokenization (`EventToken`) and the hierarchical
 transformer (`AdaptiveEpisodicTransformer`, a.k.a. AET).
 
-The repo is intentionally flexible: the final set of clinical categories and vocab
-sizes will expand as the full dataset (beyond MIMIC) comes online. What must remain
+Final vocab size and categories will be set with the full dataset available. What must remain
 stable is:
 - how events become `EventToken` bundles,
 - how windows-of-care are delimited and labeled,
