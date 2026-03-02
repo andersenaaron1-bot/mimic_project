@@ -56,12 +56,35 @@ MARKER_TEXT_PARTS = (
     "INFUSION_END",
 )
 
+OPEN_ROLE_PARTS = (
+    "ADMISSION",
+    "TRANSFER_TO",
+    "ED_REGISTRATION",
+    "STRUCT_START_",
+    "MED_MARKER::START",
+    "INFUSION_START",
+    "MEDS_BIRTH",
+    "CAREUNIT_CHANGE",
+)
+
+CLOSE_ROLE_PARTS = (
+    "DISCHARGE",
+    "ED_OUT",
+    "DEATH",
+    "STRUCT_END_",
+    "MED_MARKER::END",
+    "MED_MARKER::STOP",
+    "INFUSION_END",
+)
+
 
 @dataclass(frozen=True)
 class SegmentationPolicy:
     name: str
     placement: str
     gap_hours: float
+    bundle_gap_hours: float
+    bundle_max_index_gap: int
     custom_contains: tuple[str, ...] = ()
 
     @property
@@ -107,6 +130,8 @@ def _make_policies(args: argparse.Namespace) -> List[SegmentationPolicy]:
                     name=str(name),
                     placement=str(placement),
                     gap_hours=float(args.gap_hours),
+                    bundle_gap_hours=float(args.bundle_gap_hours),
+                    bundle_max_index_gap=int(args.bundle_max_index_gap),
                     custom_contains=custom_contains,
                 )
             )
@@ -221,6 +246,17 @@ def _is_marker_like(item: Mapping[str, Any]) -> bool:
     return any(part in text for part in MARKER_TEXT_PARTS)
 
 
+def _item_transition_role(item: Mapping[str, Any]) -> str:
+    text = _item_text(item)
+    has_open = any(part in text for part in OPEN_ROLE_PARTS)
+    has_close = any(part in text for part in CLOSE_ROLE_PARTS)
+    if has_open and not has_close:
+        return "open"
+    if has_close and not has_open:
+        return "close"
+    return "neutral"
+
+
 def _boundary_reasons(
     item: Mapping[str, Any],
     prev_item: Mapping[str, Any] | None,
@@ -286,69 +322,225 @@ def _boundary_reasons(
     return _unique_preserve_order(reasons)
 
 
+def _resolve_bundle_action(
+    bundle_items: Sequence[Mapping[str, Any]],
+    *,
+    reasons: Sequence[str],
+    fallback_placement: str,
+) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    roles = [_item_transition_role(item) for item in bundle_items]
+    has_open = any(role == "open" for role in roles)
+    has_close = any(role == "close" for role in roles)
+
+    if has_open and has_close:
+        action = "close_open"
+    elif has_open:
+        action = "open_next"
+    elif has_close:
+        action = "close_current"
+    elif any(str(r).startswith("gap>=") for r in reasons):
+        action = "open_next"
+    else:
+        action = str(fallback_placement)
+
+    closing_items: List[Dict[str, Any]] = []
+    opening_items: List[Dict[str, Any]] = []
+    if action == "close_current":
+        closing_items = [dict(item) for item in bundle_items]
+    elif action == "open_next":
+        opening_items = [dict(item) for item in bundle_items]
+    else:
+        seen_open = False
+        for item, role in zip(bundle_items, roles):
+            item_copy = dict(item)
+            if role == "close":
+                closing_items.append(item_copy)
+                continue
+            if role == "open":
+                opening_items.append(item_copy)
+                seen_open = True
+                continue
+            if seen_open:
+                opening_items.append(item_copy)
+            else:
+                closing_items.append(item_copy)
+        if not closing_items and opening_items:
+            closing_items.append(opening_items.pop(0))
+        if not opening_items and closing_items:
+            opening_items.append(closing_items.pop())
+
+    return action, closing_items, opening_items
+
+
+def _build_boundary_bundles(
+    items: List[Dict[str, Any]],
+    *,
+    policy: SegmentationPolicy,
+    context_items: int,
+) -> List[Dict[str, Any]]:
+    candidates: List[Dict[str, Any]] = []
+    for idx, item in enumerate(items):
+        prev_item = items[idx - 1] if idx > 0 else None
+        reasons = _boundary_reasons(item, prev_item, policy)
+        if reasons:
+            candidates.append({"idx": int(idx), "reasons": list(reasons)})
+
+    if not candidates:
+        return []
+
+    bundles: List[Dict[str, Any]] = []
+    current = {
+        "start_idx": int(candidates[0]["idx"]),
+        "end_idx": int(candidates[0]["idx"]),
+        "candidate_indices": [int(candidates[0]["idx"])],
+        "reasons": list(candidates[0]["reasons"]),
+    }
+
+    for cand in candidates[1:]:
+        idx = int(cand["idx"])
+        prev_idx = int(current["candidate_indices"][-1])
+        time_gap = abs(_item_t(items[idx]) - _item_t(items[prev_idx]))
+        idx_gap = idx - prev_idx
+        same_bundle = idx_gap <= int(policy.bundle_max_index_gap) and time_gap <= float(policy.bundle_gap_hours)
+        if same_bundle:
+            current["end_idx"] = idx
+            current["candidate_indices"].append(idx)
+            current["reasons"] = _unique_preserve_order(list(current["reasons"]) + list(cand["reasons"]))
+        else:
+            bundles.append(dict(current))
+            current = {
+                "start_idx": idx,
+                "end_idx": idx,
+                "candidate_indices": [idx],
+                "reasons": list(cand["reasons"]),
+            }
+    bundles.append(dict(current))
+
+    finalized: List[Dict[str, Any]] = []
+    for bundle_idx, bundle in enumerate(bundles):
+        start_idx = int(bundle["start_idx"])
+        end_idx = int(bundle["end_idx"])
+        bundle_items = [dict(x) for x in items[start_idx : end_idx + 1]]
+        action, closing_items, opening_items = _resolve_bundle_action(
+            bundle_items,
+            reasons=bundle["reasons"],
+            fallback_placement=policy.placement,
+        )
+        primary_items = opening_items if opening_items else (closing_items if closing_items else bundle_items)
+        primary_label = _item_label(primary_items[0]) if primary_items else _item_label(bundle_items[0])
+        finalized.append(
+            {
+                "bundle_index": int(bundle_idx),
+                "start_idx": start_idx,
+                "end_idx": end_idx,
+                "reasons": list(bundle["reasons"]),
+                "action": action,
+                "label": primary_label,
+                "bundle_items": bundle_items,
+                "closing_items": closing_items,
+                "opening_items": opening_items,
+                "pre_context": [_item_preview(x) for x in items[max(0, start_idx - context_items) : start_idx]],
+                "post_context": [_item_preview(x) for x in items[end_idx + 1 : end_idx + 1 + context_items]],
+            }
+        )
+    return finalized
+
+
 def _segment_items(
     items: List[Dict[str, Any]],
     *,
     policy: SegmentationPolicy,
     context_items: int,
 ) -> tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    bundles = _build_boundary_bundles(
+        items,
+        policy=policy,
+        context_items=context_items,
+    )
     windows: List[Dict[str, Any]] = []
-    boundary_examples: List[Dict[str, Any]] = []
     current_items: List[Dict[str, Any]] = []
     current_opening_reasons: List[str] = []
 
-    for idx, item in enumerate(items):
-        prev_item = items[idx - 1] if idx > 0 else None
-        next_item = items[idx + 1] if idx + 1 < len(items) else None
-        reasons = _boundary_reasons(item, prev_item, policy)
-        is_boundary = len(reasons) > 0
+    bundle_by_start = {int(bundle["start_idx"]): bundle for bundle in bundles}
+    i = 0
+    while i < len(items):
+        bundle = bundle_by_start.get(int(i))
+        if bundle is None:
+            current_items.append(items[i])
+            i += 1
+            continue
 
-        if is_boundary:
-            boundary_examples.append(
-                {
-                    "boundary_index": int(idx),
-                    "reasons": list(reasons),
-                    "boundary_item": _item_preview(item),
-                    "pre_context": [_item_preview(x) for x in items[max(0, idx - context_items) : idx]],
-                    "post_context": [_item_preview(x) for x in items[idx + 1 : idx + 1 + context_items]],
-                    "next_item": _item_preview(next_item) if next_item is not None else None,
-                }
-            )
+        action = str(bundle["action"])
+        closing_items = [dict(x) for x in bundle["closing_items"]]
+        opening_items = [dict(x) for x in bundle["opening_items"]]
 
-        if policy.placement == "open_next":
-            if is_boundary and current_items:
+        if action == "close_current":
+            current_items.extend(closing_items)
+            if current_items:
                 windows.append(
                     {
-                        "items": current_items,
+                        "items": list(current_items),
                         "opening_reasons": list(current_opening_reasons),
+                        "closing_reasons": list(bundle["reasons"]),
+                        "bundle_action": action,
                     }
                 )
-                current_items = [item]
-                current_opening_reasons = list(reasons)
-            else:
-                current_items.append(item)
-                if is_boundary and not current_opening_reasons:
-                    current_opening_reasons = list(reasons)
-        elif policy.placement == "close_current":
-            current_items.append(item)
-            if is_boundary:
+            current_items = []
+            current_opening_reasons = []
+        elif action == "open_next":
+            if current_items:
                 windows.append(
                     {
-                        "items": current_items,
+                        "items": list(current_items),
                         "opening_reasons": list(current_opening_reasons),
-                        "closing_reasons": list(reasons),
+                        "closing_reasons": [],
+                        "bundle_action": "carry_forward",
                     }
                 )
-                current_items = []
-                current_opening_reasons = []
+            current_items = list(opening_items)
+            current_opening_reasons = list(bundle["reasons"])
+        elif action == "close_open":
+            current_items.extend(closing_items)
+            if current_items:
+                windows.append(
+                    {
+                        "items": list(current_items),
+                        "opening_reasons": list(current_opening_reasons),
+                        "closing_reasons": list(bundle["reasons"]),
+                        "bundle_action": action,
+                    }
+                )
+            current_items = list(opening_items)
+            current_opening_reasons = list(bundle["reasons"])
         else:
-            raise ValueError(f"Unknown placement: {policy.placement}")
+            raise ValueError(f"Unknown bundle action: {action}")
+
+        i = int(bundle["end_idx"]) + 1
 
     if current_items:
         windows.append(
             {
-                "items": current_items,
+                "items": list(current_items),
                 "opening_reasons": list(current_opening_reasons),
+                "closing_reasons": [],
+                "bundle_action": "tail",
+            }
+        )
+
+    boundary_examples = []
+    for bundle in bundles:
+        boundary_examples.append(
+            {
+                "bundle_index": int(bundle["bundle_index"]),
+                "bundle_action": str(bundle["action"]),
+                "bundle_label": str(bundle["label"]),
+                "bundle_span": [int(bundle["start_idx"]), int(bundle["end_idx"])],
+                "reasons": list(bundle["reasons"]),
+                "bundle_items": [_item_preview(x) for x in bundle["bundle_items"]],
+                "closing_items": [_item_preview(x) for x in bundle["closing_items"]],
+                "opening_items": [_item_preview(x) for x in bundle["opening_items"]],
+                "pre_context": list(bundle["pre_context"]),
+                "post_context": list(bundle["post_context"]),
             }
         )
 
@@ -429,6 +621,7 @@ def _policy_summary_bucket() -> Dict[str, Any]:
         "closing_categories": Counter(),
         "boundary_reasons": Counter(),
         "boundary_labels": Counter(),
+        "boundary_actions": Counter(),
     }
 
 
@@ -557,8 +750,9 @@ def _collect_policy_outputs(
                     bucket["closing_categories"][str(closing_item.get("category"))] += 1
 
             for boundary in boundaries:
-                label = str(boundary["boundary_item"].get("label"))
+                label = str(boundary["bundle_label"])
                 bucket["boundary_labels"][label] += 1
+                bucket["boundary_actions"][str(boundary["bundle_action"])] += 1
                 for reason in boundary["reasons"]:
                     bucket["boundary_reasons"][str(reason)] += 1
 
@@ -580,6 +774,8 @@ def _collect_policy_outputs(
                 "name": policy.name,
                 "placement": policy.placement,
                 "gap_hours": float(policy.gap_hours),
+                "bundle_gap_hours": float(policy.bundle_gap_hours),
+                "bundle_max_index_gap": int(policy.bundle_max_index_gap),
                 "custom_boundary_contains": list(policy.custom_contains),
             },
             "summary": {
@@ -605,6 +801,9 @@ def _collect_policy_outputs(
                 ],
                 "top_boundary_labels": [
                     {"key": str(k), "count": int(v)} for k, v in bucket["boundary_labels"].most_common(20)
+                ],
+                "top_boundary_actions": [
+                    {"key": str(k), "count": int(v)} for k, v in bucket["boundary_actions"].most_common(10)
                 ],
                 "top_opening_labels": [
                     {"key": str(k), "count": int(v)} for k, v in bucket["opening_labels"].most_common(20)
@@ -661,6 +860,9 @@ def _print_summary(payload: Mapping[str, Any]) -> None:
         print(" top boundary reasons:")
         for row in summary["top_boundary_reasons"][:8]:
             print("  ", row["key"], row["count"])
+        print(" top boundary actions:")
+        for row in summary["top_boundary_actions"][:5]:
+            print("  ", row["key"], row["count"])
         print(" top opening labels:")
         for row in summary["top_opening_labels"][:8]:
             print("  ", row["key"], row["count"])
@@ -715,6 +917,8 @@ def main() -> None:
         help="Repeatable. Whether the boundary item opens the next window or closes the current one.",
     )
     ap.add_argument("--gap_hours", type=float, default=6.0)
+    ap.add_argument("--bundle_gap_hours", type=float, default=0.5)
+    ap.add_argument("--bundle_max_index_gap", type=int, default=2)
     ap.add_argument(
         "--custom_boundary_contains",
         action="append",
@@ -792,6 +996,8 @@ def main() -> None:
             "subject_ids": [int(x) for x in subject_ids[: min(len(subject_ids), 50)]],
             "max_windows": args.max_windows,
             "max_len_per_window": args.max_len_per_window,
+            "bundle_gap_hours": args.bundle_gap_hours,
+            "bundle_max_index_gap": args.bundle_max_index_gap,
             "measurement_num_codebooks": artifacts.measurement_num_codebooks,
             "measurement_codebook_size": artifacts.measurement_codebook_size,
             "measurement_stride": artifacts.measurement_stride,
