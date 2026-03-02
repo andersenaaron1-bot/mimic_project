@@ -39,9 +39,13 @@ from src.ehr_hier.tokenizers.medtok_canonicalize import (
     canonicalize_diagnosis_code,
     canonicalize_medication_code,
     canonicalize_procedure_code,
+    diagnosis_filter,
     ensure_list,
+    medication_filter,
+    procedure_filter,
 )
 from src.ehr_hier.tokenizers.medtok_loader import (
+    build_vocab_from_code2embeddings,
     CategoryVocab,
     load_attr_vocab,
     load_medtok_vocab,
@@ -177,24 +181,45 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         else None
     )
 
+    medtok_code2embeds = Path(args.medtok_code2embeds) if args.medtok_code2embeds else None
     medtok_vocab_dir = Path(args.medtok_vocab_dir)
     medtok_attr_dir = Path(args.medtok_attr_dir)
 
-    diag_vocab = load_medtok_vocab(
-        str(medtok_vocab_dir / "diag_vocab.json"),
-        offset=_offset(manifest, "diagnosis", 1_000_000),
-        name="diagnosis",
-    )
-    proc_vocab = load_medtok_vocab(
-        str(medtok_vocab_dir / "proc_vocab.json"),
-        offset=_offset(manifest, "procedure", 1_200_000),
-        name="procedure",
-    )
-    med_vocab = load_medtok_vocab(
-        str(medtok_vocab_dir / "med_vocab.json"),
-        offset=_offset(manifest, "medication", 1_400_000),
-        name="medication",
-    )
+    if medtok_code2embeds is not None:
+        diag_vocab = build_vocab_from_code2embeddings(
+            str(medtok_code2embeds),
+            offset=_offset(manifest, "diagnosis", 1_000_000),
+            name="diagnosis",
+            filter_fn=diagnosis_filter,
+        )
+        proc_vocab = build_vocab_from_code2embeddings(
+            str(medtok_code2embeds),
+            offset=_offset(manifest, "procedure", 1_200_000),
+            name="procedure",
+            filter_fn=procedure_filter,
+        )
+        med_vocab = build_vocab_from_code2embeddings(
+            str(medtok_code2embeds),
+            offset=_offset(manifest, "medication", 1_400_000),
+            name="medication",
+            filter_fn=medication_filter,
+        )
+    else:
+        diag_vocab = load_medtok_vocab(
+            str(medtok_vocab_dir / "diag_vocab.json"),
+            offset=_offset(manifest, "diagnosis", 1_000_000),
+            name="diagnosis",
+        )
+        proc_vocab = load_medtok_vocab(
+            str(medtok_vocab_dir / "proc_vocab.json"),
+            offset=_offset(manifest, "procedure", 1_200_000),
+            name="procedure",
+        )
+        med_vocab = load_medtok_vocab(
+            str(medtok_vocab_dir / "med_vocab.json"),
+            offset=_offset(manifest, "medication", 1_400_000),
+            name="medication",
+        )
 
     med_attr_vocabs: Dict[str, CategoryVocab] = {}
     for name, filename, default_offset in (
@@ -781,6 +806,7 @@ def main() -> None:
     ap.add_argument("--split", default="train")
     ap.add_argument("--max_subjects", type=int, default=100)
     ap.add_argument("--top_k", type=int, default=20)
+    ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
