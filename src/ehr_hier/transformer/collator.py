@@ -6,6 +6,11 @@ from typing import Dict, List, Literal
 import torch
 
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
+from src.ehr_hier.data.window_segmentation import (
+    SegmentedWindow,
+    WindowSegmentationConfig,
+    segment_event_tokens,
+)
 
 
 @dataclass(frozen=True)
@@ -43,7 +48,8 @@ class AETHierarchicalCollator:
     """
     Collates a batch of EventToken timelines into padded (B, W, L, ...) tensors.
 
-    - Windows are segmented on token.window_hook boundaries.
+    - Windows are segmented with bundle-based transition logic.
+    - Explicit transition metadata takes precedence over legacy token.window_hook splits.
     - Special (window-0) tokens are prefixed to every window.
     - Times are made relative to the start of each window.
     - token_type_ids mirror TokenCategory for now (head mapping handled later).
@@ -56,11 +62,15 @@ class AETHierarchicalCollator:
         max_len_per_window: int = 128,
         pad_id: int = 0,
         window_markers: WindowMarkerConfig | None = None,
+        segmentation: WindowSegmentationConfig | None = None,
     ) -> None:
         self.max_windows = max_windows
         self.max_len = max_len_per_window
         self.pad_id = pad_id
         self.window_markers = window_markers or WindowMarkerConfig()
+        self.segmentation = segmentation or WindowSegmentationConfig(
+            unk_window_type_id=int((window_markers or WindowMarkerConfig()).unk_type_id)
+        )
 
     def __call__(self, batch_timelines: List[List[EventToken]]) -> Dict[str, torch.Tensor]:
         batch_ids: List[List[List[int]]] = []
@@ -74,9 +84,10 @@ class AETHierarchicalCollator:
 
         for timeline in batch_timelines:
             special_tokens, events = self._split_special(timeline)
-            windows = self._segment_into_windows(events)[: self.max_windows]
-            window_type_ids = [self._infer_window_type_id(w) for w in windows]
-            window_start_abs_times = [float(w[0].t_from_start_hours) if w else 0.0 for w in windows]
+            segmented_windows = self._segment_windows(events)[: self.max_windows]
+            windows = [window.tokens for window in segmented_windows]
+            window_type_ids = [int(window.window_type_id) for window in segmented_windows]
+            window_start_abs_times = [float(window.start_time_hours) for window in segmented_windows]
 
             subj_ids: List[List[int]] = []
             subj_times: List[List[float]] = []
@@ -139,17 +150,10 @@ class AETHierarchicalCollator:
         return specials, events
 
     def _segment_into_windows(self, events: List[EventToken]) -> List[List[EventToken]]:
-        windows: List[List[EventToken]] = []
-        current: List[EventToken] = []
-        for tok in events:
-            if tok.window_hook is not None and current:
-                windows.append(current)
-                current = [tok]
-            else:
-                current.append(tok)
-        if current:
-            windows.append(current)
-        return windows
+        return [window.tokens for window in self._segment_windows(events)]
+
+    def _segment_windows(self, events: List[EventToken]) -> List[SegmentedWindow]:
+        return segment_event_tokens(events, config=self.segmentation)
 
     def _process_window(
         self,

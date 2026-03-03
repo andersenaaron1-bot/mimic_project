@@ -5,6 +5,7 @@ import argparse
 import json
 import math
 import sys
+import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -115,6 +116,41 @@ def _load_subject_ids(splits_parquet: str, split: str, max_subjects: int) -> Lis
     if max_subjects > 0:
         ids = ids[:max_subjects]
     return [int(x) for x in ids]
+
+
+def _parse_subject_ids(arg: str | None) -> List[int]:
+    if arg is None or not str(arg).strip():
+        return []
+    out: List[int] = []
+    for part in str(arg).split(","):
+        part = part.strip()
+        if not part:
+            continue
+        out.append(int(part))
+    return out
+
+
+def _maybe_print_progress(
+    pass_name: str,
+    *,
+    idx: int,
+    total: int,
+    every: int,
+    started_at: float,
+) -> None:
+    if every <= 0:
+        return
+    if idx != total and idx % every != 0:
+        return
+    elapsed = max(0.0, time.time() - started_at)
+    rate = float(idx) / elapsed if elapsed > 0 else 0.0
+    remaining = (float(total - idx) / rate) if rate > 0 else float("inf")
+    eta_text = f"{remaining / 60.0:.1f}m" if math.isfinite(remaining) else "unknown"
+    print(
+        f"[{pass_name}] {idx}/{total} subjects | "
+        f"elapsed={elapsed / 60.0:.1f}m | eta={eta_text}",
+        flush=True,
+    )
 
 
 def _prefix_of(code: object) -> str:
@@ -269,6 +305,7 @@ def _summarize_raw_subjects(
     *,
     artifacts: AuditArtifacts,
     top_k: int,
+    progress_every: int = 0,
 ) -> tuple[Dict[str, Any], set[str]]:
     category_counts = Counter()
     prefix_counts = Counter()
@@ -292,7 +329,9 @@ def _summarize_raw_subjects(
     other_codes = Counter()
     structural_raw_codes: set[str] = set()
 
-    for sid in subject_ids:
+    started_at = time.time()
+    total = len(subject_ids)
+    for idx, sid in enumerate(subject_ids, start=1):
         subj = db[int(sid)]
         for ev in subj.events:
             code = getattr(ev, "code", None)
@@ -361,6 +400,14 @@ def _summarize_raw_subjects(
                 structural_raw_codes.add(code_str)
             if category == TokenCategory.OTHER:
                 other_codes[code_str] += 1
+
+        _maybe_print_progress(
+            "raw",
+            idx=idx,
+            total=total,
+            every=progress_every,
+            started_at=started_at,
+        )
 
     raw_summary = {
         "subjects_scanned": len(subject_ids),
@@ -584,6 +631,7 @@ def _summarize_tokenization_and_collation(
     collate_batch_size: int,
     example_subjects: int,
     example_tokens: int,
+    progress_every: int = 0,
 ) -> Dict[str, Any]:
     struct_id2label = _make_structural_id2label(artifacts.structural_codebook)
     collator = AETHierarchicalCollator(
@@ -615,7 +663,9 @@ def _summarize_tokenization_and_collation(
     example_rows: List[Dict[str, Any]] = []
     batch_timelines: List[List[EventToken]] = []
 
-    for sid in subject_ids:
+    started_at = time.time()
+    total = len(subject_ids)
+    for idx, sid in enumerate(subject_ids, start=1):
         audited = _audit_subject_tokenization(
             db,
             sid,
@@ -710,6 +760,14 @@ def _summarize_tokenization_and_collation(
             window_type_zero += int(((batch["window_type_ids"] == 0) & win_mask).sum().item())
             window_type_total += int(win_mask.sum().item())
             batch_timelines = []
+
+        _maybe_print_progress(
+            "timeline",
+            idx=idx,
+            total=total,
+            every=progress_every,
+            started_at=started_at,
+        )
 
     if batch_timelines:
         batch = collator(batch_timelines)
@@ -807,6 +865,7 @@ def main() -> None:
     ap.add_argument("--splits_parquet", required=True)
     ap.add_argument("--split", default="train")
     ap.add_argument("--max_subjects", type=int, default=100)
+    ap.add_argument("--subject_ids", default=None, help="Comma-separated subject ids to inspect.")
     ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
@@ -821,21 +880,45 @@ def main() -> None:
     ap.add_argument("--collate_batch_size", type=int, default=16)
     ap.add_argument("--example_subjects", type=int, default=3)
     ap.add_argument("--example_tokens", type=int, default=40)
+    ap.add_argument("--progress_every", type=int, default=0)
+    ap.add_argument("--skip_raw_summary", action="store_true")
     ap.add_argument("--output_json", default=None)
     args = ap.parse_args()
 
     artifacts = _build_static_artifacts(args)
     db = mr.SubjectDatabase(args.meds_reader_db)
-    subject_ids = _load_subject_ids(args.splits_parquet, args.split, args.max_subjects)
+    subject_ids = _parse_subject_ids(args.subject_ids)
+    if not subject_ids:
+        subject_ids = _load_subject_ids(args.splits_parquet, args.split, args.max_subjects)
     if not subject_ids:
         raise ValueError(f"No subject IDs found for split={args.split}")
 
-    raw_summary, structural_raw_codes = _summarize_raw_subjects(
-        db,
-        subject_ids,
-        artifacts=artifacts,
-        top_k=args.top_k,
-    )
+    if args.skip_raw_summary:
+        raw_summary = {
+            "subjects_scanned": len(subject_ids),
+            "total_events": 0,
+            "events_by_category": {},
+            "numeric_events_by_category": {},
+            "measurement_status": {},
+            "medtok_hits": {},
+            "top_prefixes": [],
+            "top_other_codes": [],
+            "top_codes_by_category": {},
+            "top_medtok_misses": {},
+            "marker_like_counts": {},
+            "structural_labels": {},
+            "structural_boundary_labels": {},
+            "structural_overlay_labels": {},
+        }
+        structural_raw_codes = set()
+    else:
+        raw_summary, structural_raw_codes = _summarize_raw_subjects(
+            db,
+            subject_ids,
+            artifacts=artifacts,
+            top_k=args.top_k,
+            progress_every=args.progress_every,
+        )
 
     struct_codes_union = set(structural_raw_codes)
     if artifacts.structural_codebook is not None:
@@ -871,6 +954,7 @@ def main() -> None:
         collate_batch_size=args.collate_batch_size,
         example_subjects=args.example_subjects,
         example_tokens=args.example_tokens,
+        progress_every=args.progress_every,
     )
 
     payload = {

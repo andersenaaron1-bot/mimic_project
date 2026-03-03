@@ -183,21 +183,38 @@ def build_subject_timeline(
             label = structural_codebook.code2label.get(code_str, "")
             label_id = struct_label2id.get(label, 0)
             val_id = struct_offset + label_id
+            transition_action = structural_codebook.transition_action(code=code_str, label=label)
+            transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
+            transition_window_type_id = structural_codebook.window_type_id(
+                code=code_str,
+                label=label,
+                action=transition_action,
+            )
             is_boundary = bool(window_hook_label) and structural_codebook.is_window_boundary(code=code_str, label=label)
+            struct_attrs = {"struct_label_id": int(label_id)}
+            if transition_action_id is not None:
+                struct_attrs["transition_action_id"] = int(transition_action_id)
+            if transition_window_type_id is not None:
+                struct_attrs["transition_window_type_id"] = int(transition_window_type_id)
+                if transition_action in {"open_next", "close_open"}:
+                    struct_attrs["window_type_id"] = int(transition_window_type_id)
             struct_tok = EventToken(
                 value_id=val_id,
                 category_id=int(TokenCategory.STRUCTURAL),
                 t_from_start_hours=_t_from_start_hours(t) if isinstance(t, datetime) else 0.0,
                 dt_from_prev_hours=dt_hours,
-                cat_attrs={"struct_label_id": int(label_id)},
+                cat_attrs=struct_attrs,
                 num_attrs={},
                 raw_time=t if isinstance(t, datetime) else None,
                 window_hook=window_hook_label if is_boundary else None,
             )
             emitted_for_event.append(struct_tok)
 
-        # Skip original token if structural-only
-        if struct_hit and code_str in struct_only and code_str not in struct_keep_orig:
+        # Skip original token if structural-only, or if the routed category is already
+        # STRUCTURAL and the codebook emitted the canonical structural marker.
+        if struct_hit and code_str not in struct_keep_orig and (
+            code_str in struct_only or category == TokenCategory.STRUCTURAL
+        ):
             # nothing else; record timestamp advance
             tokens.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
@@ -216,6 +233,7 @@ def build_subject_timeline(
         should_hook = (
             bool(window_hook_label)
             and code_str is not None
+            and not (structural_codebook is not None and struct_hit)
             and (
                 (structural_event_map is None and category == TokenCategory.STRUCTURAL)
                 or (structural_event_map is not None and code_str in structural_codes)

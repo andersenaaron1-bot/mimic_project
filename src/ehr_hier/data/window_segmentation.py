@@ -1,0 +1,375 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+
+from src.ehr_hier.data.structural_codes import TRANSITION_ACTION_FROM_ID
+from src.ehr_hier.data.token_types import EventToken, TokenCategory
+
+
+ACTIVE_TRANSITION_ACTIONS = {"open_next", "close_current", "close_open"}
+
+
+@dataclass(frozen=True)
+class WindowSegmentationConfig:
+    """
+    Runtime segmentation policy used by the collator and any future generation code.
+
+    The policy intentionally mirrors the bundle-based audit path:
+      1. detect transition candidates from explicit transition metadata or legacy hooks
+      2. group nearby candidates into local bundles
+      3. merge sparse administrative transition chains
+      4. split the linear sequence with directional actions
+    """
+
+    bundle_gap_hours: float = 0.5
+    bundle_max_index_gap: int = 2
+    merge_transition_chains: bool = True
+    chain_gap_hours: float = 6.0
+    chain_max_intervening_tokens: int = 16
+    unk_window_type_id: int = 0
+
+
+@dataclass
+class SegmentedWindow:
+    tokens: List[EventToken]
+    window_type_id: int
+    start_time_hours: float
+    opening_action: Optional[str] = None
+    closing_action: Optional[str] = None
+
+
+def _cat_attr_int(tok: EventToken, key: str) -> Optional[int]:
+    if tok.cat_attrs is None or key not in tok.cat_attrs:
+        return None
+    try:
+        return int(tok.cat_attrs[key])
+    except Exception:
+        return None
+
+
+def _token_transition_action(tok: EventToken) -> Optional[str]:
+    action_id = _cat_attr_int(tok, "transition_action_id")
+    if action_id is not None and action_id in TRANSITION_ACTION_FROM_ID:
+        return TRANSITION_ACTION_FROM_ID[action_id]
+    if tok.window_hook is not None:
+        # Backward-compatible fallback for older timelines/tests.
+        return "open_next"
+    return None
+
+
+def _token_transition_type_id(tok: EventToken) -> Optional[int]:
+    for key in ("transition_window_type_id", "window_type_id"):
+        type_id = _cat_attr_int(tok, key)
+        if type_id is not None and type_id >= 0:
+            return type_id
+    return None
+
+
+def _infer_window_type_from_tokens(window_tokens: List[EventToken], *, unk_type_id: int) -> int:
+    if not window_tokens:
+        return int(unk_type_id)
+
+    for key in ("window_type_id", "transition_window_type_id"):
+        val = _cat_attr_int(window_tokens[0], key)
+        if val is not None:
+            return int(val)
+
+    struct_label_id = _cat_attr_int(window_tokens[0], "struct_label_id")
+    if struct_label_id is not None:
+        return int(struct_label_id) + 1
+    return int(unk_type_id)
+
+
+def _resolve_opening_window_type(
+    opening_tokens: List[EventToken],
+    *,
+    previous_type_id: int,
+    config: WindowSegmentationConfig,
+) -> int:
+    explicit_ids = [
+        int(type_id)
+        for tok in opening_tokens
+        for type_id in [_token_transition_type_id(tok)]
+        if type_id is not None
+    ]
+    if explicit_ids:
+        # Later items in a transition chain tend to be more specific than the opener.
+        return int(explicit_ids[-1])
+
+    inferred = _infer_window_type_from_tokens(opening_tokens, unk_type_id=config.unk_window_type_id)
+    if inferred != int(config.unk_window_type_id):
+        return int(inferred)
+    if previous_type_id != int(config.unk_window_type_id):
+        return int(previous_type_id)
+    return int(config.unk_window_type_id)
+
+
+def _has_explicit_transition(tokens: List[EventToken]) -> bool:
+    return any(_cat_attr_int(tok, "transition_action_id") is not None for tok in tokens)
+
+
+def _should_merge_transition_chain(
+    left_bundle: Dict[str, object],
+    right_bundle: Dict[str, object],
+    events: List[EventToken],
+    *,
+    config: WindowSegmentationConfig,
+) -> bool:
+    if not config.merge_transition_chains:
+        return False
+
+    left_tokens = events[int(left_bundle["start_idx"]) : int(left_bundle["end_idx"]) + 1]
+    right_tokens = events[int(right_bundle["start_idx"]) : int(right_bundle["end_idx"]) + 1]
+    if not (_has_explicit_transition(left_tokens) and _has_explicit_transition(right_tokens)):
+        return False
+
+    start = int(left_bundle["end_idx"]) + 1
+    stop = int(right_bundle["start_idx"])
+    if stop < start:
+        return True
+
+    intervening = events[start:stop]
+    if len(intervening) > int(config.chain_max_intervening_tokens):
+        return False
+    if any(
+        tok.category_id in {
+            int(TokenCategory.MEASUREMENT),
+            int(TokenCategory.DIAGNOSIS),
+            int(TokenCategory.PROCEDURE),
+            int(TokenCategory.MEDICATION),
+        }
+        for tok in intervening
+    ):
+        return False
+
+    left_t = float(events[int(left_bundle["end_idx"])].t_from_start_hours)
+    right_t = float(events[int(right_bundle["start_idx"])].t_from_start_hours)
+    return max(0.0, right_t - left_t) <= float(config.chain_gap_hours)
+
+
+def _build_boundary_bundles(events: List[EventToken], *, config: WindowSegmentationConfig) -> List[Dict[str, object]]:
+    candidates: List[Dict[str, object]] = []
+    for idx, tok in enumerate(events):
+        action = _token_transition_action(tok)
+        if action in ACTIVE_TRANSITION_ACTIONS:
+            candidates.append({"idx": int(idx), "action": str(action)})
+
+    if not candidates:
+        return []
+
+    bundles: List[Dict[str, object]] = []
+    current: Dict[str, object] = {
+        "start_idx": int(candidates[0]["idx"]),
+        "end_idx": int(candidates[0]["idx"]),
+        "candidate_indices": [int(candidates[0]["idx"])],
+        "candidate_actions": [str(candidates[0]["action"])],
+    }
+
+    for cand in candidates[1:]:
+        idx = int(cand["idx"])
+        prev_idx = int(current["candidate_indices"][-1])  # type: ignore[index]
+        time_gap = abs(float(events[idx].t_from_start_hours) - float(events[prev_idx].t_from_start_hours))
+        idx_gap = idx - prev_idx
+        if idx_gap <= int(config.bundle_max_index_gap) and time_gap <= float(config.bundle_gap_hours):
+            current["end_idx"] = idx
+            current["candidate_indices"].append(idx)  # type: ignore[union-attr]
+            current["candidate_actions"].append(str(cand["action"]))  # type: ignore[union-attr]
+        else:
+            bundles.append(dict(current))
+            current = {
+                "start_idx": idx,
+                "end_idx": idx,
+                "candidate_indices": [idx],
+                "candidate_actions": [str(cand["action"])],
+            }
+    bundles.append(dict(current))
+
+    if not config.merge_transition_chains or len(bundles) < 2:
+        return bundles
+
+    merged: List[Dict[str, object]] = [dict(bundles[0])]
+    for bundle in bundles[1:]:
+        prev = merged[-1]
+        if _should_merge_transition_chain(prev, bundle, events, config=config):
+            prev["end_idx"] = int(bundle["end_idx"])
+            prev["candidate_indices"] = list(prev["candidate_indices"]) + list(bundle["candidate_indices"])  # type: ignore[index]
+            prev["candidate_actions"] = list(prev["candidate_actions"]) + list(bundle["candidate_actions"])  # type: ignore[index]
+        else:
+            merged.append(dict(bundle))
+    return merged
+
+
+def _resolve_bundle_action(
+    bundle_tokens: List[EventToken],
+    bundle_candidate_indices: List[int],
+    *,
+    bundle_start_idx: int,
+) -> tuple[str, List[EventToken], List[EventToken]]:
+    candidate_positions = [int(idx) - int(bundle_start_idx) for idx in bundle_candidate_indices]
+    candidate_actions = [
+        _token_transition_action(bundle_tokens[pos])
+        for pos in candidate_positions
+        if 0 <= pos < len(bundle_tokens)
+    ]
+    open_like_positions = [
+        pos
+        for pos, action in zip(candidate_positions, candidate_actions)
+        if action in {"open_next", "close_open"}
+    ]
+    close_like_positions = [
+        pos
+        for pos, action in zip(candidate_positions, candidate_actions)
+        if action in {"close_current", "close_open"}
+    ]
+
+    if "close_open" in candidate_actions or (open_like_positions and close_like_positions):
+        bundle_action = "close_open"
+    elif open_like_positions:
+        bundle_action = "open_next"
+    elif close_like_positions:
+        bundle_action = "close_current"
+    else:
+        bundle_action = "open_next"
+
+    if bundle_action == "open_next":
+        return bundle_action, [], list(bundle_tokens)
+    if bundle_action == "close_current":
+        return bundle_action, list(bundle_tokens), []
+
+    pivot = min(open_like_positions) if open_like_positions else max(0, len(bundle_tokens) - 1)
+    closing = list(bundle_tokens[:pivot])
+    opening = list(bundle_tokens[pivot:])
+    if not opening and closing:
+        opening.append(closing.pop())
+    return bundle_action, closing, opening
+
+
+def segment_event_tokens(
+    events: List[EventToken],
+    *,
+    config: WindowSegmentationConfig | None = None,
+) -> List[SegmentedWindow]:
+    config = config or WindowSegmentationConfig()
+    if not events:
+        return []
+
+    bundles = _build_boundary_bundles(events, config=config)
+    if not bundles:
+        return [
+            SegmentedWindow(
+                tokens=list(events),
+                window_type_id=_infer_window_type_from_tokens(list(events), unk_type_id=config.unk_window_type_id),
+                start_time_hours=float(events[0].t_from_start_hours),
+                opening_action=None,
+                closing_action=None,
+            )
+        ]
+
+    windows: List[SegmentedWindow] = []
+    current_tokens: List[EventToken] = []
+    current_type_id = int(config.unk_window_type_id)
+    current_opening_action: Optional[str] = None
+
+    cursor = 0
+    for bundle in bundles:
+        start_idx = int(bundle["start_idx"])
+        end_idx = int(bundle["end_idx"])
+        if cursor < start_idx:
+            current_tokens.extend(events[cursor:start_idx])
+
+        bundle_tokens = events[start_idx : end_idx + 1]
+        bundle_action, closing_items, opening_items = _resolve_bundle_action(
+            bundle_tokens,
+            list(bundle["candidate_indices"]),  # type: ignore[arg-type]
+            bundle_start_idx=start_idx,
+        )
+
+        if bundle_action == "close_current":
+            current_tokens.extend(closing_items)
+            if current_tokens:
+                windows.append(
+                    SegmentedWindow(
+                        tokens=list(current_tokens),
+                        window_type_id=(
+                            int(current_type_id)
+                            if int(current_type_id) != int(config.unk_window_type_id)
+                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+                        ),
+                        start_time_hours=float(current_tokens[0].t_from_start_hours),
+                        opening_action=current_opening_action,
+                        closing_action=bundle_action,
+                    )
+                )
+            current_tokens = []
+            current_type_id = int(config.unk_window_type_id)
+            current_opening_action = None
+        elif bundle_action == "open_next":
+            if current_tokens:
+                windows.append(
+                    SegmentedWindow(
+                        tokens=list(current_tokens),
+                        window_type_id=(
+                            int(current_type_id)
+                            if int(current_type_id) != int(config.unk_window_type_id)
+                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+                        ),
+                        start_time_hours=float(current_tokens[0].t_from_start_hours),
+                        opening_action=current_opening_action,
+                        closing_action=None,
+                    )
+                )
+            current_tokens = list(opening_items)
+            current_type_id = _resolve_opening_window_type(
+                opening_items,
+                previous_type_id=current_type_id,
+                config=config,
+            )
+            current_opening_action = bundle_action
+        elif bundle_action == "close_open":
+            current_tokens.extend(closing_items)
+            if current_tokens:
+                windows.append(
+                    SegmentedWindow(
+                        tokens=list(current_tokens),
+                        window_type_id=(
+                            int(current_type_id)
+                            if int(current_type_id) != int(config.unk_window_type_id)
+                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+                        ),
+                        start_time_hours=float(current_tokens[0].t_from_start_hours),
+                        opening_action=current_opening_action,
+                        closing_action=bundle_action,
+                    )
+                )
+            current_tokens = list(opening_items)
+            current_type_id = _resolve_opening_window_type(
+                opening_items,
+                previous_type_id=current_type_id,
+                config=config,
+            )
+            current_opening_action = bundle_action
+        else:
+            raise ValueError(f"Unsupported bundle action: {bundle_action}")
+
+        cursor = end_idx + 1
+
+    if cursor < len(events):
+        current_tokens.extend(events[cursor:])
+
+    if current_tokens:
+        windows.append(
+            SegmentedWindow(
+                tokens=list(current_tokens),
+                window_type_id=(
+                    int(current_type_id)
+                    if int(current_type_id) != int(config.unk_window_type_id)
+                    else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+                ),
+                start_time_hours=float(current_tokens[0].t_from_start_hours),
+                opening_action=current_opening_action,
+                closing_action=None,
+            )
+        )
+
+    return windows

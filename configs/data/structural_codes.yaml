@@ -66,6 +66,29 @@ transition_map:
   "ED_REGISTRATION": "open_next"
   "ED_OUT": "close_current"
 
+window_types:
+  "UNK": 0
+  "PROLOGUE": 1
+  "ED": 2
+  "INPATIENT": 3
+  "ICU": 4
+  "OR": 5
+  "TERMINAL": 6
+
+window_type_map:
+  "MEDS_BIRTH": "PROLOGUE"
+  "ED_REGISTRATION": "ED"
+  "ED_OUT": "ED"
+  "ADMISSION": "INPATIENT"
+  "HOSPITAL_ADMISSION": "INPATIENT"
+  "CAREUNIT_CHANGE": "INPATIENT"
+  "TRANSFER_TO": "INPATIENT"
+  "ICU_ADMISSION": "ICU"
+  "ICU_DISCHARGE": "ICU"
+  "STRUCT_START_OR": "OR"
+  "STRUCT_END_OR": "OR"
+  "MEDS_DEATH": "TERMINAL"
+
 soft_signifiers:
   - "CPR_EVENT"
   - "DEFIB_EVENT"

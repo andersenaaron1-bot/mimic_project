@@ -48,11 +48,20 @@ Concepts:
 Emitted structural `EventToken` fields (by convention):
 - `category_id = TokenCategory.STRUCTURAL`
 - `cat_attrs["struct_label_id"] = <0-based label id>`
+- `cat_attrs["transition_action_id"] = <int>` when the codebook marks the token as a
+  regime-transition candidate (`open_next`, `close_current`, `close_open`, `suppress`)
+- `cat_attrs["transition_window_type_id"] = <int>` when the token implies a target care-regime type
 - `window_hook = <non-None>` iff the label (or code) is configured as a boundary
 
 ### 2.2 Model-driven delimiters (window marker tokens)
-The collator (`src/ehr_hier/transformer/collator.py`) segments timelines on `window_hook`
-and inserts **window marker tokens** inside each window sequence:
+The collator (`src/ehr_hier/transformer/collator.py`) segments timelines using
+**transition bundles**:
+- explicit transition metadata takes precedence
+- nearby transition candidates are grouped into bundles
+- sparse administrative transition chains can be merged
+- legacy `window_hook` boundaries remain as a fallback
+
+It then inserts **window marker tokens** inside each window sequence:
 
     [special_tokens...] [WIN_TYPE] [window_tokens...] [WIN_END or WIN_<NEXT_TYPE>]
 
@@ -67,7 +76,8 @@ Configuration: `WindowMarkerConfig` (and `vocab_config["window_markers"]` for th
   - `"next_type"`: append the *next* window's `WIN_<TYPE>` id (last window still uses `WIN_END`).
 
 Window type id inference:
-- If the first token in a window carries `cat_attrs["window_type_id"]`, use it.
+- If segmentation already assigned a typed regime window, use that type id.
+- Else if the first token in a window carries `cat_attrs["window_type_id"]`, use it.
 - Else if it carries `cat_attrs["struct_label_id"]`, use `struct_label_id + 1` (reserve `0` for UNK).
 - Else fall back to `unk_type_id`.
 

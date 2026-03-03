@@ -5,6 +5,15 @@ from typing import Dict, Optional, Set
 import yaml
 
 
+TRANSITION_ACTION_TO_ID: Dict[str, int] = {
+    "open_next": 1,
+    "close_current": 2,
+    "close_open": 3,
+    "suppress": 4,
+}
+TRANSITION_ACTION_FROM_ID: Dict[int, str] = {v: k for k, v in TRANSITION_ACTION_TO_ID.items()}
+
+
 @dataclass
 class StructuralCodebook:
     """
@@ -32,6 +41,8 @@ class StructuralCodebook:
     boundary_labels: Optional[Set[str]] = None
     boundary_codes: Optional[Set[str]] = None
     transition_map: Dict[str, str] = field(default_factory=dict)
+    window_type2id_map: Dict[str, int] = field(default_factory=dict)
+    window_type_map: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Auto-derive label2id_map if not provided
@@ -44,6 +55,12 @@ class StructuralCodebook:
         if self.boundary_codes is not None:
             self.boundary_codes = {str(x) for x in self.boundary_codes}
         self.transition_map = {str(k): str(v) for k, v in self.transition_map.items()}
+        if not self.window_type2id_map:
+            self.window_type2id_map = {"UNK": 0}
+        else:
+            self.window_type2id_map = {str(k): int(v) for k, v in self.window_type2id_map.items()}
+            self.window_type2id_map.setdefault("UNK", 0)
+        self.window_type_map = {str(k): str(v) for k, v in self.window_type_map.items()}
 
     def label2id(self) -> Dict[str, int]:
         # Return a copy to avoid external mutation
@@ -90,6 +107,81 @@ class StructuralCodebook:
                 return self.transition_map[candidate]
         return None
 
+    def transition_action_id(self, *, code: str | None = None, label: str | None = None) -> Optional[int]:
+        action = self.transition_action(code=code, label=label)
+        if action is None:
+            return None
+        return TRANSITION_ACTION_TO_ID.get(action)
+
+    def window_type2id(self) -> Dict[str, int]:
+        return dict(self.window_type2id_map)
+
+    def window_type_name(
+        self,
+        *,
+        code: str | None = None,
+        label: str | None = None,
+        action: str | None = None,
+    ) -> Optional[str]:
+        candidates = []
+        code_str = None
+        if code is not None:
+            code_str = str(code)
+            candidates.append(code_str)
+        if label is not None:
+            candidates.append(str(label))
+        for candidate in candidates:
+            if candidate in self.window_type_map:
+                return self.window_type_map[candidate]
+
+        if code_str is not None:
+            upper = code_str.upper()
+            prefix = upper.split("//", 1)[0]
+            if prefix in {"HOSPITAL_ADMISSION", "ADMISSION", "CAREUNIT_CHANGE"} and prefix in self.window_type_map:
+                return self.window_type_map[prefix]
+            if prefix in {"ICU_ADMISSION", "ICU_DISCHARGE"} and prefix in self.window_type_map:
+                return self.window_type_map[prefix]
+            if prefix == "TRANSFER_TO":
+                if "//ED//" in upper or "EMERGENCY DEPARTMENT" in upper:
+                    return "ED"
+                if "ICU" in upper:
+                    return "ICU"
+                if "OPERATING ROOM" in upper or "//OR//" in upper:
+                    return "OR"
+                if prefix in self.window_type_map:
+                    return self.window_type_map[prefix]
+            if "EMERGENCY DEPARTMENT" in upper or "EMERGENCY ROOM" in upper or upper.startswith("ED_"):
+                return "ED"
+            if "ICU" in upper:
+                return "ICU"
+            if "OPERATING ROOM" in upper or upper.startswith("OR_") or "//OR//" in upper:
+                return "OR"
+            if prefix in self.window_type_map:
+                return self.window_type_map[prefix]
+
+        if label is not None:
+            label_str = str(label).upper()
+            if "ICU" in label_str:
+                return "ICU"
+            if "OR" in label_str:
+                return "OR"
+
+        if action == "suppress" and code_str == "MEDS_BIRTH":
+            return "PROLOGUE"
+        return None
+
+    def window_type_id(
+        self,
+        *,
+        code: str | None = None,
+        label: str | None = None,
+        action: str | None = None,
+    ) -> Optional[int]:
+        name = self.window_type_name(code=code, label=label, action=action)
+        if name is None:
+            return None
+        return self.window_type2id_map.get(name)
+
     def __contains__(self, code: object) -> bool:
         return code is not None and str(code) in self.code2label
 
@@ -106,6 +198,8 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
       - window_boundary_labels / window_boundaries / boundary_labels: labels that split windows
       - window_boundary_codes / boundary_codes: raw codes that split windows
       - transition_map: mapping raw code / prefix / label -> transition action
+      - window_types: mapping semantic window type -> integer id
+      - window_type_map: mapping raw code / prefix / label -> semantic window type
       - soft_signifiers: list of codes to emit structural markers for (defaults to label "SOFT::<code>")
     """
     with open(yaml_fp, "r", encoding="utf-8") as f:
@@ -158,6 +252,14 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
     if not isinstance(transition_map, dict):
         raise TypeError(f"YAML key 'transition_map' must be a dict, got {type(transition_map)}")
 
+    window_types = payload.get("window_types", {})
+    if not isinstance(window_types, dict):
+        raise TypeError(f"YAML key 'window_types' must be a dict, got {type(window_types)}")
+
+    window_type_map = payload.get("window_type_map", {})
+    if not isinstance(window_type_map, dict):
+        raise TypeError(f"YAML key 'window_type_map' must be a dict, got {type(window_type_map)}")
+
     return StructuralCodebook(
         code2label=code2label,
         structural_only=structural_only,
@@ -166,4 +268,6 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
         boundary_labels=boundary_labels,
         boundary_codes=boundary_codes,
         transition_map={str(k): str(v) for k, v in transition_map.items()},
+        window_type2id_map={str(k): int(v) for k, v in window_types.items()},
+        window_type_map={str(k): str(v) for k, v in window_type_map.items()},
     )

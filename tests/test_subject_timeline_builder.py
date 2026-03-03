@@ -4,7 +4,11 @@ import pytest
 from types import SimpleNamespace
 from typing import Dict, List
 
-from src.ehr_hier.data.structural_codes import StructuralCodebook, load_structural_codebook_yaml
+from src.ehr_hier.data.structural_codes import (
+    TRANSITION_ACTION_TO_ID,
+    StructuralCodebook,
+    load_structural_codebook_yaml,
+)
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
@@ -173,6 +177,70 @@ def test_structural_codebook_can_emit_overlay_without_window_hook():
     assert overlay_tok.cat_attrs.get("struct_label_id") == codebook.label2id()["STRUCT_START_MECH"]
 
 
+def test_structural_codebook_emits_transition_metadata_for_typed_windows():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="ED_REGISTRATION", time=t0)]
+    db = DummyDB({1: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0})
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    codebook = StructuralCodebook(
+        code2label={"ED_REGISTRATION": "STRUCT_START_ADM"},
+        transition_map={"ED_REGISTRATION": "open_next"},
+        window_type2id_map={"UNK": 0, "ED": 2},
+        window_type_map={"ED_REGISTRATION": "ED"},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=1,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        structural_codebook=codebook,
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 1
+    tok = tokens[0]
+    assert tok.cat_attrs["transition_action_id"] == TRANSITION_ACTION_TO_ID["open_next"]
+    assert tok.cat_attrs["transition_window_type_id"] == 2
+    assert tok.cat_attrs["window_type_id"] == 2
+    assert tok.window_hook == "episode"
+
+
+def test_structural_codebook_suppresses_duplicate_legacy_hook_on_original_structural_token():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="HOSPITAL_ADMISSION", time=t0)]
+    db = DummyDB({1: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(
+        name="struct_raw",
+        offset=50,
+        code2id={"<UNK>": 0, "HOSPITAL_ADMISSION": 1},
+    )
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    codebook = StructuralCodebook(
+        code2label={"HOSPITAL_ADMISSION": "STRUCT_START_ADM"},
+        boundary_labels={"STRUCT_START_ADM"},
+        transition_map={"HOSPITAL_ADMISSION": "open_next"},
+        window_type2id_map={"UNK": 0, "INPATIENT": 3},
+        window_type_map={"HOSPITAL_ADMISSION": "INPATIENT"},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=1,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        structural_codebook=codebook,
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 1
+    assert sum(1 for tok in tokens if tok.window_hook is not None) == 1
+    assert tokens[0].window_hook == "episode"
+
+
 def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifiers(tmp_path):
     yaml_fp = tmp_path / "structural_codes.yaml"
     yaml_fp.write_text(
@@ -185,6 +253,11 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
                 "transition_map:",
                 "  EVT_BOUNDARY: open_next",
                 "  TRANSFER_TO: close_open",
+                "window_types:",
+                "  UNK: 0",
+                "  ED: 2",
+                "window_type_map:",
+                "  EVT_BOUNDARY: ED",
                 "soft_signifiers:",
                 "  - CPR_EVENT",
             ]
@@ -198,6 +271,7 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
     assert codebook.code2label["CPR_EVENT"].startswith("SOFT::")
     assert codebook.transition_action(code="EVT_BOUNDARY", label="STRUCT_START_ADM") == "open_next"
     assert codebook.transition_action(code="TRANSFER_TO//ED//Emergency Department") == "close_open"
+    assert codebook.window_type_id(code="EVT_BOUNDARY") == 2
 
 
 def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():
