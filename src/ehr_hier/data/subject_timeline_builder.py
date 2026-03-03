@@ -32,6 +32,9 @@ class _EventWithDemographics:
         return getattr(self._ev, name)
 
 
+ACTIVE_TRANSITION_ACTIONS = {"open_next", "close_current", "close_open"}
+
+
 def build_subject_timeline(
     db: mr.SubjectDatabase,
     subject_id: int,
@@ -120,6 +123,25 @@ def build_subject_timeline(
         struct_enc = encoders.get(TokenCategory.STRUCTURAL)
         struct_offset = getattr(getattr(struct_enc, "vocab", None), "offset", 0) or structural_codebook.offset
 
+    def _transition_attrs_for_event(*, code_str: Optional[str], label: Optional[str]) -> tuple[Dict[str, int], Optional[str]]:
+        if structural_codebook is None or code_str is None:
+            return {}, None
+        transition_action = structural_codebook.transition_action(code=code_str, label=label)
+        transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
+        transition_window_type_id = structural_codebook.window_type_id(
+            code=code_str,
+            label=label,
+            action=transition_action,
+        )
+        attrs: Dict[str, int] = {}
+        if transition_action_id is not None:
+            attrs["transition_action_id"] = int(transition_action_id)
+        if transition_window_type_id is not None:
+            attrs["transition_window_type_id"] = int(transition_window_type_id)
+            if transition_action in {"open_next", "close_open"}:
+                attrs["window_type_id"] = int(transition_window_type_id)
+        return attrs, transition_action
+
     def _extract_med_numeric(ev: object) -> Optional[float]:
         """
         Pull raw numeric_value from MEDS medication events, guarding for NaN/None.
@@ -179,25 +201,21 @@ def build_subject_timeline(
         # Structural codebook: emit structural token regardless of routing
         emitted_for_event: List[EventToken] = []
         struct_hit = structural_codebook is not None and code_str in structural_codebook.code2label
+        routed_transition_attrs: Dict[str, int] = {}
+        routed_transition_action: Optional[str] = None
+        if category == TokenCategory.STRUCTURAL:
+            routed_transition_attrs, routed_transition_action = _transition_attrs_for_event(
+                code_str=code_str,
+                label=None,
+            )
         if struct_hit:
             label = structural_codebook.code2label.get(code_str, "")
             label_id = struct_label2id.get(label, 0)
             val_id = struct_offset + label_id
-            transition_action = structural_codebook.transition_action(code=code_str, label=label)
-            transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
-            transition_window_type_id = structural_codebook.window_type_id(
-                code=code_str,
-                label=label,
-                action=transition_action,
-            )
+            struct_transition_attrs, _ = _transition_attrs_for_event(code_str=code_str, label=label)
             is_boundary = bool(window_hook_label) and structural_codebook.is_window_boundary(code=code_str, label=label)
             struct_attrs = {"struct_label_id": int(label_id)}
-            if transition_action_id is not None:
-                struct_attrs["transition_action_id"] = int(transition_action_id)
-            if transition_window_type_id is not None:
-                struct_attrs["transition_window_type_id"] = int(transition_window_type_id)
-                if transition_action in {"open_next", "close_open"}:
-                    struct_attrs["window_type_id"] = int(transition_window_type_id)
+            struct_attrs.update(struct_transition_attrs)
             struct_tok = EventToken(
                 value_id=val_id,
                 category_id=int(TokenCategory.STRUCTURAL),
@@ -230,15 +248,17 @@ def build_subject_timeline(
 
         # Encoders may return multiple tokens for a single event (e.g., MEDTOK)
         event_tokens = encoder.encode_event(ev_view, dt_hours=dt_hours)
-        should_hook = (
-            bool(window_hook_label)
-            and code_str is not None
-            and not (structural_codebook is not None and struct_hit)
-            and (
-                (structural_event_map is None and category == TokenCategory.STRUCTURAL)
-                or (structural_event_map is not None and code_str in structural_codes)
-            )
-        )
+        should_hook = False
+        if bool(window_hook_label) and code_str is not None and not (structural_codebook is not None and struct_hit):
+            if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
+                should_hook = True
+            elif routed_transition_action == "suppress":
+                should_hook = False
+            else:
+                should_hook = (
+                    (structural_event_map is None and category == TokenCategory.STRUCTURAL)
+                    or (structural_event_map is not None and code_str in structural_codes)
+                )
 
         # Guarantee boundary presence if map says so (fallback to UNK)
         if not event_tokens and should_hook:
@@ -271,12 +291,15 @@ def build_subject_timeline(
             dt_budget = 0.0  # structural token already consumed dt
 
         for idx, tok in enumerate(event_tokens):
+            cat_attrs = dict(tok.cat_attrs)
+            if idx == 0 and routed_transition_attrs:
+                cat_attrs.update(routed_transition_attrs)
             emitted = EventToken(
                 value_id=int(tok.value_id),
                 category_id=int(category),
                 t_from_start_hours=t_from_start,
                 dt_from_prev_hours=dt_budget if idx == 0 else 0.0,
-                cat_attrs=dict(tok.cat_attrs),
+                cat_attrs=cat_attrs,
                 num_attrs=dict(tok.num_attrs),
                 raw_time=t if isinstance(t, datetime) else tok.raw_time,
                 window_hook=window_hook_label if should_hook else tok.window_hook,
