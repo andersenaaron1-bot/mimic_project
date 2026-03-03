@@ -130,6 +130,7 @@ def decode_timeline_tokens(
     medication_id2code: Mapping[int, str] | None = None,
     structural_offset: int | None = None,
     structural_id2label: Mapping[int, str] | None = None,
+    structural_id2code: Mapping[int, str] | None = None,
     special_id2name: Mapping[int, str] | None = None,
 ) -> List[Dict[str, Any]]:
     """
@@ -211,8 +212,9 @@ def decode_timeline_tokens(
         elif category == TokenCategory.STRUCTURAL and structural_offset is not None:
             if tok.cat_attrs and "struct_label_id" in tok.cat_attrs and structural_id2label is not None:
                 entry["label"] = structural_id2label.get(int(tok.cat_attrs["struct_label_id"]))
-            elif structural_id2label is not None:
-                entry["label"] = structural_id2label.get(int(tok.value_id) - int(structural_offset))
+            elif structural_id2code is not None:
+                entry["label"] = structural_id2code.get(int(tok.value_id) - int(structural_offset))
+                entry["raw_code"] = entry.get("label")
 
         out.append(entry)
         i += 1

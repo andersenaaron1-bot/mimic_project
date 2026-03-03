@@ -578,6 +578,7 @@ def _summarize_tokenization_and_collation(
     *,
     encoders: Dict[TokenCategory, Any],
     artifacts: AuditArtifacts,
+    struct_id2code: Mapping[int, str],
     max_windows: int,
     max_len_per_window: int,
     collate_batch_size: int,
@@ -694,6 +695,7 @@ def _summarize_tokenization_and_collation(
                         medication_id2code=invert_code2id(artifacts.med_vocab.code2id),
                         structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
                         structural_id2label=struct_id2label,
+                        structural_id2code=struct_id2code,
                         special_id2name=SPECIAL_ID2NAME,
                     ),
                 }
@@ -839,6 +841,7 @@ def main() -> None:
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
+    struct_id2code = invert_code2id(struct_vocab.code2id)
 
     meas_cfg = _build_measurement_config(args, artifacts=artifacts)
     if meas_cfg is None:
@@ -862,6 +865,7 @@ def main() -> None:
         subject_ids,
         encoders=encoders,
         artifacts=artifacts,
+        struct_id2code=struct_id2code,
         max_windows=args.max_windows,
         max_len_per_window=args.max_len_per_window,
         collate_batch_size=args.collate_batch_size,

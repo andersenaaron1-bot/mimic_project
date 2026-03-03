@@ -35,9 +35,6 @@ structural_map:
   "CRRT_START": "STRUCT_START_CRRT"
   "CRRT_END": "STRUCT_END_CRRT"
 
-  # SURGERY / RECOVERY (site-specific)
-  "225402": "STRUCT_START_REC"    # OR Received (Recovery start)
-
   # GOALS OF CARE
   "CODE_STATUS_CHANGE": "STRUCT_CODE_STATUS_CHANGE"
 
@@ -50,6 +47,25 @@ window_boundary_labels:
   - "STRUCT_END_OR"
   - "STRUCT_END_ADM"
 
+transition_map:
+  "MEDS_BIRTH": "suppress"
+  "MEDS_DEATH": "close_current"
+  "ADMISSION": "open_next"
+  "DISCHARGE": "close_current"
+  "CAREUNIT_CHANGE": "close_open"
+  "STRUCT_START_ADM": "open_next"
+  "STRUCT_END_ADM": "close_current"
+  "STRUCT_CAREUNIT_CHANGE": "close_open"
+  "STRUCT_START_OR": "open_next"
+  "STRUCT_END_OR": "close_current"
+  "HOSPITAL_ADMISSION": "open_next"
+  "HOSPITAL_DISCHARGE": "close_current"
+  "ICU_ADMISSION": "open_next"
+  "ICU_DISCHARGE": "close_current"
+  "TRANSFER_TO": "close_open"
+  "ED_REGISTRATION": "open_next"
+  "ED_OUT": "close_current"
+
 soft_signifiers:
   - "CPR_EVENT"
   - "DEFIB_EVENT"
@@ -58,17 +74,9 @@ soft_signifiers:
   - "MASSIVE_TRANSFUSION"
   - "REINTUBATION_72H"
 
-structural_only:
-  - "224385"
-  - "227194"
-  - "225802"
-  - "225441"
-  - "225803"
-
 keep_original:
   - "221906"
   - "221289"
   - "221749"
-  - "225402"
   - "ADMISSION"
   - "DISCHARGE"

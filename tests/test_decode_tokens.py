@@ -55,6 +55,21 @@ def test_decode_timeline_tokens_labels_med_markers_and_structural():
     assert decoded[3]["label"] == "STRUCT_START_MECH"
 
 
+def test_decode_timeline_tokens_decodes_raw_structural_code_ids():
+    tokens = [
+        EventToken(2200007, int(TokenCategory.STRUCTURAL), 2.0, 1.0, {}, {}),
+    ]
+
+    decoded = decode_timeline_tokens(
+        tokens,
+        structural_offset=2200000,
+        structural_id2code={7: "TRANSFER_TO//ED//Emergency Department"},
+    )
+
+    assert decoded[0]["label"] == "TRANSFER_TO//ED//Emergency Department"
+    assert decoded[0]["raw_code"] == "TRANSFER_TO//ED//Emergency Department"
+
+
 def test_decode_timeline_tokens_does_not_misread_rvq_as_code_token():
     tokens = [
         EventToken(2100007, int(TokenCategory.MEASUREMENT), 1.0, 0.0, {}, {}),

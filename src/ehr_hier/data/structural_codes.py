@@ -18,6 +18,7 @@ class StructuralCodebook:
     keep_original: codes that should emit both structural + routed tokens
     boundary_labels: optional set of structural labels that define window boundaries
     boundary_codes: optional set of raw codes that define window boundaries
+    transition_map: optional mapping from raw code / prefix / label -> transition action
 
     If neither boundary_labels nor boundary_codes are provided, all structural
     codebook hits are treated as window boundaries (backward compatible).
@@ -30,6 +31,7 @@ class StructuralCodebook:
     keep_original: Set[str] = field(default_factory=set)
     boundary_labels: Optional[Set[str]] = None
     boundary_codes: Optional[Set[str]] = None
+    transition_map: Dict[str, str] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         # Auto-derive label2id_map if not provided
@@ -41,6 +43,7 @@ class StructuralCodebook:
             self.boundary_labels = {str(x) for x in self.boundary_labels}
         if self.boundary_codes is not None:
             self.boundary_codes = {str(x) for x in self.boundary_codes}
+        self.transition_map = {str(k): str(v) for k, v in self.transition_map.items()}
 
     def label2id(self) -> Dict[str, int]:
         # Return a copy to avoid external mutation
@@ -62,6 +65,31 @@ class StructuralCodebook:
             return True
         return False
 
+    def transition_action(self, *, code: str | None = None, label: str | None = None) -> Optional[str]:
+        """
+        Resolve a transition action from a raw code or semantic label.
+
+        Matching precedence:
+          1. exact raw code
+          2. raw prefix before "//"
+          3. exact label
+        """
+        if not self.transition_map:
+            return None
+
+        candidates = []
+        if code is not None:
+            code_str = str(code)
+            candidates.append(code_str)
+            candidates.append(code_str.split("//", 1)[0])
+        if label is not None:
+            candidates.append(str(label))
+
+        for candidate in candidates:
+            if candidate in self.transition_map:
+                return self.transition_map[candidate]
+        return None
+
     def __contains__(self, code: object) -> bool:
         return code is not None and str(code) in self.code2label
 
@@ -77,6 +105,7 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
       - offset: optional global vocab offset fallback
       - window_boundary_labels / window_boundaries / boundary_labels: labels that split windows
       - window_boundary_codes / boundary_codes: raw codes that split windows
+      - transition_map: mapping raw code / prefix / label -> transition action
       - soft_signifiers: list of codes to emit structural markers for (defaults to label "SOFT::<code>")
     """
     with open(yaml_fp, "r", encoding="utf-8") as f:
@@ -125,6 +154,10 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
             boundary_codes = _as_code_set(key)
             break
 
+    transition_map = payload.get("transition_map", {})
+    if not isinstance(transition_map, dict):
+        raise TypeError(f"YAML key 'transition_map' must be a dict, got {type(transition_map)}")
+
     return StructuralCodebook(
         code2label=code2label,
         structural_only=structural_only,
@@ -132,4 +165,5 @@ def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> S
         offset=offset,
         boundary_labels=boundary_labels,
         boundary_codes=boundary_codes,
+        transition_map={str(k): str(v) for k, v in transition_map.items()},
     )

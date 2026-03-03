@@ -182,6 +182,9 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
                 "  EVT_BOUNDARY: STRUCT_START_ADM",
                 "window_boundary_labels:",
                 "  - STRUCT_START_ADM",
+                "transition_map:",
+                "  EVT_BOUNDARY: open_next",
+                "  TRANSFER_TO: close_open",
                 "soft_signifiers:",
                 "  - CPR_EVENT",
             ]
@@ -193,6 +196,8 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
     assert codebook.code2label["EVT_BOUNDARY"] == "STRUCT_START_ADM"
     assert codebook.boundary_labels == {"STRUCT_START_ADM"}
     assert codebook.code2label["CPR_EVENT"].startswith("SOFT::")
+    assert codebook.transition_action(code="EVT_BOUNDARY", label="STRUCT_START_ADM") == "open_next"
+    assert codebook.transition_action(code="TRANSFER_TO//ED//Emergency Department") == "close_open"
 
 
 def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():

@@ -32,19 +32,6 @@ from src.ehr_hier.tokenizers.decode_tokens import decode_timeline_tokens, invert
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 
 
-TRANSITION_TEXT_PARTS = (
-    "STRUCT_START_ADM",
-    "STRUCT_END_ADM",
-    "STRUCT_CAREUNIT_CHANGE",
-    "STRUCT_START_OR",
-    "STRUCT_END_OR",
-    "TRANSFER_TO",
-    "HOSPITAL_ADMISSION",
-    "HOSPITAL_DISCHARGE",
-    "ED_REGISTRATION",
-    "ED_OUT",
-)
-
 MARKER_TEXT_PARTS = (
     "MED_MARKER::START",
     "MED_MARKER::END",
@@ -56,27 +43,7 @@ MARKER_TEXT_PARTS = (
     "INFUSION_END",
 )
 
-OPEN_ROLE_PARTS = (
-    "ADMISSION",
-    "TRANSFER_TO",
-    "ED_REGISTRATION",
-    "STRUCT_START_",
-    "MED_MARKER::START",
-    "INFUSION_START",
-    "MEDS_BIRTH",
-    "CAREUNIT_CHANGE",
-)
-
-CLOSE_ROLE_PARTS = (
-    "DISCHARGE",
-    "ED_OUT",
-    "DEATH",
-    "STRUCT_END_",
-    "MED_MARKER::END",
-    "MED_MARKER::STOP",
-    "INFUSION_END",
-)
-
+ACTIVE_TRANSITION_ACTIONS = {"open_next", "close_current", "close_open"}
 
 @dataclass(frozen=True)
 class SegmentationPolicy:
@@ -235,10 +202,9 @@ def _item_preview(item: Mapping[str, Any]) -> Dict[str, Any]:
 
 
 def _is_transition_like(item: Mapping[str, Any]) -> bool:
-    text = _item_text(item)
     if _item_category(item) != "STRUCTURAL":
         return False
-    return any(part in text for part in TRANSITION_TEXT_PARTS)
+    return str(item.get("transition_action")) in ACTIVE_TRANSITION_ACTIONS
 
 
 def _is_marker_like(item: Mapping[str, Any]) -> bool:
@@ -247,12 +213,10 @@ def _is_marker_like(item: Mapping[str, Any]) -> bool:
 
 
 def _item_transition_role(item: Mapping[str, Any]) -> str:
-    text = _item_text(item)
-    has_open = any(part in text for part in OPEN_ROLE_PARTS)
-    has_close = any(part in text for part in CLOSE_ROLE_PARTS)
-    if has_open and not has_close:
+    action = item.get("transition_action")
+    if action == "open_next":
         return "open"
-    if has_close and not has_open:
+    if action == "close_current":
         return "close"
     return "neutral"
 
@@ -328,20 +292,39 @@ def _resolve_bundle_action(
     reasons: Sequence[str],
     fallback_placement: str,
 ) -> tuple[str, List[Dict[str, Any]], List[Dict[str, Any]]]:
+    explicit_actions = [
+        str(item.get("transition_action"))
+        for item in bundle_items
+        if str(item.get("transition_action")) in ACTIVE_TRANSITION_ACTIONS
+    ]
+    if "close_open" in explicit_actions:
+        action = "close_open"
+    elif explicit_actions:
+        uniq_actions = set(explicit_actions)
+        if uniq_actions == {"open_next"}:
+            action = "open_next"
+        elif uniq_actions == {"close_current"}:
+            action = "close_current"
+        else:
+            action = "close_open"
+    else:
+        action = ""
+
     roles = [_item_transition_role(item) for item in bundle_items]
     has_open = any(role == "open" for role in roles)
     has_close = any(role == "close" for role in roles)
 
-    if has_open and has_close:
-        action = "close_open"
-    elif has_open:
-        action = "open_next"
-    elif has_close:
-        action = "close_current"
-    elif any(str(r).startswith("gap>=") for r in reasons):
-        action = "open_next"
-    else:
-        action = str(fallback_placement)
+    if not action:
+        if has_open and has_close:
+            action = "close_open"
+        elif has_open:
+            action = "open_next"
+        elif has_close:
+            action = "close_current"
+        elif any(str(r).startswith("gap>=") for r in reasons):
+            action = "open_next"
+        else:
+            action = str(fallback_placement)
 
     closing_items: List[Dict[str, Any]] = []
     opening_items: List[Dict[str, Any]] = []
@@ -629,6 +612,7 @@ def _decode_full_timeline(
     event_tokens: List[Any],
     *,
     artifacts: AuditArtifacts,
+    struct_id2code: Mapping[int, str],
 ) -> List[Dict[str, Any]]:
     struct_id2label = _make_structural_id2label(artifacts.structural_codebook)
     decoded = decode_timeline_tokens(
@@ -646,9 +630,22 @@ def _decode_full_timeline(
         medication_id2code=invert_code2id(artifacts.med_vocab.code2id),
         structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
         structural_id2label=struct_id2label,
+        structural_id2code=struct_id2code,
         special_id2name=SPECIAL_ID2NAME,
     )
-    return _annotate_token_spans(decoded)
+    annotated = _annotate_token_spans(decoded)
+    codebook = artifacts.structural_codebook
+    if codebook is None:
+        return annotated
+    for item in annotated:
+        if _item_category(item) != "STRUCTURAL":
+            continue
+        raw_code = item.get("raw_code")
+        label = item.get("label")
+        action = codebook.transition_action(code=raw_code, label=label)
+        if action is not None:
+            item["transition_action"] = action
+    return annotated
 
 
 def _collect_policy_outputs(
@@ -657,6 +654,7 @@ def _collect_policy_outputs(
     *,
     encoders: Dict[Any, Any],
     artifacts: AuditArtifacts,
+    struct_id2code: Mapping[int, str],
     max_windows: int,
     max_len_per_window: int,
     policies: List[SegmentationPolicy],
@@ -685,7 +683,11 @@ def _collect_policy_outputs(
         )
         timeline = audited["timeline"]
         special_tokens, event_tokens = collator._split_special(timeline)
-        decoded_items = _decode_full_timeline(event_tokens, artifacts=artifacts)
+        decoded_items = _decode_full_timeline(
+            event_tokens,
+            artifacts=artifacts,
+            struct_id2code=struct_id2code,
+        )
 
         for policy in policies:
             segmented_windows, boundaries = _segment_items(
@@ -955,6 +957,7 @@ def main() -> None:
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
+    struct_id2code = invert_code2id(struct_vocab.code2id)
 
     meas_cfg = _build_measurement_config(args, artifacts=artifacts)
     if meas_cfg is None:
@@ -979,6 +982,7 @@ def main() -> None:
         subject_ids,
         encoders=encoders,
         artifacts=artifacts,
+        struct_id2code=struct_id2code,
         max_windows=args.max_windows,
         max_len_per_window=args.max_len_per_window,
         policies=policies,
