@@ -1,8 +1,9 @@
 # Time Model (TIME_MODEL)
 
-This repo models time at two coupled scales:
-- **Intra-window time**: irregular time within a "window of care" (local encoder).
-- **Inter-window time**: the macro timing between windows (global aggregator).
+This repo now models time at three coupled scales:
+- **Intra-chunk time**: irregular time within a bounded local attention chunk.
+- **Intra-window time**: progress across local chunks inside one semantic care-regime window.
+- **Inter-window time**: the macro timing between semantic windows in the global trajectory.
 
 The intent is to preserve clinical semantics: the model reasons about *what happened*
 within a care setting, and *how care settings evolve* over longer trajectories.
@@ -20,13 +21,16 @@ Notes:
 
 ## 2) Collation-time tensors (what the model actually receives)
 The hierarchical collator (`src/ehr_hier/transformer/collator.py`) produces:
-- `time_ids[b,w,l]` (float): **window-relative** time in hours.
-  - For a token at absolute time `t_abs`, `t_rel = max(0, t_abs - window_start_abs)`.
-  - Summary/special tokens are forced to `t_rel = 0`.
-- `window_start_times[b,w]` (float): **absolute** window start time in hours (macro clock).
+- `time_ids[b,w,c,l]` (float): **chunk-relative** time in hours.
+  - For a token at absolute time `t_abs`, `t_rel_chunk = max(0, t_abs - chunk_start_abs)`.
+  - Summary/special tokens are forced to `0`.
+- `chunk_start_offsets[b,w,c]` (float): hours from semantic-window start to chunk start.
+- `window_start_times[b,w]` (float): **absolute** semantic-window start time in hours (macro clock).
 
-This cleanly separates "micro" time (within-window ordering/density) from "macro" time
-(when each window happened in the patient's course).
+This cleanly separates:
+- local time inside a bounded chunk,
+- semantic-window progress across chunks, and
+- macro time across the patient trajectory.
 
 ## 3) How AET uses time
 
@@ -34,7 +38,8 @@ This cleanly separates "micro" time (within-window ordering/density) from "macro
 `ContinuousRotaryPositionalEmbedding` rotates Q/K using continuous timestamps instead of
 integer positions (see `src/ehr_hier/transformer/embeddings.py`).
 
-- Local encoder: cRoPE is driven by `time_ids` (hours since window start).
+- Local encoder: cRoPE is driven by `time_ids` (hours since chunk start).
+- Intra-window chunk aggregator: cRoPE is driven by `chunk_start_offsets`.
 - Global aggregator: cRoPE is driven by `window_start_times` (hours since timeline start).
 
 ### 3.2 Optional ALiBi-style bias in hours
@@ -58,8 +63,20 @@ Why both?
 - additive time embeddings make time available to MLPs/heads even without attending.
 
 ## 4) Time-aware window transition modeling (signifiers)
-AET optionally predicts expected window length (in tokens and hours) and uses it to bias
-the logits of the **window marker tokens** (WIN_END / WIN_<TYPE>) during local decoding
+AET optionally predicts expected semantic-window length (in tokens and hours) and uses it to bias
+the logits of the **semantic transition markers** (`WIN_END` / `WIN_<TYPE>`) on the final chunk.
+
+Separately, the local chunk path can predict chunk length priors and bias the
+`WIN_CONTINUE` marker inside dense semantic windows.
+
+Current levels:
+- semantic-window priors:
+  - `pred_window_len_tokens`, `pred_window_len_hours`
+  - `pred_window_dur_mu`, `pred_window_dur_sigma`
+- chunk-local priors:
+  - `pred_chunk_len_tokens`, `pred_chunk_len_hours`
+
+Both are trained on their own target objects: semantic windows vs bounded local chunks.
 (see `src/ehr_hier/transformer/model.py`):
 
 - Predict priors per window: `pred_window_len_tokens`, `pred_window_len_hours`

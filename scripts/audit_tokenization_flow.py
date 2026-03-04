@@ -627,6 +627,7 @@ def _summarize_tokenization_and_collation(
     artifacts: AuditArtifacts,
     struct_id2code: Mapping[int, str],
     max_windows: int,
+    max_chunks_per_window: int,
     max_len_per_window: int,
     collate_batch_size: int,
     example_subjects: int,
@@ -636,6 +637,7 @@ def _summarize_tokenization_and_collation(
     struct_id2label = _make_structural_id2label(artifacts.structural_codebook)
     collator = AETHierarchicalCollator(
         max_windows=max_windows,
+        max_chunks_per_window=max_chunks_per_window,
         max_len_per_window=max_len_per_window,
         pad_id=0,
         window_markers=WindowMarkerConfig(),
@@ -654,10 +656,12 @@ def _summarize_tokenization_and_collation(
     family_max_id: Dict[str, int] = {}
 
     window_counts = Counter()
+    chunk_counts = Counter()
     truncation_counts = Counter()
     numeric_mask_ones = 0
     attention_mask_ones = 0
     window_mask_ones = 0
+    chunk_mask_ones = 0
     window_type_zero = 0
     window_type_total = 0
     example_rows: List[Dict[str, Any]] = []
@@ -693,7 +697,7 @@ def _summarize_tokenization_and_collation(
             bundle_sizes_by_category[cat_name].update(bundle_counter)
 
         specials, events = collator._split_special(timeline)
-        all_windows = collator._segment_into_windows(events)
+        all_windows = collator._segment_windows(events)
         kept_windows = all_windows[: max_windows]
         if len(all_windows) > max_windows:
             truncation_counts["subjects_truncated_by_max_windows"] += 1
@@ -701,30 +705,34 @@ def _summarize_tokenization_and_collation(
         window_counts["subjects"] += 1
         window_counts["windows_total_pre_cap"] += len(all_windows)
         window_counts["windows_total_post_cap"] += len(kept_windows)
+        chunked_windows = collator._chunk_windows(kept_windows, special_tokens=specials)
+        chunk_counts["chunks_total_post_cap"] += sum(len(window.chunks) for window in chunked_windows)
+        chunk_counts["semantic_windows_split_into_chunks"] += sum(1 for window in chunked_windows if len(window.chunks) > 1)
 
-        win_types = [collator._infer_window_type_id(w) for w in kept_windows]
-        win_starts = [float(w[0].t_from_start_hours) if w else 0.0 for w in kept_windows]
-        for wi, window in enumerate(kept_windows):
+        win_types = [int(window.window_type_id) for window in chunked_windows]
+        win_starts = [float(window.start_time_hours) for window in chunked_windows]
+        for wi, window in enumerate(chunked_windows):
             prefix_len = len(specials) + (1 if collator.window_markers.enabled else 0)
             suffix_len = 1 if collator.window_markers.enabled else 0
             budget = max(0, collator.max_len - prefix_len - suffix_len)
-            if len(window) > budget:
-                truncation_counts["windows_truncated_by_max_len"] += 1
-            if budget == 0 and len(window) > 0:
+            if sum(len(chunk.tokens) for chunk in window.chunks) < len(window.tokens):
+                truncation_counts["semantic_windows_truncated_by_max_chunks"] += 1
+            if budget == 0 and len(window.tokens) > 0:
                 truncation_counts["marker_only_windows"] += 1
 
             next_type = win_types[wi + 1] if wi + 1 < len(win_types) else None
             next_start = win_starts[wi + 1] if wi + 1 < len(win_starts) else None
-            ids, *_ = collator._process_window(
-                window,
-                specials,
-                w_type_id=win_types[wi],
-                w_start_abs=win_starts[wi],
-                next_type_id=next_type,
-                next_start_abs=next_start,
-            )
-            if len(ids) > collator.max_len:
-                truncation_counts["windows_overflow_internal_budget"] += 1
+            for chunk in window.chunks:
+                ids, *_ = collator._process_chunk(
+                    chunk,
+                    specials,
+                    w_type_id=win_types[wi],
+                    w_start_abs=win_starts[wi],
+                    next_type_id=next_type,
+                    next_start_abs=next_start,
+                )
+                if len(ids) > collator.max_len:
+                    truncation_counts["chunks_overflow_internal_budget"] += 1
 
         if len(example_rows) < example_subjects:
             example_rows.append(
@@ -756,6 +764,7 @@ def _summarize_tokenization_and_collation(
             numeric_mask_ones += int(batch["numeric_mask"].sum().item())
             attention_mask_ones += int(batch["attention_mask"].sum().item())
             window_mask_ones += int(batch["window_mask"].sum().item())
+            chunk_mask_ones += int(batch["chunk_mask"].sum().item())
             win_mask = batch["window_mask"].to(dtype=torch.bool)
             window_type_zero += int(((batch["window_type_ids"] == 0) & win_mask).sum().item())
             window_type_total += int(win_mask.sum().item())
@@ -774,6 +783,7 @@ def _summarize_tokenization_and_collation(
         numeric_mask_ones += int(batch["numeric_mask"].sum().item())
         attention_mask_ones += int(batch["attention_mask"].sum().item())
         window_mask_ones += int(batch["window_mask"].sum().item())
+        chunk_mask_ones += int(batch["chunk_mask"].sum().item())
         win_mask = batch["window_mask"].to(dtype=torch.bool)
         window_type_zero += int(((batch["window_type_ids"] == 0) & win_mask).sum().item())
         window_type_total += int(win_mask.sum().item())
@@ -810,6 +820,7 @@ def _summarize_tokenization_and_collation(
 
     collation_summary = {
         "windows": _as_plain_counter(window_counts),
+        "chunks": _as_plain_counter(chunk_counts),
         "truncation": _as_plain_counter(truncation_counts),
         "numeric_mask_density_vs_attended": (
             float(numeric_mask_ones) / float(attention_mask_ones)
@@ -828,6 +839,7 @@ def _summarize_tokenization_and_collation(
         ),
         "attended_tokens": int(attention_mask_ones),
         "active_windows": int(window_mask_ones),
+        "active_chunks": int(chunk_mask_ones),
     }
 
     return {
@@ -852,6 +864,7 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Timeline dropped events by category:", timeline["dropped_events_by_category"])
     print("Average tokens per emitted event:", timeline["avg_tokens_per_emitted_event_by_category"])
     print("Collation windows:", coll["windows"])
+    print("Collation chunks:", coll.get("chunks", {}))
     print("Collation truncation:", coll["truncation"])
     print("Collation numeric_mask_density_vs_attended:", f"{coll['numeric_mask_density_vs_attended']:.4f}")
     print("Collation window_type_unk_frac:", f"{coll['window_type_unk_frac']:.4f}")
@@ -876,6 +889,7 @@ def main() -> None:
     ap.add_argument("--cvae_ckpt", default=None)
     ap.add_argument("--tokenizer_ckpt", default=None)
     ap.add_argument("--max_windows", type=int, default=64)
+    ap.add_argument("--max_chunks_per_window", type=int, default=8)
     ap.add_argument("--max_len_per_window", type=int, default=128)
     ap.add_argument("--collate_batch_size", type=int, default=16)
     ap.add_argument("--example_subjects", type=int, default=3)
@@ -950,6 +964,7 @@ def main() -> None:
         artifacts=artifacts,
         struct_id2code=struct_id2code,
         max_windows=args.max_windows,
+        max_chunks_per_window=args.max_chunks_per_window,
         max_len_per_window=args.max_len_per_window,
         collate_batch_size=args.collate_batch_size,
         example_subjects=args.example_subjects,
@@ -962,6 +977,7 @@ def main() -> None:
             "split": args.split,
             "subjects_scanned": len(subject_ids),
             "max_windows": args.max_windows,
+            "max_chunks_per_window": args.max_chunks_per_window,
             "max_len_per_window": args.max_len_per_window,
             "collate_batch_size": args.collate_batch_size,
             "measurement_num_codebooks": artifacts.measurement_num_codebooks,

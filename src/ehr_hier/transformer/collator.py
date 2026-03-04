@@ -7,9 +7,10 @@ import torch
 
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.data.window_segmentation import (
+    SegmentedChunk,
     SegmentedWindow,
     WindowSegmentationConfig,
-    rebalance_segmented_windows,
+    chunk_segmented_windows,
     segment_event_tokens,
 )
 
@@ -39,6 +40,9 @@ class WindowMarkerConfig:
     # Global token id for the end-of-window marker. If None, defaults to
     # type_token_offset + num_types (i.e., directly after the WIN_<TYPE> block).
     end_token_id: int | None = None
+    # Global token id for the intra-window continuation marker. If None, defaults to
+    # end_token_id + 1 (or directly after the WIN_<TYPE>/WIN_END block).
+    continue_token_id: int | None = None
     # Fallback type id when a window type cannot be inferred.
     unk_type_id: int = 0
     # Category assigned to marker tokens (affects pooling masks, not routing).
@@ -60,12 +64,14 @@ class AETHierarchicalCollator:
         self,
         *,
         max_windows: int = 64,
+        max_chunks_per_window: int = 8,
         max_len_per_window: int = 128,
         pad_id: int = 0,
         window_markers: WindowMarkerConfig | None = None,
         segmentation: WindowSegmentationConfig | None = None,
     ) -> None:
         self.max_windows = max_windows
+        self.max_chunks_per_window = max_chunks_per_window
         self.max_len = max_len_per_window
         self.pad_id = pad_id
         self.window_markers = window_markers or WindowMarkerConfig()
@@ -74,51 +80,108 @@ class AETHierarchicalCollator:
         )
 
     def __call__(self, batch_timelines: List[List[EventToken]]) -> Dict[str, torch.Tensor]:
-        batch_ids: List[List[List[int]]] = []
-        batch_times: List[List[List[float]]] = []
-        batch_vals: List[List[List[float]]] = []
-        batch_types: List[List[List[int]]] = []
-        batch_attn: List[List[List[int]]] = []
-        batch_valmask: List[List[List[int]]] = []
+        batch_ids: List[List[List[List[int]]]] = []
+        batch_times: List[List[List[List[float]]]] = []
+        batch_vals: List[List[List[List[float]]]] = []
+        batch_types: List[List[List[List[int]]]] = []
+        batch_attn: List[List[List[List[int]]]] = []
+        batch_valmask: List[List[List[List[int]]]] = []
         batch_window_types: List[List[int]] = []
         batch_window_start_times: List[List[float]] = []
+        batch_chunk_mask: List[List[List[int]]] = []
+        batch_chunk_start_offsets: List[List[List[float]]] = []
+        batch_chunk_start_times: List[List[List[float]]] = []
+        batch_chunk_is_last: List[List[List[int]]] = []
+        batch_window_token_counts: List[List[float]] = []
+        batch_window_duration_hours: List[List[float]] = []
+        batch_chunk_token_counts: List[List[List[float]]] = []
+        batch_chunk_duration_hours: List[List[List[float]]] = []
 
         for timeline in batch_timelines:
             special_tokens, events = self._split_special(timeline)
-            segmented_windows = self._segment_windows(events, special_tokens=special_tokens)[: self.max_windows]
-            windows = [window.tokens for window in segmented_windows]
-            window_type_ids = [int(window.window_type_id) for window in segmented_windows]
-            window_start_abs_times = [float(window.start_time_hours) for window in segmented_windows]
+            semantic_windows = self._segment_windows(events)[: self.max_windows]
+            chunked_windows = self._chunk_windows(semantic_windows, special_tokens=special_tokens)
+            window_type_ids = [int(window.window_type_id) for window in chunked_windows]
+            window_start_abs_times = [float(window.start_time_hours) for window in chunked_windows]
 
-            subj_ids: List[List[int]] = []
-            subj_times: List[List[float]] = []
-            subj_vals: List[List[float]] = []
-            subj_types: List[List[int]] = []
-            subj_masks: List[List[int]] = []
-            subj_valmask: List[List[int]] = []
+            subj_ids: List[List[List[int]]] = []
+            subj_times: List[List[List[float]]] = []
+            subj_vals: List[List[List[float]]] = []
+            subj_types: List[List[List[int]]] = []
+            subj_masks: List[List[List[int]]] = []
+            subj_valmask: List[List[List[int]]] = []
             subj_window_types: List[int] = []
             subj_window_start_times: List[float] = []
+            subj_chunk_mask: List[List[int]] = []
+            subj_chunk_start_offsets: List[List[float]] = []
+            subj_chunk_start_times: List[List[float]] = []
+            subj_chunk_is_last: List[List[int]] = []
+            subj_window_token_counts: List[float] = []
+            subj_window_duration_hours: List[float] = []
+            subj_chunk_token_counts: List[List[float]] = []
+            subj_chunk_duration_hours: List[List[float]] = []
 
-            for wi, window in enumerate(windows):
+            for wi, window in enumerate(chunked_windows):
                 next_type_id = window_type_ids[wi + 1] if wi + 1 < len(window_type_ids) else None
                 next_start_abs = window_start_abs_times[wi + 1] if wi + 1 < len(window_start_abs_times) else None
-                w_ids, w_times, w_vals, w_valmask, w_types, w_type_id, w_start_time = self._process_window(
-                    window,
-                    special_tokens,
-                    w_type_id=window_type_ids[wi],
-                    w_start_abs=window_start_abs_times[wi],
-                    next_type_id=next_type_id,
-                    next_start_abs=next_start_abs,
-                )
-                seq_len = len(w_ids)
-                subj_ids.append(w_ids)
-                subj_times.append(w_times)
-                subj_vals.append(w_vals)
-                subj_types.append(w_types)
-                subj_masks.append([1] * seq_len)
-                subj_valmask.append(w_valmask)
-                subj_window_types.append(w_type_id)
-                subj_window_start_times.append(w_start_time)
+                chunk_ids: List[List[int]] = []
+                chunk_times: List[List[float]] = []
+                chunk_vals: List[List[float]] = []
+                chunk_types: List[List[int]] = []
+                chunk_masks: List[List[int]] = []
+                chunk_valmask: List[List[int]] = []
+                chunk_mask: List[int] = []
+                chunk_offsets: List[float] = []
+                chunk_start_times: List[float] = []
+                chunk_is_last: List[int] = []
+                chunk_token_counts: List[float] = []
+                chunk_duration_hours: List[float] = []
+
+                for chunk in window.chunks:
+                    ids, times, vals, valmask, types, start_abs, start_offset = self._process_chunk(
+                        chunk,
+                        special_tokens,
+                        w_type_id=window_type_ids[wi],
+                        w_start_abs=window_start_abs_times[wi],
+                        next_type_id=next_type_id,
+                        next_start_abs=next_start_abs,
+                    )
+                    seq_len = len(ids)
+                    chunk_ids.append(ids)
+                    chunk_times.append(times)
+                    chunk_vals.append(vals)
+                    chunk_types.append(types)
+                    chunk_masks.append([1] * seq_len)
+                    chunk_valmask.append(valmask)
+                    chunk_mask.append(1)
+                    chunk_offsets.append(start_offset)
+                    chunk_start_times.append(start_abs)
+                    chunk_is_last.append(1 if chunk.is_last_chunk else 0)
+                    chunk_token_counts.append(float(len(chunk.tokens)))
+                    if chunk.tokens:
+                        chunk_duration_hours.append(float(chunk.tokens[-1].t_from_start_hours) - float(chunk.start_time_hours))
+                    else:
+                        chunk_duration_hours.append(0.0)
+
+                subj_ids.append(chunk_ids)
+                subj_times.append(chunk_times)
+                subj_vals.append(chunk_vals)
+                subj_types.append(chunk_types)
+                subj_masks.append(chunk_masks)
+                subj_valmask.append(chunk_valmask)
+                subj_window_types.append(int(window.window_type_id))
+                subj_window_start_times.append(float(window.start_time_hours))
+                subj_chunk_mask.append(chunk_mask)
+                subj_chunk_start_offsets.append(chunk_offsets)
+                subj_chunk_start_times.append(chunk_start_times)
+                subj_chunk_is_last.append(chunk_is_last)
+                subj_window_token_counts.append(float(len(window.tokens)))
+                if window.tokens:
+                    subj_window_duration_hours.append(float(window.tokens[-1].t_from_start_hours) - float(window.start_time_hours))
+                else:
+                    subj_window_duration_hours.append(0.0)
+                subj_chunk_token_counts.append(chunk_token_counts)
+                subj_chunk_duration_hours.append(chunk_duration_hours)
 
             batch_ids.append(subj_ids)
             batch_times.append(subj_times)
@@ -128,6 +191,14 @@ class AETHierarchicalCollator:
             batch_valmask.append(subj_valmask)
             batch_window_types.append(subj_window_types)
             batch_window_start_times.append(subj_window_start_times)
+            batch_chunk_mask.append(subj_chunk_mask)
+            batch_chunk_start_offsets.append(subj_chunk_start_offsets)
+            batch_chunk_start_times.append(subj_chunk_start_times)
+            batch_chunk_is_last.append(subj_chunk_is_last)
+            batch_window_token_counts.append(subj_window_token_counts)
+            batch_window_duration_hours.append(subj_window_duration_hours)
+            batch_chunk_token_counts.append(subj_chunk_token_counts)
+            batch_chunk_duration_hours.append(subj_chunk_duration_hours)
 
         return self._pad_batch(
             batch_ids,
@@ -138,6 +209,14 @@ class AETHierarchicalCollator:
             batch_valmask,
             batch_window_types,
             batch_window_start_times,
+            batch_chunk_mask,
+            batch_chunk_start_offsets,
+            batch_chunk_start_times,
+            batch_chunk_is_last,
+            batch_window_token_counts,
+            batch_window_duration_hours,
+            batch_chunk_token_counts,
+            batch_chunk_duration_hours,
         )
 
     def _split_special(self, timeline: List[EventToken]) -> tuple[List[EventToken], List[EventToken]]:
@@ -153,61 +232,84 @@ class AETHierarchicalCollator:
     def _segment_into_windows(self, events: List[EventToken]) -> List[List[EventToken]]:
         return [window.tokens for window in self._segment_windows(events)]
 
-    def _segment_windows(
+    def _segment_windows(self, events: List[EventToken]) -> List[SegmentedWindow]:
+        return segment_event_tokens(events, config=self.segmentation)
+
+    def _chunk_windows(
         self,
-        events: List[EventToken],
+        semantic_windows: List[SegmentedWindow],
         *,
         special_tokens: List[EventToken] | None = None,
     ) -> List[SegmentedWindow]:
-        semantic_windows = segment_event_tokens(events, config=self.segmentation)
         marker_slots = 2 if self.window_markers.enabled else 0
         special_count = len(special_tokens or [])
         max_content_tokens = max(1, int(self.max_len) - int(marker_slots) - int(special_count))
-        return rebalance_segmented_windows(
+        return chunk_segmented_windows(
             semantic_windows,
             max_content_tokens=max_content_tokens,
+            max_chunks_per_window=int(self.max_chunks_per_window),
             config=self.segmentation,
         )
 
-    def _process_window(
+    def _window_end_token_id(self) -> int:
+        return (
+            int(self.window_markers.end_token_id)
+            if self.window_markers.end_token_id is not None
+            else int(self.window_markers.type_token_offset) + int(self.window_markers.num_types)
+        )
+
+    def _window_continue_token_id(self) -> int:
+        if self.window_markers.continue_token_id is not None:
+            return int(self.window_markers.continue_token_id)
+        return self._window_end_token_id() + 1
+
+    def _process_chunk(
         self,
-        window_tokens: List[EventToken],
+        chunk: SegmentedChunk,
         special_tokens: List[EventToken],
         *,
         w_type_id: int,
         w_start_abs: float,
         next_type_id: int | None,
         next_start_abs: float | None,
-    ) -> tuple[List[int], List[float], List[float], List[int], List[int], int, float]:
-        if not window_tokens:
-            return [], [], [], [], [], int(self.window_markers.unk_type_id), 0.0
+    ) -> tuple[List[int], List[float], List[float], List[int], List[int], float, float]:
+        if not chunk.tokens:
+            return [], [], [], [], [], float(w_start_abs), 0.0
 
         w_start_abs = float(w_start_abs)
         w_type_id = int(w_type_id)
+        chunk_start_abs = float(chunk.start_time_hours)
+        chunk_start_offset = max(0.0, chunk_start_abs - w_start_abs)
 
-        # Build sequence with optional window markers while preserving the end marker.
         prefix: List[EventToken] = list(special_tokens)
         suffix: List[EventToken] = []
         if self.window_markers.enabled:
             type_token_id = int(self.window_markers.type_token_offset) + int(w_type_id)
-            end_token_id = (
-                int(self.window_markers.end_token_id)
-                if self.window_markers.end_token_id is not None
-                else int(self.window_markers.type_token_offset) + int(self.window_markers.num_types)
-            )
+            end_token_id = self._window_end_token_id()
             end_mode = str(getattr(self.window_markers, "end_mode", "end_token"))
 
             prefix.append(
                 EventToken(
                     value_id=type_token_id,
                     category_id=int(self.window_markers.marker_category),
-                    t_from_start_hours=w_start_abs,
+                    t_from_start_hours=chunk_start_abs,
                     dt_from_prev_hours=0.0,
                     cat_attrs={"window_type_id": int(w_type_id)},
                     num_attrs={},
                 )
             )
-            if end_mode == "next_type" and next_type_id is not None:
+            if not chunk.is_last_chunk:
+                suffix.append(
+                    EventToken(
+                        value_id=self._window_continue_token_id(),
+                        category_id=int(self.window_markers.marker_category),
+                        t_from_start_hours=float(chunk.tokens[-1].t_from_start_hours),
+                        dt_from_prev_hours=0.0,
+                        cat_attrs={"window_type_id": int(w_type_id), "chunk_continue": 1},
+                        num_attrs={},
+                    )
+                )
+            elif end_mode == "next_type" and next_type_id is not None:
                 next_type_id_int = self._clamp_window_type_id(int(next_type_id))
                 next_token_id = int(self.window_markers.type_token_offset) + int(next_type_id_int)
                 suffix.append(
@@ -225,7 +327,7 @@ class AETHierarchicalCollator:
                     EventToken(
                         value_id=end_token_id,
                         category_id=int(self.window_markers.marker_category),
-                        t_from_start_hours=float(window_tokens[-1].t_from_start_hours),
+                        t_from_start_hours=float(chunk.tokens[-1].t_from_start_hours),
                         dt_from_prev_hours=0.0,
                         cat_attrs={},
                         num_attrs={},
@@ -233,7 +335,7 @@ class AETHierarchicalCollator:
                 )
 
         budget = max(0, int(self.max_len) - len(prefix) - len(suffix))
-        seq: List[EventToken] = prefix + window_tokens[:budget] + suffix
+        seq: List[EventToken] = prefix + chunk.tokens[:budget] + suffix
 
         ids: List[int] = []
         times: List[float] = []
@@ -251,10 +353,41 @@ class AETHierarchicalCollator:
             if tok in special_tokens:
                 times.append(0.0)
             else:
-                rel_t = max(0.0, float(tok.t_from_start_hours) - w_start_abs)
+                rel_t = max(0.0, float(tok.t_from_start_hours) - chunk_start_abs)
                 times.append(rel_t)
 
-        return ids, times, vals, val_mask, types, int(w_type_id), float(w_start_abs)
+        return ids, times, vals, val_mask, types, float(chunk_start_abs), float(chunk_start_offset)
+
+    def _process_window(
+        self,
+        window_tokens: List[EventToken],
+        special_tokens: List[EventToken],
+        *,
+        w_type_id: int,
+        w_start_abs: float,
+        next_type_id: int | None,
+        next_start_abs: float | None,
+    ) -> tuple[List[int], List[float], List[float], List[int], List[int], int, float]:
+        """
+        Backward-compatible helper used by audits/tests that still inspect a single
+        semantic window as one local sequence.
+        """
+        pseudo_chunk = SegmentedChunk(
+            tokens=list(window_tokens),
+            start_time_hours=float(w_start_abs) if window_tokens else 0.0,
+            chunk_index=0,
+            is_first_chunk=True,
+            is_last_chunk=True,
+        )
+        ids, times, vals, valmask, types, _, _ = self._process_chunk(
+            pseudo_chunk,
+            special_tokens,
+            w_type_id=w_type_id,
+            w_start_abs=w_start_abs,
+            next_type_id=next_type_id,
+            next_start_abs=next_start_abs,
+        )
+        return ids, times, vals, valmask, types, int(w_type_id), float(w_start_abs)
 
     def _infer_window_type_id(self, window_tokens: List[EventToken]) -> int:
         """
@@ -296,54 +429,87 @@ class AETHierarchicalCollator:
 
     def _pad_batch(
         self,
-        batch_ids: List[List[List[int]]],
-        batch_times: List[List[List[float]]],
-        batch_vals: List[List[List[float]]],
-        batch_types: List[List[List[int]]],
-        batch_masks: List[List[List[int]]],
-        batch_valmask: List[List[List[int]]],
+        batch_ids: List[List[List[List[int]]]],
+        batch_times: List[List[List[List[float]]]],
+        batch_vals: List[List[List[List[float]]]],
+        batch_types: List[List[List[List[int]]]],
+        batch_masks: List[List[List[List[int]]]],
+        batch_valmask: List[List[List[List[int]]]],
         batch_window_types: List[List[int]],
         batch_window_start_times: List[List[float]],
+        batch_chunk_mask: List[List[List[int]]],
+        batch_chunk_start_offsets: List[List[List[float]]],
+        batch_chunk_start_times: List[List[List[float]]],
+        batch_chunk_is_last: List[List[List[int]]],
+        batch_window_token_counts: List[List[float]],
+        batch_window_duration_hours: List[List[float]],
+        batch_chunk_token_counts: List[List[List[float]]],
+        batch_chunk_duration_hours: List[List[List[float]]],
     ) -> Dict[str, torch.Tensor]:
         B = len(batch_ids)
         W = max((len(x) for x in batch_ids), default=0)
+        C = max((len(chunks) for subj in batch_ids for chunks in subj), default=0)
         L = self.max_len
 
-        input_ids = torch.full((B, W, L), self.pad_id, dtype=torch.long)
-        time_ids = torch.zeros((B, W, L), dtype=torch.float)
-        numeric_values = torch.zeros((B, W, L, 1), dtype=torch.float)
-        token_type_ids = torch.zeros((B, W, L), dtype=torch.long)
-        attention_mask = torch.zeros((B, W, L), dtype=torch.long)
+        input_ids = torch.full((B, W, C, L), self.pad_id, dtype=torch.long)
+        time_ids = torch.zeros((B, W, C, L), dtype=torch.float)
+        numeric_values = torch.zeros((B, W, C, L, 1), dtype=torch.float)
+        token_type_ids = torch.zeros((B, W, C, L), dtype=torch.long)
+        attention_mask = torch.zeros((B, W, C, L), dtype=torch.long)
         window_mask = torch.zeros((B, W), dtype=torch.long)
-        numeric_mask = torch.zeros((B, W, L), dtype=torch.long)
+        chunk_mask = torch.zeros((B, W, C), dtype=torch.long)
+        numeric_mask = torch.zeros((B, W, C, L), dtype=torch.long)
         window_type_ids = torch.zeros((B, W), dtype=torch.long)
         window_start_times = torch.zeros((B, W), dtype=torch.float)
+        chunk_start_offsets = torch.zeros((B, W, C), dtype=torch.float)
+        chunk_start_times = torch.zeros((B, W, C), dtype=torch.float)
+        chunk_is_last = torch.zeros((B, W, C), dtype=torch.long)
+        semantic_token_counts = torch.zeros((B, W), dtype=torch.float)
+        semantic_duration_hours = torch.zeros((B, W), dtype=torch.float)
+        chunk_token_counts = torch.zeros((B, W, C), dtype=torch.float)
+        chunk_duration_hours = torch.zeros((B, W, C), dtype=torch.float)
 
         for b in range(B):
             for w in range(len(batch_ids[b])):
-                ids = batch_ids[b][w]
-                times = batch_times[b][w]
-                vals = batch_vals[b][w]
-                types = batch_types[b][w]
-                mask = batch_masks[b][w]
-                valmask = batch_valmask[b][w]
-                seq_len = min(len(ids), L)
                 window_mask[b, w] = 1
-
-                input_ids[b, w, :seq_len] = torch.tensor(ids[:seq_len], dtype=torch.long)
-                time_ids[b, w, :seq_len] = torch.tensor(times[:seq_len], dtype=torch.float)
-                token_type_ids[b, w, :seq_len] = torch.tensor(types[:seq_len], dtype=torch.long)
-                attention_mask[b, w, :seq_len] = torch.tensor(mask[:seq_len], dtype=torch.long)
-
-                val_slice = torch.tensor(vals[:seq_len], dtype=torch.float).unsqueeze(-1)
-                numeric_values[b, w, :seq_len, :] = val_slice
-                numeric_mask[b, w, :seq_len] = torch.tensor(valmask[:seq_len], dtype=torch.long)
-
-                # Per-window metadata
                 if b < len(batch_window_types) and w < len(batch_window_types[b]):
                     window_type_ids[b, w] = int(batch_window_types[b][w])
                 if b < len(batch_window_start_times) and w < len(batch_window_start_times[b]):
                     window_start_times[b, w] = float(batch_window_start_times[b][w])
+                if b < len(batch_window_token_counts) and w < len(batch_window_token_counts[b]):
+                    semantic_token_counts[b, w] = float(batch_window_token_counts[b][w])
+                if b < len(batch_window_duration_hours) and w < len(batch_window_duration_hours[b]):
+                    semantic_duration_hours[b, w] = float(batch_window_duration_hours[b][w])
+
+                for c in range(len(batch_ids[b][w])):
+                    ids = batch_ids[b][w][c]
+                    times = batch_times[b][w][c]
+                    vals = batch_vals[b][w][c]
+                    types = batch_types[b][w][c]
+                    mask = batch_masks[b][w][c]
+                    valmask = batch_valmask[b][w][c]
+                    seq_len = min(len(ids), L)
+                    chunk_mask[b, w, c] = 1
+
+                    input_ids[b, w, c, :seq_len] = torch.tensor(ids[:seq_len], dtype=torch.long)
+                    time_ids[b, w, c, :seq_len] = torch.tensor(times[:seq_len], dtype=torch.float)
+                    token_type_ids[b, w, c, :seq_len] = torch.tensor(types[:seq_len], dtype=torch.long)
+                    attention_mask[b, w, c, :seq_len] = torch.tensor(mask[:seq_len], dtype=torch.long)
+
+                    val_slice = torch.tensor(vals[:seq_len], dtype=torch.float).unsqueeze(-1)
+                    numeric_values[b, w, c, :seq_len, :] = val_slice
+                    numeric_mask[b, w, c, :seq_len] = torch.tensor(valmask[:seq_len], dtype=torch.long)
+
+                    if b < len(batch_chunk_start_offsets) and w < len(batch_chunk_start_offsets[b]) and c < len(batch_chunk_start_offsets[b][w]):
+                        chunk_start_offsets[b, w, c] = float(batch_chunk_start_offsets[b][w][c])
+                    if b < len(batch_chunk_start_times) and w < len(batch_chunk_start_times[b]) and c < len(batch_chunk_start_times[b][w]):
+                        chunk_start_times[b, w, c] = float(batch_chunk_start_times[b][w][c])
+                    if b < len(batch_chunk_is_last) and w < len(batch_chunk_is_last[b]) and c < len(batch_chunk_is_last[b][w]):
+                        chunk_is_last[b, w, c] = int(batch_chunk_is_last[b][w][c])
+                    if b < len(batch_chunk_token_counts) and w < len(batch_chunk_token_counts[b]) and c < len(batch_chunk_token_counts[b][w]):
+                        chunk_token_counts[b, w, c] = float(batch_chunk_token_counts[b][w][c])
+                    if b < len(batch_chunk_duration_hours) and w < len(batch_chunk_duration_hours[b]) and c < len(batch_chunk_duration_hours[b][w]):
+                        chunk_duration_hours[b, w, c] = float(batch_chunk_duration_hours[b][w][c])
 
         return {
             "input_ids": input_ids,
@@ -353,6 +519,14 @@ class AETHierarchicalCollator:
             "token_type_ids": token_type_ids,
             "attention_mask": attention_mask,
             "window_mask": window_mask,
+            "chunk_mask": chunk_mask,
             "window_type_ids": window_type_ids,
             "window_start_times": window_start_times,
+            "chunk_start_offsets": chunk_start_offsets,
+            "chunk_start_times": chunk_start_times,
+            "chunk_is_last": chunk_is_last,
+            "semantic_token_counts": semantic_token_counts,
+            "semantic_duration_hours": semantic_duration_hours,
+            "chunk_token_counts": chunk_token_counts,
+            "chunk_duration_hours": chunk_duration_hours,
         }

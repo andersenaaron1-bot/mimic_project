@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional
 
 from src.ehr_hier.data.structural_codes import TRANSITION_ACTION_FROM_ID
@@ -41,6 +41,16 @@ class SegmentedWindow:
     start_time_hours: float
     opening_action: Optional[str] = None
     closing_action: Optional[str] = None
+    chunks: List["SegmentedChunk"] = field(default_factory=list)
+
+
+@dataclass
+class SegmentedChunk:
+    tokens: List[EventToken]
+    start_time_hours: float
+    chunk_index: int
+    is_first_chunk: bool
+    is_last_chunk: bool
 
 
 def _same_time_group(left: EventToken, right: EventToken) -> bool:
@@ -473,5 +483,109 @@ def rebalance_segmented_windows(
                     closing_action=window.closing_action if idx == len(chunks) - 1 else None,
                 )
             )
+
+    return out
+
+
+def chunk_segmented_windows(
+    windows: List[SegmentedWindow],
+    *,
+    max_content_tokens: int,
+    max_chunks_per_window: int,
+    config: WindowSegmentationConfig | None = None,
+) -> List[SegmentedWindow]:
+    """
+    Derive bounded local chunks *within* each semantic window.
+
+    Unlike `rebalance_segmented_windows`, this preserves the semantic global chain:
+    one `SegmentedWindow` remains one global regime step, while `chunks` provides the
+    local attention units used inside that regime.
+    """
+    config = config or WindowSegmentationConfig()
+    if max_content_tokens <= 0:
+        max_content_tokens = 1
+    if max_chunks_per_window <= 0:
+        max_chunks_per_window = 1
+
+    target_tokens = int(round(float(max_content_tokens) * float(config.rebalance_target_frac)))
+    target_tokens = max(1, min(int(max_content_tokens), target_tokens))
+    min_tokens = max(1, int(config.rebalance_min_tokens))
+    tail_tokens = max(1, int(config.rebalance_tail_tokens))
+
+    out: List[SegmentedWindow] = []
+    for window in windows:
+        if not window.tokens:
+            out.append(
+                SegmentedWindow(
+                    tokens=[],
+                    window_type_id=int(window.window_type_id),
+                    start_time_hours=float(window.start_time_hours),
+                    opening_action=window.opening_action,
+                    closing_action=window.closing_action,
+                    chunks=[],
+                )
+            )
+            continue
+
+        groups: List[List[EventToken]] = []
+        for group in _group_tokens_by_time(window.tokens):
+            groups.extend(_split_oversized_group(group, max_content_tokens=int(max_content_tokens)))
+
+        raw_chunks: List[List[EventToken]] = []
+        current: List[EventToken] = []
+        current_len = 0
+        for group in groups:
+            g_len = len(group)
+            if not current:
+                current = list(group)
+                current_len = g_len
+                continue
+
+            if current_len < min_tokens and current_len + g_len <= int(max_content_tokens):
+                current.extend(group)
+                current_len += g_len
+                continue
+
+            if current_len + g_len <= int(max_content_tokens) and current_len < target_tokens:
+                current.extend(group)
+                current_len += g_len
+                continue
+
+            raw_chunks.append(list(current))
+            current = list(group)
+            current_len = g_len
+
+        if current:
+            raw_chunks.append(list(current))
+
+        if len(raw_chunks) >= 2 and len(raw_chunks[-1]) < tail_tokens:
+            if len(raw_chunks[-2]) + len(raw_chunks[-1]) <= int(max_content_tokens):
+                raw_chunks[-2].extend(raw_chunks[-1])
+                raw_chunks.pop()
+
+        raw_chunks = raw_chunks[: int(max_chunks_per_window)]
+
+        chunks = [
+            SegmentedChunk(
+                tokens=list(chunk),
+                start_time_hours=float(chunk[0].t_from_start_hours),
+                chunk_index=idx,
+                is_first_chunk=(idx == 0),
+                is_last_chunk=(idx == len(raw_chunks) - 1),
+            )
+            for idx, chunk in enumerate(raw_chunks)
+            if chunk
+        ]
+
+        out.append(
+            SegmentedWindow(
+                tokens=list(window.tokens),
+                window_type_id=int(window.window_type_id),
+                start_time_hours=float(window.start_time_hours),
+                opening_action=window.opening_action,
+                closing_action=window.closing_action,
+                chunks=chunks,
+            )
+        )
 
     return out

@@ -395,21 +395,29 @@ class AETLocalEncoder(nn.Module):
     def forward(self, x, times, attention_mask, token_type_ids=None):
         """
         Args:
-            x: (Batch, Num_Windows, Window_Len, Dim)
-            times: (Batch, Num_Windows, Window_Len)
-            attention_mask: (Batch, Num_Windows, Window_Len)
-            token_type_ids: Optional (Batch, Num_Windows, Window_Len) coarse categories.
+            x: (Batch, Num_Windows, Window_Len, Dim) or (Batch, Num_Windows, Num_Chunks, Window_Len, Dim)
+            times: matching float tensor without the final Dim
+            attention_mask: matching mask tensor without the final Dim
+            token_type_ids: Optional matching coarse category tensor.
         Returns:
             x: Contextualized tokens (Same Shape)
-            window_summaries: (Batch, Num_Windows, Dim) - Attention-pooled summaries
+            chunk_summaries: (Batch, Num_Windows, Num_Chunks, Dim) or (Batch, Num_Windows, 1, Dim)
         """
-        B, W, L, D = x.shape
+        if x.ndim == 4:
+            x = x.unsqueeze(2)
+            times = times.unsqueeze(2)
+            attention_mask = attention_mask.unsqueeze(2)
+            if token_type_ids is not None:
+                token_type_ids = token_type_ids.unsqueeze(2)
+        if x.ndim != 5:
+            raise ValueError(f"x must be 4D or 5D, got shape {tuple(x.shape)}")
 
-        # 1. Flatten Batch and Windows
-        # We treat every window as an independent sequence
-        x_flat = x.view(B * W, L, D)
-        times_flat = times.view(B * W, L)
-        mask_flat = attention_mask.view(B * W, L)
+        B, W, C, L, D = x.shape
+
+        # 1. Flatten Batch, Windows, and local chunks.
+        x_flat = x.view(B * W * C, L, D)
+        times_flat = times.view(B * W * C, L)
+        mask_flat = attention_mask.view(B * W * C, L)
 
         # 2. Pass through Transformer Layers
         for layer in self.layers:
@@ -418,19 +426,19 @@ class AETLocalEncoder(nn.Module):
         x_flat = self.norm(x_flat)
 
         # 3. Unflatten
-        x_out = x_flat.view(B, W, L, D)
+        x_out = x_flat.view(B, W, C, L, D)
 
         # 4. Attention-pooled window summaries
         # We pool over eligible (non-pad) tokens, optionally excluding SPECIAL-prefix tokens.
         mask_bool = mask_flat.to(dtype=torch.bool)
-        is_real_window = mask_bool.any(dim=-1)  # (B*W,)
+        is_real_window = mask_bool.any(dim=-1)  # (B*W*C,)
 
-        window_summaries_flat = torch.zeros((B * W, D), device=x.device, dtype=x.dtype)
+        window_summaries_flat = torch.zeros((B * W * C, D), device=x.device, dtype=x.dtype)
         if is_real_window.any():
             pool_mask = mask_bool
             types_flat = None
             if token_type_ids is not None and self.exclude_special_from_summary:
-                types_flat = token_type_ids.view(B * W, L)
+                types_flat = token_type_ids.view(B * W * C, L)
                 pool_mask = pool_mask & (types_flat != self.special_type_id)
 
             # For windows where all eligible tokens were excluded (e.g. all SPECIAL),
@@ -480,7 +488,7 @@ class AETLocalEncoder(nn.Module):
             # Window-level features to help global transition modeling (and biasing).
             content_mask = mask_bool
             if token_type_ids is not None:
-                types_flat_all = token_type_ids.view(B * W, L)
+                types_flat_all = token_type_ids.view(B * W * C, L)
                 content_mask = content_mask & (types_flat_all != self.special_type_id)
             else:
                 types_flat_all = None
@@ -522,6 +530,6 @@ class AETLocalEncoder(nn.Module):
             meta_emb = meta_emb * is_real_window.to(dtype=meta_emb.dtype).unsqueeze(-1)
             window_summaries_flat = window_summaries_flat + meta_emb
 
-        window_summaries = window_summaries_flat.view(B, W, D)
+        window_summaries = window_summaries_flat.view(B, W, C, D)
 
         return x_out, window_summaries

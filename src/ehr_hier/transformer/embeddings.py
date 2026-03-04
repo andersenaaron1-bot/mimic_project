@@ -119,8 +119,8 @@ class AETEmbeddings(nn.Module):
     def forward(self, input_ids, numeric_values, *, window_type_ids=None, token_type_ids=None):
         """
         Args:
-            input_ids: (Batch, Seq) LongTensor
-            numeric_values: (Batch, Seq, 1) FloatTensor.
+            input_ids: (Batch, Windows, Len) or (Batch, Windows, Chunks, Len) LongTensor
+            numeric_values: matching float tensor with trailing singleton channel.
                             Note: Must be 0.0 for tokens without values!
             window_type_ids: Optional (Batch, Num_Windows) LongTensor of per-window type ids.
             token_type_ids: Optional (Batch, Num_Windows, Seq) LongTensor of TokenCategory ids.
@@ -140,9 +140,15 @@ class AETEmbeddings(nn.Module):
 
         # 4. Window type segment embedding (optional)
         if self.window_type_embedding is not None and window_type_ids is not None:
-            win_emb = self.window_type_embedding(window_type_ids).unsqueeze(2)  # (B, W, 1, D)
+            win_emb = self.window_type_embedding(window_type_ids)
+            if input_ids.ndim == 3:
+                win_emb = win_emb.unsqueeze(2)  # (B, W, 1, D)
+            elif input_ids.ndim == 4:
+                win_emb = win_emb.unsqueeze(2).unsqueeze(3)  # (B, W, 1, 1, D)
+            else:
+                raise ValueError(f"input_ids must be 3D or 4D, got shape {tuple(input_ids.shape)}")
             if self.exclude_special_from_window_type and token_type_ids is not None:
-                mask = (token_type_ids != self.special_type_id).unsqueeze(-1)  # (B, W, L, 1)
+                mask = (token_type_ids != self.special_type_id).unsqueeze(-1)
                 x = x + win_emb * mask
             else:
                 x = x + win_emb

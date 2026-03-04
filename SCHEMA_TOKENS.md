@@ -54,19 +54,28 @@ Emitted structural `EventToken` fields (by convention):
 - `window_hook = <non-None>` iff the label (or code) is configured as a boundary
 
 ### 2.2 Model-driven delimiters (window marker tokens)
-The collator (`src/ehr_hier/transformer/collator.py`) segments timelines using
-**transition bundles**:
+The collator (`src/ehr_hier/transformer/collator.py`) now has a 3-level hierarchy:
+- **semantic windows**: care-regime segments produced by transition-bundle segmentation
+- **local chunks**: bounded local attention units inside a semantic window
+- **tokens**: ordered event-token bundles inside each chunk
+
+Semantic windows are segmented using **transition bundles**:
 - explicit transition metadata takes precedence
 - nearby transition candidates are grouped into bundles
 - sparse administrative transition chains can be merged
 - legacy `window_hook` boundaries remain as a fallback
 
-It then inserts **window marker tokens** inside each window sequence:
+It then inserts **window marker tokens** inside each local chunk sequence:
 
-    [special_tokens...] [WIN_TYPE] [window_tokens...] [WIN_END or WIN_<NEXT_TYPE>]
+    [special_tokens...] [WIN_TYPE] [chunk_tokens...] [WIN_CONTINUE | WIN_END | WIN_<NEXT_TYPE>]
 
-These marker tokens are the learnable "signifiers" that the model can predict to end a
-window and (optionally) specify the type of the next window.
+Marker semantics:
+- `WIN_CONTINUE`: continue within the current semantic window using another local chunk
+- `WIN_END`: end the current semantic window
+- `WIN_<NEXT_TYPE>`: end the current semantic window and indicate the next semantic-window type
+
+This keeps the global chain at semantic-window granularity while still giving the local
+model a bounded sequence budget.
 
 Configuration: `WindowMarkerConfig` (and `vocab_config["window_markers"]` for the model)
 - `type_token_offset`: global token id where `WIN_<TYPE>` starts.
@@ -112,7 +121,7 @@ Metadata:
 
 ### 3.3 Numeric side-channel (`numeric_values`)
 The collator extracts `EventToken.num_attrs["numeric_value"]` into a dense tensor
-`numeric_values` (shape `(B,W,L,1)`) plus a `numeric_mask`.
+`numeric_values` (shape `(B,W,C,L,1)` in the chunked hierarchy) plus a `numeric_mask`.
 
 Current intended uses:
 - medication dose / rate / duration when available

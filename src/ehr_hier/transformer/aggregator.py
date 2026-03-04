@@ -3,6 +3,64 @@ import torch.nn as nn
 from .encoder import AETCausalAttention  # Re-use our custom attention!
 
 
+class AETIntraWindowAggregator(nn.Module):
+    """
+    Models chunk-to-chunk dynamics within a semantic window.
+
+    Input/Output contract:
+      - input chunk summaries: (B, W, C, D)
+      - chunk times: (B, W, C) relative to semantic-window start
+      - chunk mask: (B, W, C)
+      - output chunk states: (B, W, C, D)
+      - output semantic summaries: (B, W, D), taken from the last real chunk state
+    """
+
+    def __init__(self, config, rope_module):
+        super().__init__()
+        num_layers = int(getattr(config, "num_chunk_layers", 1))
+        self.layers = nn.ModuleList([
+            AETGlobalLayer(
+                d_model=config.d_model,
+                num_heads=config.num_heads,
+                d_ff=config.d_ff,
+                rope_module=rope_module,
+                dropout=config.dropout,
+                enable_alibi_hours_bias=bool(getattr(config, "enable_alibi_hours_bias", False)),
+                alibi_hours_max=float(getattr(config, "alibi_hours_max", 28.0 * 24.0)),
+                alibi_hours_slope_scale=float(getattr(config, "alibi_hours_slope_scale", 1.0)),
+            ) for _ in range(max(0, num_layers))
+        ])
+        self.norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, chunk_summaries, chunk_times, chunk_mask):
+        if chunk_summaries.ndim != 4:
+            raise ValueError(
+                f"chunk_summaries must be (B,W,C,D), got shape {tuple(chunk_summaries.shape)}"
+            )
+        B, W, C, D = chunk_summaries.shape
+        if C == 0:
+            return chunk_summaries, chunk_summaries.new_zeros((B, W, D))
+
+        x = chunk_summaries.view(B * W, C, D)
+        times = chunk_times.view(B * W, C)
+        mask = chunk_mask.view(B * W, C)
+
+        for layer in self.layers:
+            x = layer(x, times, mask)
+
+        x = self.norm(x)
+        x = x * mask.unsqueeze(-1)
+
+        chunk_states = x.view(B, W, C, D)
+        n_real = chunk_mask.to(dtype=torch.long).sum(dim=2).clamp(min=1)
+        last_idx = (n_real - 1).clamp(min=0)
+        batch_idx = torch.arange(B, device=chunk_summaries.device)[:, None]
+        win_idx = torch.arange(W, device=chunk_summaries.device)[None, :]
+        semantic_summaries = chunk_states[batch_idx, win_idx, last_idx, :]
+        semantic_summaries = semantic_summaries * (chunk_mask.any(dim=2).unsqueeze(-1))
+        return chunk_states, semantic_summaries
+
+
 class AETGlobalAggregator(nn.Module):
     """
     The "Spine" of the architecture.

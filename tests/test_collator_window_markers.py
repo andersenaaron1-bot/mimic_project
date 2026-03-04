@@ -50,20 +50,21 @@ def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
 
     batch = collator([[summary, token1, token2, token3]])
 
-    # (B=1,W=2,L=8)
-    assert batch["input_ids"].shape[:3] == (1, 2, 8)
+    # (B=1,W=2,C=1,L=8)
+    assert batch["input_ids"].shape == (1, 2, 1, 8)
 
     # Window 0: [summary] [WIN_TYPE=10+2] [token1] [WIN_END=10+4]
-    w0 = batch["input_ids"][0, 0, :4].tolist()
+    w0 = batch["input_ids"][0, 0, 0, :4].tolist()
     assert w0 == [1, 12, 100, 14]
 
     # Window 1: [summary] [WIN_TYPE=10+1] [token2] [token3] [WIN_END]
-    w1 = batch["input_ids"][0, 1, :5].tolist()
+    w1 = batch["input_ids"][0, 1, 0, :5].tolist()
     assert w1 == [1, 11, 200, 201, 14]
 
     # Window metadata is per-window and uses absolute time for starts.
     assert batch["window_type_ids"][0, :2].tolist() == [2, 1]
     assert batch["window_start_times"][0, :2].tolist() == pytest.approx([5.0, 7.0], rel=1e-6)
+    assert batch["chunk_mask"][0, :2, 0].tolist() == [1, 1]
 
 
 def test_collator_merges_sparse_transition_chain_and_uses_last_opening_type() -> None:
@@ -145,11 +146,12 @@ def test_collator_merges_sparse_transition_chain_and_uses_last_opening_type() ->
     assert batch["window_mask"][0].tolist() == [1]
     assert batch["window_type_ids"][0, 0].item() == 3
     assert batch["window_start_times"][0, 0].item() == pytest.approx(0.0, rel=1e-6)
-    w0 = batch["input_ids"][0, 0, :8].tolist()
+    w0 = batch["input_ids"][0, 0, 0, :8].tolist()
     assert w0 == [1, 13, 300, 400, 301, 100, 302, 18]
+    assert batch["chunk_mask"][0, 0, 0].item() == 1
 
 
-def test_collator_rebalances_dense_window_into_same_type_continuation_chunks() -> None:
+def test_collator_chunks_dense_semantic_window_without_creating_new_global_windows() -> None:
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 
@@ -214,6 +216,7 @@ def test_collator_rebalances_dense_window_into_same_type_continuation_chunks() -
 
     collator = AETHierarchicalCollator(
         max_windows=8,
+        max_chunks_per_window=4,
         max_len_per_window=6,
         pad_id=0,
         window_markers=WindowMarkerConfig(enabled=True, end_mode="next_type", type_token_offset=10, num_types=4),
@@ -221,14 +224,19 @@ def test_collator_rebalances_dense_window_into_same_type_continuation_chunks() -
 
     batch = collator([[summary, *tokens]])
 
-    assert batch["window_mask"][0, :2].tolist() == [1, 1]
-    assert batch["window_type_ids"][0, :2].tolist() == [2, 2]
-    assert batch["window_start_times"][0, :2].tolist() == pytest.approx([0.0, 1.0], rel=1e-6)
+    # One semantic window with two local chunks.
+    assert batch["window_mask"][0, :1].tolist() == [1]
+    assert batch["window_type_ids"][0, :1].tolist() == [2]
+    assert batch["window_start_times"][0, :1].tolist() == pytest.approx([0.0], rel=1e-6)
+    assert batch["chunk_mask"][0, 0, :2].tolist() == [1, 1]
+    assert batch["chunk_start_offsets"][0, 0, :2].tolist() == pytest.approx([0.0, 1.0], rel=1e-6)
+    assert batch["chunk_is_last"][0, 0, :2].tolist() == [0, 1]
+    assert batch["semantic_token_counts"][0, 0].item() == pytest.approx(6.0, rel=1e-6)
 
-    # First chunk continues into the same regime type rather than inventing a new transition.
-    w0 = batch["input_ids"][0, 0, :6].tolist()
-    assert w0 == [1, 12, 101, 102, 103, 12]
+    # First local chunk ends with WIN_CONTINUE rather than a semantic transition marker.
+    w0 = batch["input_ids"][0, 0, 0, :6].tolist()
+    assert w0 == [1, 12, 101, 102, 103, 15]
 
-    # Final chunk closes the continued regime.
-    w1 = batch["input_ids"][0, 1, :6].tolist()
+    # Final chunk closes the semantic window.
+    w1 = batch["input_ids"][0, 0, 1, :6].tolist()
     assert w1 == [1, 12, 104, 105, 106, 14]
