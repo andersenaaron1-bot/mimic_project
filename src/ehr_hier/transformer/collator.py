@@ -9,6 +9,7 @@ from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.data.window_segmentation import (
     SegmentedWindow,
     WindowSegmentationConfig,
+    rebalance_segmented_windows,
     segment_event_tokens,
 )
 
@@ -84,7 +85,7 @@ class AETHierarchicalCollator:
 
         for timeline in batch_timelines:
             special_tokens, events = self._split_special(timeline)
-            segmented_windows = self._segment_windows(events)[: self.max_windows]
+            segmented_windows = self._segment_windows(events, special_tokens=special_tokens)[: self.max_windows]
             windows = [window.tokens for window in segmented_windows]
             window_type_ids = [int(window.window_type_id) for window in segmented_windows]
             window_start_abs_times = [float(window.start_time_hours) for window in segmented_windows]
@@ -152,8 +153,21 @@ class AETHierarchicalCollator:
     def _segment_into_windows(self, events: List[EventToken]) -> List[List[EventToken]]:
         return [window.tokens for window in self._segment_windows(events)]
 
-    def _segment_windows(self, events: List[EventToken]) -> List[SegmentedWindow]:
-        return segment_event_tokens(events, config=self.segmentation)
+    def _segment_windows(
+        self,
+        events: List[EventToken],
+        *,
+        special_tokens: List[EventToken] | None = None,
+    ) -> List[SegmentedWindow]:
+        semantic_windows = segment_event_tokens(events, config=self.segmentation)
+        marker_slots = 2 if self.window_markers.enabled else 0
+        special_count = len(special_tokens or [])
+        max_content_tokens = max(1, int(self.max_len) - int(marker_slots) - int(special_count))
+        return rebalance_segmented_windows(
+            semantic_windows,
+            max_content_tokens=max_content_tokens,
+            config=self.segmentation,
+        )
 
     def _process_window(
         self,

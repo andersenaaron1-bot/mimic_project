@@ -27,6 +27,10 @@ class WindowSegmentationConfig:
     merge_transition_chains: bool = True
     chain_gap_hours: float = 6.0
     chain_max_intervening_tokens: int = 16
+    rebalance_dense_windows: bool = True
+    rebalance_target_frac: float = 0.8
+    rebalance_min_tokens: int = 32
+    rebalance_tail_tokens: int = 16
     unk_window_type_id: int = 0
 
 
@@ -37,6 +41,33 @@ class SegmentedWindow:
     start_time_hours: float
     opening_action: Optional[str] = None
     closing_action: Optional[str] = None
+
+
+def _same_time_group(left: EventToken, right: EventToken) -> bool:
+    if left.raw_time is not None and right.raw_time is not None:
+        return left.raw_time == right.raw_time
+    return float(left.t_from_start_hours) == float(right.t_from_start_hours)
+
+
+def _group_tokens_by_time(tokens: List[EventToken]) -> List[List[EventToken]]:
+    if not tokens:
+        return []
+    groups: List[List[EventToken]] = [[tokens[0]]]
+    for tok in tokens[1:]:
+        if _same_time_group(groups[-1][-1], tok):
+            groups[-1].append(tok)
+        else:
+            groups.append([tok])
+    return groups
+
+
+def _split_oversized_group(group: List[EventToken], *, max_content_tokens: int) -> List[List[EventToken]]:
+    if len(group) <= max_content_tokens:
+        return [group]
+    return [
+        list(group[start : start + max_content_tokens])
+        for start in range(0, len(group), max_content_tokens)
+    ]
 
 
 def _cat_attr_int(tok: EventToken, key: str) -> Optional[int]:
@@ -373,3 +404,74 @@ def segment_event_tokens(
         )
 
     return windows
+
+
+def rebalance_segmented_windows(
+    windows: List[SegmentedWindow],
+    *,
+    max_content_tokens: int,
+    config: WindowSegmentationConfig | None = None,
+) -> List[SegmentedWindow]:
+    config = config or WindowSegmentationConfig()
+    if not config.rebalance_dense_windows or max_content_tokens <= 0:
+        return list(windows)
+
+    target_tokens = int(round(float(max_content_tokens) * float(config.rebalance_target_frac)))
+    target_tokens = max(1, min(int(max_content_tokens), target_tokens))
+    min_tokens = max(1, int(config.rebalance_min_tokens))
+    tail_tokens = max(1, int(config.rebalance_tail_tokens))
+
+    out: List[SegmentedWindow] = []
+    for window in windows:
+        if len(window.tokens) <= int(max_content_tokens):
+            out.append(window)
+            continue
+
+        groups: List[List[EventToken]] = []
+        for group in _group_tokens_by_time(window.tokens):
+            groups.extend(_split_oversized_group(group, max_content_tokens=int(max_content_tokens)))
+
+        chunks: List[List[EventToken]] = []
+        current: List[EventToken] = []
+        current_len = 0
+        for group in groups:
+            g_len = len(group)
+            if not current:
+                current = list(group)
+                current_len = g_len
+                continue
+
+            if current_len < min_tokens and current_len + g_len <= int(max_content_tokens):
+                current.extend(group)
+                current_len += g_len
+                continue
+
+            if current_len + g_len <= int(max_content_tokens) and current_len < target_tokens:
+                current.extend(group)
+                current_len += g_len
+                continue
+
+            chunks.append(list(current))
+            current = list(group)
+            current_len = g_len
+
+        if current:
+            chunks.append(list(current))
+
+        if len(chunks) >= 2 and len(chunks[-1]) < tail_tokens:
+            if len(chunks[-2]) + len(chunks[-1]) <= int(max_content_tokens):
+                chunks[-2].extend(chunks[-1])
+                chunks.pop()
+
+        for idx, chunk in enumerate(chunks):
+            out.append(
+                SegmentedWindow(
+                    tokens=list(chunk),
+                    window_type_id=int(window.window_type_id),
+                    start_time_hours=float(chunk[0].t_from_start_hours),
+                    opening_action=window.opening_action if idx == 0 else None,
+                    closing_action=window.closing_action if idx == len(chunks) - 1 else None,
+                )
+            )
+
+    return out

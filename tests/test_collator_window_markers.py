@@ -147,3 +147,88 @@ def test_collator_merges_sparse_transition_chain_and_uses_last_opening_type() ->
     assert batch["window_start_times"][0, 0].item() == pytest.approx(0.0, rel=1e-6)
     w0 = batch["input_ids"][0, 0, :8].tolist()
     assert w0 == [1, 13, 300, 400, 301, 100, 302, 18]
+
+
+def test_collator_rebalances_dense_window_into_same_type_continuation_chunks() -> None:
+    from ehr_hier.data.token_types import EventToken, TokenCategory
+    from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
+
+    summary = EventToken(
+        value_id=1,
+        category_id=int(TokenCategory.SPECIAL),
+        t_from_start_hours=0.0,
+        dt_from_prev_hours=0.0,
+        cat_attrs={},
+        num_attrs={},
+    )
+    tokens = [
+        EventToken(
+            value_id=101,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={"window_type_id": 2},
+            num_attrs={"numeric_value": 1.0},
+        ),
+        EventToken(
+            value_id=102,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={},
+            num_attrs={"numeric_value": 2.0},
+        ),
+        EventToken(
+            value_id=103,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={},
+            num_attrs={"numeric_value": 3.0},
+        ),
+        EventToken(
+            value_id=104,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={"numeric_value": 4.0},
+        ),
+        EventToken(
+            value_id=105,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={},
+            num_attrs={"numeric_value": 5.0},
+        ),
+        EventToken(
+            value_id=106,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={},
+            num_attrs={"numeric_value": 6.0},
+        ),
+    ]
+
+    collator = AETHierarchicalCollator(
+        max_windows=8,
+        max_len_per_window=6,
+        pad_id=0,
+        window_markers=WindowMarkerConfig(enabled=True, end_mode="next_type", type_token_offset=10, num_types=4),
+    )
+
+    batch = collator([[summary, *tokens]])
+
+    assert batch["window_mask"][0, :2].tolist() == [1, 1]
+    assert batch["window_type_ids"][0, :2].tolist() == [2, 2]
+    assert batch["window_start_times"][0, :2].tolist() == pytest.approx([0.0, 1.0], rel=1e-6)
+
+    # First chunk continues into the same regime type rather than inventing a new transition.
+    w0 = batch["input_ids"][0, 0, :6].tolist()
+    assert w0 == [1, 12, 101, 102, 103, 12]
+
+    # Final chunk closes the continued regime.
+    w1 = batch["input_ids"][0, 1, :6].tolist()
+    assert w1 == [1, 12, 104, 105, 106, 14]
