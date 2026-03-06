@@ -183,7 +183,8 @@ def build_subject_timeline(
 
     def _stable_local_id(raw: str, *, modulo: int = 900_000) -> int:
         data = str(raw).encode("utf-8", errors="ignore")
-        return 1 + (zlib.crc32(data) % int(modulo))
+        mod = max(1, int(modulo))
+        return 1 + (zlib.crc32(data) % mod)
 
     def _code_parts(code_value: Optional[str]) -> List[str]:
         if code_value is None:
@@ -237,17 +238,20 @@ def build_subject_timeline(
         if prefix not in {"LAB", "VITAL", "MEAS", "SUBJECT_FLUID_OUTPUT", "SUBJECT_WEIGHT_AT_INFUSION", "OMR"}:
             return []
 
-        local_code_id: int
+        obs_code_lane = max(16, int(qual_obs_value_offset) - int(qual_obs_code_offset) - 1)
+        obs_value_lane = max(16, int(struct_action_offset) - int(qual_obs_value_offset) - 1)
+
         item_or_code = parts[1] if len(parts) >= 2 else code_value
-        if item_or_code.isdigit():
-            local_code_id = int(item_or_code)
-        else:
-            local_code_id = _stable_local_id(item_or_code)
+        local_code_id = _stable_local_id(f"{prefix}::{item_or_code}", modulo=obs_code_lane)
         obs_code_gid = int(qual_obs_code_offset) + int(local_code_id)
 
         obs_val_text = _extract_obs_value(ev_view, code_value=code_value)
         obs_val_upper = obs_val_text.upper()
-        obs_val_local = OBS_SPECIAL_VALUE_IDS.get(obs_val_upper, 100 + _stable_local_id(obs_val_text))
+        special_local = OBS_SPECIAL_VALUE_IDS.get(obs_val_upper)
+        if special_local is not None and int(special_local) <= int(obs_value_lane):
+            obs_val_local = int(special_local)
+        else:
+            obs_val_local = _stable_local_id(f"OBS_VAL::{obs_val_text}", modulo=obs_value_lane)
         obs_val_gid = int(qual_obs_value_offset) + int(obs_val_local)
         t_from_start = _t_from_start_hours(t_value) if isinstance(t_value, datetime) else 0.0
 
