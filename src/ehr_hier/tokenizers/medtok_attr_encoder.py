@@ -9,6 +9,46 @@ from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
 from src.ehr_hier.tokenizers.medtok_canonicalize import ensure_list
 
+_LEX_NORM_RE = re.compile(r"[^A-Z0-9]+")
+_MED_ACTION_SUFFIXES = {
+    "ADMINISTERED",
+    "NOT ADMINISTERED",
+    "NOT GIVEN",
+    "NOT GIVEN PER SLIDING SCALE",
+    "CONFIRMED",
+    "FLUSHED",
+    "NOT FLUSHED",
+    "STARTED",
+    "STOPPED",
+    "HELD",
+    "REFUSED",
+    "PAUSED",
+    "RESUMED",
+}
+
+
+def _normalize_lexical_key(raw: object) -> str:
+    s = _LEX_NORM_RE.sub("", str(raw).upper())
+    # Avoid unstable tiny/mostly-numeric aliases.
+    if len(s) < 4:
+        return ""
+    if not any(ch.isalpha() for ch in s):
+        return ""
+    return s
+
+
+def _strip_medication_action_tail(raw: object) -> Optional[str]:
+    parts = [p.strip() for p in str(raw).split("//")]
+    if not parts:
+        return None
+    if parts[0].upper() != "MEDICATION":
+        return None
+    if len(parts) >= 4 and parts[1].upper() in {"START", "END", "STOP"}:
+        return f"MEDICATION//{'//'.join(parts[2:])}"
+    if len(parts) >= 3 and parts[-1].upper() in _MED_ACTION_SUFFIXES:
+        return f"MEDICATION//{'//'.join(parts[1:-1])}"
+    return None
+
 
 def load_parent_lookup_from_codes_parquet(codes_parquet_fp: str) -> Dict[str, List[str]]:
     """
@@ -122,9 +162,12 @@ class MedTokenWithAttrsEncoder:
         self.residual_fallback_buckets = max(1, int(residual_fallback_buckets))
         self.unk_gid = self.base_vocab.offset + self.base_vocab.unk_id
         self._cache: Dict[str, Optional[int]] = {}
+        self._lexical_bridge: Dict[str, str] = {}
         # START/END/STOP markers from MEDS-style medication/infusion/procedure events
         self._marker_attr = "event_marker"
         self._marker_to_id = {"START": 1, "END": 2, "STOP": 3}
+        if self.category == TokenCategory.MEDICATION:
+            self._lexical_bridge = self._build_medication_lexical_bridge()
 
     def reset_state(self) -> None:
         return None  # stateless
@@ -215,7 +258,10 @@ class MedTokenWithAttrsEncoder:
         base_code: Optional[str],
     ) -> List[str]:
         out: List[str] = []
-        for key in (raw_code, base_code):
+        keys: List[Optional[str]] = [raw_code, base_code]
+        if raw_code is not None:
+            keys.append(_strip_medication_action_tail(raw_code))
+        for key in keys:
             if key is None:
                 continue
             out.extend(self.parent_lookup.get(str(key).upper(), []))
@@ -228,6 +274,42 @@ class MedTokenWithAttrsEncoder:
             seen.add(x)
             uniq.append(x)
         return uniq
+
+    def _build_medication_lexical_bridge(self) -> Dict[str, str]:
+        """
+        Build a conservative one-to-one normalized alias -> vocab code map.
+        Ambiguous aliases are discarded.
+        """
+        alias_hits: Dict[str, set[str]] = {}
+        for code in self.base_vocab.code2id.keys():
+            if code == self.base_vocab.unk_token:
+                continue
+            raw = str(code)
+            parts = [p.strip() for p in raw.split("//") if p.strip()]
+            aliases = [raw]
+            if parts:
+                aliases.append(parts[-1])
+                head = parts[0].upper()
+                if head == "MEDICATION":
+                    stripped = _strip_medication_action_tail(raw)
+                    if stripped:
+                        aliases.append(stripped)
+                    if len(parts) >= 2:
+                        aliases.append(parts[1])
+                elif head == "INFUSION" and len(parts) >= 2:
+                    aliases.append(parts[1])
+
+            for alias in aliases:
+                key = _normalize_lexical_key(alias)
+                if not key:
+                    continue
+                alias_hits.setdefault(key, set()).add(raw)
+
+        out: Dict[str, str] = {}
+        for key, targets in alias_hits.items():
+            if len(targets) == 1:
+                out[key] = next(iter(targets))
+        return out
 
     @staticmethod
     def _stable_bucket(raw: str, buckets: int) -> int:
@@ -277,6 +359,16 @@ class MedTokenWithAttrsEncoder:
                 continue
             uniq.append(c)
             seen.add(c)
+
+        if self._lexical_bridge:
+            for c in list(uniq):
+                key = _normalize_lexical_key(c)
+                if not key:
+                    continue
+                bridged = self._lexical_bridge.get(key)
+                if bridged and bridged not in seen:
+                    uniq.append(bridged)
+                    seen.add(bridged)
         return uniq
 
     def _encode_base(

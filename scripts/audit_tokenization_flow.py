@@ -925,6 +925,7 @@ def main() -> None:
     ap.add_argument("--residual_fallback_buckets", type=int, default=40_000)
     ap.add_argument("--diag_residual_offset", type=int, default=None)
     ap.add_argument("--proc_residual_offset", type=int, default=None)
+    ap.add_argument("--med_residual_offset", type=int, default=None)
     ap.add_argument("--example_subjects", type=int, default=3)
     ap.add_argument("--example_tokens", type=int, default=40)
     ap.add_argument("--progress_every", type=int, default=0)
@@ -996,6 +997,7 @@ def main() -> None:
             for k, v in {
                 "diagnosis": args.diag_residual_offset,
                 "procedure": args.proc_residual_offset,
+                "medication": args.med_residual_offset,
             }.items()
             if v is not None
         },
@@ -1032,6 +1034,7 @@ def main() -> None:
             "residual_fallback_buckets": int(args.residual_fallback_buckets),
             "diag_residual_offset": args.diag_residual_offset,
             "proc_residual_offset": args.proc_residual_offset,
+            "med_residual_offset": args.med_residual_offset,
         },
         "raw": raw_summary,
         "timeline": downstream["timeline"],

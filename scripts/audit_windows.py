@@ -943,6 +943,7 @@ def main() -> None:
     ap.add_argument("--residual_fallback_buckets", type=int, default=40_000)
     ap.add_argument("--diag_residual_offset", type=int, default=None)
     ap.add_argument("--proc_residual_offset", type=int, default=None)
+    ap.add_argument("--med_residual_offset", type=int, default=None)
     ap.add_argument("--example_subjects", type=int, default=4)
     ap.add_argument("--example_windows", type=int, default=6)
     ap.add_argument("--preview_items", type=int, default=8)
@@ -995,6 +996,7 @@ def main() -> None:
             for k, v in {
                 "diagnosis": args.diag_residual_offset,
                 "procedure": args.proc_residual_offset,
+                "medication": args.med_residual_offset,
             }.items()
             if v is not None
         },

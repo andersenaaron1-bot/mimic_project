@@ -181,6 +181,9 @@ def test_canonicalizers_basic():
 
     med_cands = canonicalize_medication_code("rxnorm 12345")
     assert "RXNORM//12345" in med_cands
+    med_name_cands = canonicalize_medication_code("MEDICATION//Acetaminophen//Administered")
+    assert "MEDICATION//ACETAMINOPHEN" in med_name_cands
+    assert "ACETAMINOPHEN" in med_name_cands
 
 
 def test_drop_unknown_diagnosis(monkeypatch, tiny_vocabs):

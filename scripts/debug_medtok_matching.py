@@ -335,6 +335,12 @@ def _summarize(cat: TokenCategory, stats: CatStats, top_k: int) -> None:
             f"  miss split: expected_process_reroute={stats.expected_process_reroute_misses:,}, "
             f"true_medtok_gap={stats.true_medtok_gap_misses:,}"
         )
+        semantic_total = max(0, stats.routed_total - stats.expected_process_reroute_misses)
+        semantic_hit_rate = (stats.hits / semantic_total * 100.0) if semantic_total else 0.0
+        print(
+            f"  semantic_hit_rate_excluding_expected_reroute={semantic_hit_rate:.1f}% "
+            f"(hits={stats.hits:,}/{semantic_total:,})"
+        )
     if cat == TokenCategory.DIAGNOSIS and stats.misses:
         rec = stats.format_recoverable_misses
         print(
@@ -520,6 +526,12 @@ def run(args: argparse.Namespace) -> None:
                 "parent_recovered_hits": int(s.parent_recovered_hits),
                 "expected_process_reroute_misses": int(s.expected_process_reroute_misses),
                 "true_medtok_gap_misses": int(s.true_medtok_gap_misses),
+                "semantic_routed_total": int(max(0, s.routed_total - s.expected_process_reroute_misses)),
+                "semantic_hit_rate": (
+                    float(s.hits) / float(max(1, s.routed_total - s.expected_process_reroute_misses))
+                    if (s.routed_total - s.expected_process_reroute_misses) > 0
+                    else 0.0
+                ),
                 "hits": int(s.hits),
                 "misses": int(s.misses),
                 "matched_vocab_ids": int(len(s.matched_vocab_ids)),

@@ -43,12 +43,15 @@ def build_base_encoders(
 
     diag_residual_offset = None
     proc_residual_offset = None
+    med_residual_offset = None
     if enable_residual_fallback:
         if residual_fallback_offsets:
             if "diagnosis" in residual_fallback_offsets:
                 diag_residual_offset = int(residual_fallback_offsets["diagnosis"])
             if "procedure" in residual_fallback_offsets:
                 proc_residual_offset = int(residual_fallback_offsets["procedure"])
+            if "medication" in residual_fallback_offsets:
+                med_residual_offset = int(residual_fallback_offsets["medication"])
 
         # If not explicitly provided, carve residual ranges from in-band slack
         # between diagnosis->procedure and procedure->medication offsets.
@@ -62,6 +65,11 @@ def build_base_encoders(
             candidate = int(proc_vocab.offset) + int(proc_max_local) + 1_000
             if candidate + int(residual_fallback_buckets) < int(med_vocab.offset):
                 proc_residual_offset = candidate
+        if med_residual_offset is None:
+            med_max_local = max(med_vocab.code2id.values()) if med_vocab.code2id else 0
+            candidate = int(med_vocab.offset) + int(med_max_local) + 1_000
+            if candidate + int(residual_fallback_buckets) < int(struct_vocab.offset):
+                med_residual_offset = candidate
 
     encoders[TokenCategory.MEASUREMENT] = MeasurementTokenEncoder(meas_cfg)
     encoders[TokenCategory.DIAGNOSIS]   = MedTokenWithAttrsEncoder(
@@ -90,6 +98,9 @@ def build_base_encoders(
             numeric_attrs=med_numeric_attrs or {},
             canonicalize_fn=canonicalize_medication_code,
             parent_lookup=medtok_parent_lookup,
+            residual_fallback_offset=med_residual_offset,
+            residual_fallback_buckets=residual_fallback_buckets,
+            drop_unknowns=drop_unknowns,
         )
     else:
         encoders[TokenCategory.MEDICATION]  = MedTokenWithAttrsEncoder(
@@ -97,6 +108,9 @@ def build_base_encoders(
             med_vocab,
             canonicalize_fn=canonicalize_medication_code,
             parent_lookup=medtok_parent_lookup,
+            residual_fallback_offset=med_residual_offset,
+            residual_fallback_buckets=residual_fallback_buckets,
+            drop_unknowns=drop_unknowns,
         )
     encoders[TokenCategory.STRUCTURAL]  = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL,  struct_vocab)
     if include_other_noop:

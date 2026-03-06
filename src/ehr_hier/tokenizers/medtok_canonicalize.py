@@ -134,6 +134,21 @@ def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
 _RXNORM_RE = re.compile(r"RXNORM\W*([0-9]{3,9})", re.IGNORECASE)
 _NDC_RE = re.compile(r"NDC\W*([0-9]{4,5}-?[0-9]{3,4}-?[0-9]{1,2})", re.IGNORECASE)
 _NUMERIC_RE = re.compile(r"\b([0-9]{3,11})\b")
+_MED_ACTION_SUFFIXES = {
+    "ADMINISTERED",
+    "NOT ADMINISTERED",
+    "NOT GIVEN",
+    "NOT GIVEN PER SLIDING SCALE",
+    "CONFIRMED",
+    "FLUSHED",
+    "NOT FLUSHED",
+    "STARTED",
+    "STOPPED",
+    "HELD",
+    "REFUSED",
+    "PAUSED",
+    "RESUMED",
+}
 
 
 def _normalize_ndc(ndc: str) -> str:
@@ -142,6 +157,42 @@ def _normalize_ndc(ndc: str) -> str:
     if len(digits) == 10:  # pad to 11 using FDA segments (simple heuristic)
         return digits[0].zfill(5) + digits[1:5].zfill(4) + digits[5:].zfill(2)
     return digits
+
+
+def _norm_med_text(text: str) -> str:
+    out = str(text).upper().strip()
+    out = re.sub(r"\s+", " ", out)
+    return out
+
+
+def _split_medication_surface(raw: str) -> tuple[str, Optional[str], Optional[str]]:
+    """
+    Parse MEDS-style medication/infusion strings into (domain, entity, action).
+    """
+    parts = [p.strip() for p in str(raw).split("//")]
+    if not parts:
+        return "", None, None
+
+    head = parts[0].upper()
+    tail = parts[1:]
+    action: Optional[str] = None
+
+    if head == "INFUSION_START":
+        return "INFUSION", ("//".join(tail).strip() or None), "START"
+    if head == "INFUSION_END":
+        return "INFUSION", ("//".join(tail).strip() or None), "END"
+
+    if head in {"MEDICATION", "INFUSION"}:
+        if tail and tail[0].upper() in {"START", "END", "STOP"}:
+            action = tail[0].upper()
+            tail = tail[1:]
+        elif len(tail) >= 2 and _norm_med_text(tail[-1]) in _MED_ACTION_SUFFIXES:
+            action = _norm_med_text(tail[-1])
+            tail = tail[:-1]
+        entity = "//".join(tail).strip() if tail else ""
+        return head, (entity or None), action
+
+    return head, None, None
 
 
 def canonicalize_medication_code(code: Optional[str]) -> List[str]:
@@ -154,17 +205,8 @@ def canonicalize_medication_code(code: Optional[str]) -> List[str]:
     s = raw.upper()
     cands: List[str] = []
 
-    # If MEDICATION/INFUSION prefixes are present, peel them to focus on the core token.
-    # Handle forms like MEDICATION//START//INSULIN, INFUSION//225158, MEDICATION//NDC//0000-0000.
-    core = raw
-    parts = raw.split("//")
-    if parts and parts[0].upper() in {"MEDICATION", "INFUSION"}:
-        tail_parts = [p for p in parts[1:] if p and p.upper() not in {"START", "END", "STOP"}]
-        if tail_parts:
-            core = tail_parts[-1]
-        else:
-            core = parts[-1]
-    core_upper = str(core).upper()
+    domain, entity_raw, action = _split_medication_surface(raw)
+    entity = _norm_med_text(entity_raw) if entity_raw else None
 
     m = _RXNORM_RE.search(s)
     if m:
@@ -184,9 +226,20 @@ def canonicalize_medication_code(code: Optional[str]) -> List[str]:
             ]
         )
 
+    if entity:
+        m = _RXNORM_RE.search(entity)
+        if m:
+            rx = m.group(1)
+            cands.extend([f"RXNORM//{rx}", rx])
+        m = _NDC_RE.search(entity)
+        if m:
+            ndc_raw = m.group(1)
+            ndc_norm = _normalize_ndc(ndc_raw)
+            cands.extend([f"NDC//{ndc_raw}", f"NDC//{ndc_norm}", ndc_raw, ndc_norm])
+
     # As a fallback, capture standalone numeric codes that might be RxNorm (favor core token)
     if not cands:
-        m = _NUMERIC_RE.search(core_upper)
+        m = _NUMERIC_RE.search(entity or "")
         if m:
             num = m.group(1)
             cands.extend([f"RXNORM//{num}", num])
@@ -196,11 +249,19 @@ def canonicalize_medication_code(code: Optional[str]) -> List[str]:
             num = m.group(1)
             cands.extend([f"RXNORM//{num}", num])
 
-    # Also try the core token itself (name or code) before the raw string
-    if core and core not in cands:
-        cands.append(str(core))
+    # Name-based candidates for semantic matching when explicit RxNorm/NDC is missing.
+    if entity:
+        if domain == "MEDICATION":
+            cands.append(f"MEDICATION//{entity}")
+            if action:
+                cands.append(f"MEDICATION//{entity}//{action}")
+        elif domain == "INFUSION":
+            cands.append(f"INFUSION//{entity}")
+        cands.append(entity)
+
+    # Also try original code.
     if raw and raw not in cands:
-        cands.append(str(raw))
+        cands.append(raw)
 
     return list(dict.fromkeys(cands))
 
