@@ -93,6 +93,8 @@ class CatStats:
     filtered_routed: int = 0         # of the above, how many router sent to this category
     routed_total: int = 0            # events routed here by event_router
     parent_meta_present: int = 0
+    parent_lookup_present: int = 0
+    parent_recovered_hits: int = 0   # misses on base candidates that become hits via parent candidates
     hits: int = 0
     misses: int = 0
     no_candidate: int = 0            # canonicalizer produced zero candidates (raw included)
@@ -199,6 +201,56 @@ def _extract_parent_codes_from_event(ev: object) -> list[str]:
     return _dedupe_preserve(out)
 
 
+def _load_parent_lookup_from_codes_parquet(fp: str | None) -> Dict[str, List[str]]:
+    """
+    Build code -> parent_codes lookup from MEDS metadata/codes.parquet.
+    Keys are normalized to uppercase for alignment with routed event codes in this script.
+    """
+    if not fp:
+        return {}
+    path = Path(fp)
+    if not path.exists():
+        raise FileNotFoundError(f"codes.parquet not found: {path}")
+    try:
+        import pyarrow.parquet as pq
+    except Exception as exc:
+        raise ImportError("pyarrow is required to read codes.parquet for parent lookup") from exc
+
+    tbl = pq.read_table(str(path), columns=["code", "parent_codes"])
+    codes = tbl.column("code").to_pylist()
+    parents = tbl.column("parent_codes").to_pylist()
+    out: Dict[str, List[str]] = {}
+
+    def _parse_parent_cell(v: object) -> List[str]:
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple, set)):
+            return _dedupe_preserve(str(x).strip() for x in v if x is not None and str(x).strip())
+        if isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            parsed = None
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(s)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                return _dedupe_preserve(str(x).strip() for x in parsed if x is not None and str(x).strip())
+            return [s]
+        return [str(v).strip()] if str(v).strip() else []
+
+    for code, parent_cell in zip(codes, parents):
+        if code is None:
+            continue
+        key = str(code).upper()
+        pcs = _parse_parent_cell(parent_cell)
+        if pcs:
+            out[key] = pcs
+    return out
+
+
 def _build_resources(manifest: Dict, args: argparse.Namespace):
     code2embeds = args.code2embeds or os.getenv("MEDTOK_CODE2EMBEDS")
     vocab_dir_env = os.getenv("MEDTOK_VOCAB_DIR", args.vocab_dir)
@@ -248,9 +300,18 @@ def _summarize(cat: TokenCategory, stats: CatStats, top_k: int) -> None:
         f"({(_pct(stats.parent_meta_present, stats.routed_total)):.1f}% of routed)"
     )
     print(
+        f"  parent_lookup_present={stats.parent_lookup_present:,} "
+        f"({(_pct(stats.parent_lookup_present, stats.routed_total)):.1f}% of routed)"
+    )
+    print(
         f"  hits={stats.hits:,} | misses={stats.misses:,} "
         f"| hit_rate={_pct(stats.hits, stats.routed_total):.1f}%"
     )
+    if stats.parent_recovered_hits:
+        print(
+            f"  parent_recovered_hits={stats.parent_recovered_hits:,} "
+            f"({(_pct(stats.parent_recovered_hits, stats.routed_total)):.2f}% absolute hit-rate gain)"
+        )
     if stats.no_candidate or stats.not_in_vocab:
         print(f"  miss breakdown: no_cand={stats.no_candidate:,}, not_in_vocab={stats.not_in_vocab:,}")
     if cat == TokenCategory.DIAGNOSIS and stats.misses:
@@ -280,6 +341,9 @@ def run(args: argparse.Namespace) -> None:
 
     manifest = _load_manifest(Path("artifacts/vocab_manifest.json"))
     cat_resources = _build_resources(manifest, args)
+    parent_lookup = _load_parent_lookup_from_codes_parquet(args.codes_parquet)
+    if parent_lookup:
+        print(f"Loaded parent lookup entries: {len(parent_lookup):,}")
 
     stats: Dict[TokenCategory, CatStats] = {
         TokenCategory.DIAGNOSIS: CatStats(),
@@ -334,18 +398,38 @@ def run(args: argparse.Namespace) -> None:
             stats[category].routed_total += 1
             if category in filter_hits:
                 stats[category].filtered_routed += 1
-            if _extract_parent_codes_from_event(ev):
+            event_parent_codes = _extract_parent_codes_from_event(ev)
+            if event_parent_codes:
                 stats[category].parent_meta_present += 1
-            try:
-                cands = ensure_list(canon_fn(code)) + [code_upper]
-            except Exception:
-                cands = [code_upper]
+            lookup_parent_codes = parent_lookup.get(code_upper, [])
+            if lookup_parent_codes:
+                stats[category].parent_lookup_present += 1
 
-            cands = _dedupe_preserve(cands)
+            try:
+                base_cands = ensure_list(canon_fn(code)) + [code_upper]
+            except Exception:
+                base_cands = [code_upper]
+            base_cands = _dedupe_preserve(base_cands)
+
+            parent_cands: list[str] = []
+            for pc in _dedupe_preserve(list(event_parent_codes) + list(lookup_parent_codes)):
+                try:
+                    parent_cands.extend(ensure_list(canon_fn(pc)))
+                except Exception:
+                    pass
+                parent_cands.append(str(pc).upper())
+            parent_cands = _dedupe_preserve(parent_cands)
+
+            cands = _dedupe_preserve(parent_cands + base_cands)
             if not cands:
                 stats[category].misses += 1
                 stats[category].no_candidate += 1
                 stats[category].miss_samples[code_upper] += 1
+                continue
+
+            hit_base = any(vocab.maybe_encode(cand) is not None for cand in base_cands)
+            if hit_base:
+                stats[category].hits += 1
                 continue
 
             hit = False
@@ -357,6 +441,8 @@ def run(args: argparse.Namespace) -> None:
 
             if hit:
                 stats[category].hits += 1
+                if parent_cands:
+                    stats[category].parent_recovered_hits += 1
             else:
                 stats[category].misses += 1
                 stats[category].not_in_vocab += 1
@@ -388,6 +474,8 @@ def run(args: argparse.Namespace) -> None:
                 "filtered_routed": int(s.filtered_routed),
                 "routed_total": int(s.routed_total),
                 "parent_meta_present": int(s.parent_meta_present),
+                "parent_lookup_present": int(s.parent_lookup_present),
+                "parent_recovered_hits": int(s.parent_recovered_hits),
                 "hits": int(s.hits),
                 "misses": int(s.misses),
                 "no_candidate": int(s.no_candidate),
@@ -432,6 +520,12 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--top-k", type=int, default=20, help="How many miss/mismatch samples to print per category.")
     parser.add_argument("--output-json", type=str, default=None, help="Optional path to write a JSON summary.")
+    parser.add_argument(
+        "--codes-parquet",
+        type=str,
+        default=None,
+        help="Optional MEDS metadata/codes.parquet to supply code->parent_codes lookup.",
+    )
     return parser.parse_args()
 
 
