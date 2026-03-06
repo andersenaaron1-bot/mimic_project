@@ -22,6 +22,7 @@ import argparse
 import ast
 import json
 import os
+import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
