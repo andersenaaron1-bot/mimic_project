@@ -49,6 +49,19 @@ from src.ehr_hier.tokenizers.medtok_loader import (
 )
 
 
+def _is_expected_process_reroute(code_upper: str, category: TokenCategory) -> bool:
+    s = str(code_upper).upper()
+    if category == TokenCategory.MEDICATION:
+        if s.startswith("INFUSION_START//") or s.startswith("INFUSION_END//"):
+            return True
+        if s.startswith("MEDICATION//START//") or s.startswith("MEDICATION//END//") or s.startswith("MEDICATION//STOP//"):
+            return True
+    if category == TokenCategory.PROCEDURE:
+        if s.startswith("PROCEDURE//START//") or s.startswith("PROCEDURE//END//") or s.startswith("PROCEDURE//STOP//"):
+            return True
+    return False
+
+
 def _offset(manifest: Dict, key: str, default: int) -> int:
     return int(manifest.get(key, {}).get("offset", default))
 
@@ -95,6 +108,9 @@ class CatStats:
     parent_meta_present: int = 0
     parent_lookup_present: int = 0
     parent_recovered_hits: int = 0   # misses on base candidates that become hits via parent candidates
+    expected_process_reroute_misses: int = 0
+    true_medtok_gap_misses: int = 0
+    matched_vocab_ids: set[int] = field(default_factory=set)
     hits: int = 0
     misses: int = 0
     no_candidate: int = 0            # canonicalizer produced zero candidates (raw included)
@@ -314,6 +330,11 @@ def _summarize(cat: TokenCategory, stats: CatStats, top_k: int) -> None:
         )
     if stats.no_candidate or stats.not_in_vocab:
         print(f"  miss breakdown: no_cand={stats.no_candidate:,}, not_in_vocab={stats.not_in_vocab:,}")
+    if cat in {TokenCategory.MEDICATION, TokenCategory.PROCEDURE} and stats.misses:
+        print(
+            f"  miss split: expected_process_reroute={stats.expected_process_reroute_misses:,}, "
+            f"true_medtok_gap={stats.true_medtok_gap_misses:,}"
+        )
     if cat == TokenCategory.DIAGNOSIS and stats.misses:
         rec = stats.format_recoverable_misses
         print(
@@ -341,6 +362,9 @@ def run(args: argparse.Namespace) -> None:
 
     manifest = _load_manifest(Path("artifacts/vocab_manifest.json"))
     cat_resources = _build_resources(manifest, args)
+    vocab_size_ex_unk: Dict[TokenCategory, int] = {}
+    for cat, (vocab, _, _) in cat_resources.items():
+        vocab_size_ex_unk[cat] = max(0, len(vocab.code2id) - (1 if "<UNK>" in vocab.code2id else 0))
     parent_lookup = _load_parent_lookup_from_codes_parquet(args.codes_parquet)
     if parent_lookup:
         print(f"Loaded parent lookup entries: {len(parent_lookup):,}")
@@ -427,25 +451,36 @@ def run(args: argparse.Namespace) -> None:
                 stats[category].miss_samples[code_upper] += 1
                 continue
 
-            hit_base = any(vocab.maybe_encode(cand) is not None for cand in base_cands)
-            if hit_base:
+            base_gid = None
+            for cand in base_cands:
+                gid = vocab.maybe_encode(cand)
+                if gid is not None:
+                    base_gid = int(gid)
+                    break
+            if base_gid is not None:
                 stats[category].hits += 1
+                stats[category].matched_vocab_ids.add(int(base_gid))
                 continue
 
-            hit = False
+            hit_gid = None
             for cand in cands:
                 gid = vocab.maybe_encode(cand)
                 if gid is not None:
-                    hit = True
+                    hit_gid = int(gid)
                     break
 
-            if hit:
+            if hit_gid is not None:
                 stats[category].hits += 1
+                stats[category].matched_vocab_ids.add(int(hit_gid))
                 if parent_cands:
                     stats[category].parent_recovered_hits += 1
             else:
                 stats[category].misses += 1
                 stats[category].not_in_vocab += 1
+                if _is_expected_process_reroute(code_upper, category):
+                    stats[category].expected_process_reroute_misses += 1
+                else:
+                    stats[category].true_medtok_gap_misses += 1
                 stats[category].miss_samples[code_upper] += 1
                 if category == TokenCategory.DIAGNOSIS:
                     probe_cands = _diagnosis_format_probe_candidates(code_upper)
@@ -459,6 +494,13 @@ def run(args: argparse.Namespace) -> None:
     print(f"Processed {total_events:,} events across {subjects_seen:,} subjects from {db_path}")
     for cat in (TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION):
         _summarize(cat, stats[cat], args.top_k)
+        total_vocab = int(vocab_size_ex_unk.get(cat, 0))
+        matched_vocab = int(len(stats[cat].matched_vocab_ids))
+        frac = (matched_vocab / total_vocab) if total_vocab > 0 else 0.0
+        print(
+            f"  unique_vocab_covered={matched_vocab:,}/{total_vocab:,} "
+            f"({frac*100.0:.2f}%)"
+        )
 
     if args.output_json:
         payload = {
@@ -476,8 +518,12 @@ def run(args: argparse.Namespace) -> None:
                 "parent_meta_present": int(s.parent_meta_present),
                 "parent_lookup_present": int(s.parent_lookup_present),
                 "parent_recovered_hits": int(s.parent_recovered_hits),
+                "expected_process_reroute_misses": int(s.expected_process_reroute_misses),
+                "true_medtok_gap_misses": int(s.true_medtok_gap_misses),
                 "hits": int(s.hits),
                 "misses": int(s.misses),
+                "matched_vocab_ids": int(len(s.matched_vocab_ids)),
+                "vocab_size_ex_unk": int(vocab_size_ex_unk.get(cat, 0)),
                 "no_candidate": int(s.no_candidate),
                 "not_in_vocab": int(s.not_in_vocab),
                 "format_recoverable_misses": int(s.format_recoverable_misses),

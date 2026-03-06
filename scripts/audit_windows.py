@@ -891,6 +891,11 @@ def main() -> None:
     ap.add_argument("--medtok_vocab_dir", default=str(PROJECT_ROOT / "artifacts" / "medtok"))
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_attr_dir", default=str(PROJECT_ROOT / "artifacts" / "medtok_attrs"))
+    ap.add_argument(
+        "--codes_parquet_parent_lookup",
+        default=None,
+        help="Optional metadata/codes.parquet for code->parent_codes lookup used by MedTok encoders.",
+    )
     ap.add_argument("--structural_yaml", default=str(PROJECT_ROOT / "configs" / "data" / "structural_codes.yaml"))
 
     ap.add_argument("--code2id_pt", required=True)
@@ -934,6 +939,10 @@ def main() -> None:
 
     ap.add_argument("--max_windows", type=int, default=64)
     ap.add_argument("--max_len_per_window", type=int, default=128)
+    ap.add_argument("--disable_residual_fallback", action="store_true")
+    ap.add_argument("--residual_fallback_buckets", type=int, default=40_000)
+    ap.add_argument("--diag_residual_offset", type=int, default=None)
+    ap.add_argument("--proc_residual_offset", type=int, default=None)
     ap.add_argument("--example_subjects", type=int, default=4)
     ap.add_argument("--example_windows", type=int, default=6)
     ap.add_argument("--preview_items", type=int, default=8)
@@ -978,6 +987,17 @@ def main() -> None:
         struct_vocab=struct_vocab,
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
+        medtok_parent_lookup=artifacts.medtok_parent_lookup,
+        enable_residual_fallback=not bool(args.disable_residual_fallback),
+        residual_fallback_buckets=int(args.residual_fallback_buckets),
+        residual_fallback_offsets={
+            k: int(v)
+            for k, v in {
+                "diagnosis": args.diag_residual_offset,
+                "procedure": args.proc_residual_offset,
+            }.items()
+            if v is not None
+        },
     )
 
     policies = _make_policies(args)

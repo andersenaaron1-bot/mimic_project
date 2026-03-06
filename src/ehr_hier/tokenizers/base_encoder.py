@@ -1,5 +1,5 @@
 from __future__ import annotations
-from typing import Dict, Optional
+from typing import Dict, Optional, List
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 from src.ehr_hier.tokenizers.measurement_encoder import (
@@ -26,6 +26,10 @@ def build_base_encoders(
     struct_vocab: CategoryVocab,
     med_attr_vocabs: Optional[Dict[str, CategoryVocab]] = None,
     med_numeric_attrs: Optional[Dict[str, NumericBinConfig]] = None,
+    medtok_parent_lookup: Optional[Dict[str, List[str]]] = None,
+    enable_residual_fallback: bool = False,
+    residual_fallback_buckets: int = 40_000,
+    residual_fallback_offsets: Optional[Dict[str, int]] = None,
     include_other_noop: bool = True,
     drop_unknowns: bool = False,
 ) -> Dict[TokenCategory, EventTokenEncoder]:
@@ -37,17 +41,45 @@ def build_base_encoders(
     """
     encoders: Dict[TokenCategory, EventTokenEncoder] = {}
 
+    diag_residual_offset = None
+    proc_residual_offset = None
+    if enable_residual_fallback:
+        if residual_fallback_offsets:
+            if "diagnosis" in residual_fallback_offsets:
+                diag_residual_offset = int(residual_fallback_offsets["diagnosis"])
+            if "procedure" in residual_fallback_offsets:
+                proc_residual_offset = int(residual_fallback_offsets["procedure"])
+
+        # If not explicitly provided, carve residual ranges from in-band slack
+        # between diagnosis->procedure and procedure->medication offsets.
+        if diag_residual_offset is None:
+            diag_max_local = max(diag_vocab.code2id.values()) if diag_vocab.code2id else 0
+            candidate = int(diag_vocab.offset) + int(diag_max_local) + 1_000
+            if candidate + int(residual_fallback_buckets) < int(proc_vocab.offset):
+                diag_residual_offset = candidate
+        if proc_residual_offset is None:
+            proc_max_local = max(proc_vocab.code2id.values()) if proc_vocab.code2id else 0
+            candidate = int(proc_vocab.offset) + int(proc_max_local) + 1_000
+            if candidate + int(residual_fallback_buckets) < int(med_vocab.offset):
+                proc_residual_offset = candidate
+
     encoders[TokenCategory.MEASUREMENT] = MeasurementTokenEncoder(meas_cfg)
     encoders[TokenCategory.DIAGNOSIS]   = MedTokenWithAttrsEncoder(
         TokenCategory.DIAGNOSIS,
         diag_vocab,
         canonicalize_fn=canonicalize_diagnosis_code,
+        parent_lookup=medtok_parent_lookup,
+        residual_fallback_offset=diag_residual_offset,
+        residual_fallback_buckets=residual_fallback_buckets,
         drop_unknowns=drop_unknowns,
     )
     encoders[TokenCategory.PROCEDURE]   = MedTokenWithAttrsEncoder(
         TokenCategory.PROCEDURE,
         proc_vocab,
         canonicalize_fn=canonicalize_procedure_code,
+        parent_lookup=medtok_parent_lookup,
+        residual_fallback_offset=proc_residual_offset,
+        residual_fallback_buckets=residual_fallback_buckets,
         drop_unknowns=drop_unknowns,
     )
     if med_attr_vocabs or med_numeric_attrs:
@@ -57,12 +89,14 @@ def build_base_encoders(
             categorical_attrs=med_attr_vocabs or {},
             numeric_attrs=med_numeric_attrs or {},
             canonicalize_fn=canonicalize_medication_code,
+            parent_lookup=medtok_parent_lookup,
         )
     else:
         encoders[TokenCategory.MEDICATION]  = MedTokenWithAttrsEncoder(
             TokenCategory.MEDICATION,
             med_vocab,
             canonicalize_fn=canonicalize_medication_code,
+            parent_lookup=medtok_parent_lookup,
         )
     encoders[TokenCategory.STRUCTURAL]  = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL,  struct_vocab)
     if include_other_noop:

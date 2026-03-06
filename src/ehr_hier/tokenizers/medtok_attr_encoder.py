@@ -1,12 +1,83 @@
 from __future__ import annotations
 import ast
 import re
+import zlib
 from typing import Dict, List, Any, Optional, Iterable, Callable
 
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
 from src.ehr_hier.tokenizers.medtok_canonicalize import ensure_list
+
+
+def load_parent_lookup_from_codes_parquet(codes_parquet_fp: str) -> Dict[str, List[str]]:
+    """
+    Load code -> parent_codes from MEDS metadata/codes.parquet.
+    Returns uppercase raw-code keys to match event.code normalization.
+    """
+    if not codes_parquet_fp:
+        return {}
+    try:
+        import pyarrow.parquet as pq
+    except Exception as exc:
+        raise ImportError("pyarrow is required to read codes.parquet parent_codes lookup") from exc
+
+    tbl = pq.read_table(str(codes_parquet_fp), columns=["code", "parent_codes"])
+    codes = tbl.column("code").to_pylist()
+    parents = tbl.column("parent_codes").to_pylist()
+    out: Dict[str, List[str]] = {}
+
+    def _parse_parent_cell(v: object) -> List[str]:
+        vals: List[str] = []
+
+        def _append(x: object) -> None:
+            if x is None:
+                return
+            s = str(x).strip()
+            if s:
+                vals.append(s)
+
+        if v is None:
+            return []
+        if isinstance(v, (list, tuple, set)):
+            for x in v:
+                _append(x)
+        elif isinstance(v, str):
+            s = v.strip()
+            if not s:
+                return []
+            parsed = None
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(s)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                for x in parsed:
+                    _append(x)
+            else:
+                _append(s)
+        else:
+            _append(v)
+
+        # de-dupe preserving order
+        seen = set()
+        uniq: List[str] = []
+        for x in vals:
+            if x in seen:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+
+    for code, parent_cell in zip(codes, parents):
+        if code is None:
+            continue
+        key = str(code).upper()
+        pcs = _parse_parent_cell(parent_cell)
+        if pcs:
+            out[key] = pcs
+    return out
 
 
 class MedTokenWithAttrsEncoder:
@@ -25,16 +96,30 @@ class MedTokenWithAttrsEncoder:
         categorical_attrs: Dict[str, CategoryVocab] | None = None,
         numeric_attrs: Dict[str, NumericBinConfig] | None = None,
         canonicalize_fn: Optional[Callable[[Any], Iterable[str]]] = None,
+        parent_lookup: Optional[Dict[str, List[str]]] = None,
         drop_unknowns: bool = False,
         fallback_to_raw: bool = True,
+        residual_fallback_offset: Optional[int] = None,
+        residual_fallback_buckets: int = 40_000,
     ):
         self.category = category
         self.base_vocab = base_vocab
         self.categorical_attrs = categorical_attrs or {}
         self.numeric_attrs = numeric_attrs or {}
         self.canonicalize_fn = canonicalize_fn
+        self.parent_lookup = {
+            str(k).upper(): list(v)
+            for k, v in (parent_lookup or {}).items()
+            if v
+        }
         self.drop_unknowns = drop_unknowns
         self.fallback_to_raw = fallback_to_raw
+        self.residual_fallback_offset = (
+            int(residual_fallback_offset)
+            if residual_fallback_offset is not None
+            else None
+        )
+        self.residual_fallback_buckets = max(1, int(residual_fallback_buckets))
         self.unk_gid = self.base_vocab.offset + self.base_vocab.unk_id
         self._cache: Dict[str, Optional[int]] = {}
         # START/END/STOP markers from MEDS-style medication/infusion/procedure events
@@ -123,6 +208,39 @@ class MedTokenWithAttrsEncoder:
         _append(parent_codes)
         return list(dict.fromkeys(out))
 
+    def _lookup_parent_codes(
+        self,
+        *,
+        raw_code: Optional[str],
+        base_code: Optional[str],
+    ) -> List[str]:
+        out: List[str] = []
+        for key in (raw_code, base_code):
+            if key is None:
+                continue
+            out.extend(self.parent_lookup.get(str(key).upper(), []))
+        # de-dupe preserving order
+        seen = set()
+        uniq: List[str] = []
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            uniq.append(x)
+        return uniq
+
+    @staticmethod
+    def _stable_bucket(raw: str, buckets: int) -> int:
+        data = str(raw).encode("utf-8", errors="ignore")
+        return 1 + (zlib.crc32(data) % max(1, int(buckets)))
+
+    def _is_residual_gid(self, gid: int) -> bool:
+        if self.residual_fallback_offset is None:
+            return False
+        lo = int(self.residual_fallback_offset)
+        hi = lo + int(self.residual_fallback_buckets)
+        return lo <= int(gid) <= hi
+
     def _candidate_codes(
         self,
         base_code: Optional[str],
@@ -186,6 +304,15 @@ class MedTokenWithAttrsEncoder:
             self._cache[cache_key] = None
             return None
 
+        if self.residual_fallback_offset is not None:
+            seed = str(base_code if base_code is not None else raw_code)
+            fallback_gid = int(self.residual_fallback_offset) + self._stable_bucket(
+                seed,
+                int(self.residual_fallback_buckets),
+            )
+            self._cache[cache_key] = fallback_gid
+            return fallback_gid
+
         self._cache[cache_key] = self.unk_gid
         return self.unk_gid
 
@@ -207,10 +334,15 @@ class MedTokenWithAttrsEncoder:
         raw_code = getattr(ev, "code", None)
         base_code, marker = self._strip_marker(raw_code)
         parent_codes = self._iter_parent_codes(ev)
+        parent_codes.extend(self._lookup_parent_codes(raw_code=raw_code, base_code=base_code))
+        # de-dupe preserving order
+        parent_codes = list(dict.fromkeys(parent_codes))
         base_gid = self._encode_base(base_code, raw_code, parent_codes=parent_codes)
         if base_gid is None:
             return []
         cat_attrs = self._encode_categorical_attrs(ev)
+        if self._is_residual_gid(base_gid):
+            cat_attrs["residual_fallback"] = 1
         num_attrs = self._encode_numeric_attrs(ev)
 
         tokens = [

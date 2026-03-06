@@ -51,6 +51,7 @@ from src.ehr_hier.tokenizers.medtok_loader import (
     load_attr_vocab,
     load_medtok_vocab,
 )
+from src.ehr_hier.tokenizers.medtok_attr_encoder import load_parent_lookup_from_codes_parquet
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 
 
@@ -75,6 +76,7 @@ class AuditArtifacts:
     med_vocab: CategoryVocab
     med_attr_vocabs: Dict[str, CategoryVocab]
     med_numeric_attrs: Dict[str, NumericBinConfig]
+    medtok_parent_lookup: Dict[str, List[str]]
 
 
 class _EventWithDemographics:
@@ -284,6 +286,11 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         measurement_codebook_size = int(tok_ckpt["cfg"]["codebook_size"])
         measurement_stride = measurement_codebook_size
 
+    medtok_parent_lookup: Dict[str, List[str]] = {}
+    codes_parquet_parent_lookup = getattr(args, "codes_parquet_parent_lookup", None)
+    if codes_parquet_parent_lookup:
+        medtok_parent_lookup = load_parent_lookup_from_codes_parquet(codes_parquet_parent_lookup)
+
     return AuditArtifacts(
         manifest=manifest,
         structural_codebook=structural_codebook,
@@ -296,6 +303,7 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         med_vocab=med_vocab,
         med_attr_vocabs=med_attr_vocabs,
         med_numeric_attrs=_build_med_numeric_cfg(manifest),
+        medtok_parent_lookup=medtok_parent_lookup,
     )
 
 
@@ -899,6 +907,11 @@ def main() -> None:
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument(
+        "--codes_parquet_parent_lookup",
+        default=None,
+        help="Optional metadata/codes.parquet for code->parent_codes lookup used by MedTok encoders.",
+    )
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
     ap.add_argument("--code2id_pt", default=None)
     ap.add_argument("--stats_pt", default=None)
@@ -908,6 +921,10 @@ def main() -> None:
     ap.add_argument("--max_chunks_per_window", type=int, default=8)
     ap.add_argument("--max_len_per_window", type=int, default=128)
     ap.add_argument("--collate_batch_size", type=int, default=16)
+    ap.add_argument("--disable_residual_fallback", action="store_true")
+    ap.add_argument("--residual_fallback_buckets", type=int, default=40_000)
+    ap.add_argument("--diag_residual_offset", type=int, default=None)
+    ap.add_argument("--proc_residual_offset", type=int, default=None)
     ap.add_argument("--example_subjects", type=int, default=3)
     ap.add_argument("--example_tokens", type=int, default=40)
     ap.add_argument("--progress_every", type=int, default=0)
@@ -971,6 +988,17 @@ def main() -> None:
         struct_vocab=struct_vocab,
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
+        medtok_parent_lookup=artifacts.medtok_parent_lookup,
+        enable_residual_fallback=not bool(args.disable_residual_fallback),
+        residual_fallback_buckets=int(args.residual_fallback_buckets),
+        residual_fallback_offsets={
+            k: int(v)
+            for k, v in {
+                "diagnosis": args.diag_residual_offset,
+                "procedure": args.proc_residual_offset,
+            }.items()
+            if v is not None
+        },
     )
 
     downstream = _summarize_tokenization_and_collation(
@@ -999,6 +1027,11 @@ def main() -> None:
             "measurement_num_codebooks": artifacts.measurement_num_codebooks,
             "measurement_codebook_size": artifacts.measurement_codebook_size,
             "measurement_stride": artifacts.measurement_stride,
+            "medtok_parent_lookup_entries": len(artifacts.medtok_parent_lookup),
+            "residual_fallback_enabled": not bool(args.disable_residual_fallback),
+            "residual_fallback_buckets": int(args.residual_fallback_buckets),
+            "diag_residual_offset": args.diag_residual_offset,
+            "proc_residual_offset": args.proc_residual_offset,
         },
         "raw": raw_summary,
         "timeline": downstream["timeline"],
