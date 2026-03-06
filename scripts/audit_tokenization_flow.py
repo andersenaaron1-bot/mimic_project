@@ -485,6 +485,10 @@ def _family_name_for_token(tok: EventToken, *, artifacts: AuditArtifacts) -> str
     meas_code_offset = _offset(manifest, "measurement_code", 2_000_000)
     meas_value_offset = _offset(manifest, "measurement_value", 2_100_000)
     struct_offset = _offset(manifest, "structural", 2_200_000)
+    obs_code_offset = _offset(manifest, "observation_code", 2_300_000)
+    obs_value_offset = _offset(manifest, "observation_value", 2_320_000)
+    struct_action_offset = _offset(manifest, "structural_action", 2_400_000)
+    struct_entity_offset = _offset(manifest, "structural_entity", 2_420_000)
 
     if meas_value_offset <= value_id < struct_offset:
         return "measurement_value"
@@ -496,6 +500,14 @@ def _family_name_for_token(tok: EventToken, *, artifacts: AuditArtifacts) -> str
         return "procedure"
     if diag_offset <= value_id < proc_offset:
         return "diagnosis"
+    if obs_value_offset <= value_id < struct_action_offset:
+        return "observation_value"
+    if obs_code_offset <= value_id < obs_value_offset:
+        return "observation_code"
+    if struct_entity_offset <= value_id:
+        return "structural_entity"
+    if struct_action_offset <= value_id < struct_entity_offset:
+        return "structural_action"
     if value_id >= struct_offset:
         return "structural"
     return "special_or_window"
@@ -751,7 +763,11 @@ def _summarize_tokenization_and_collation(
                         procedure_id2code=invert_code2id(artifacts.proc_vocab.code2id),
                         medication_offset=artifacts.med_vocab.offset,
                         medication_id2code=invert_code2id(artifacts.med_vocab.code2id),
+                        observation_code_offset=_offset(artifacts.manifest, "observation_code", 2_300_000),
+                        observation_value_offset=_offset(artifacts.manifest, "observation_value", 2_320_000),
                         structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
+                        structural_action_offset=_offset(artifacts.manifest, "structural_action", 2_400_000),
+                        structural_entity_offset=_offset(artifacts.manifest, "structural_entity", 2_420_000),
                         structural_id2label=struct_id2label,
                         structural_id2code=struct_id2code,
                         special_id2name=SPECIAL_ID2NAME,

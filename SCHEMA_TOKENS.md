@@ -108,6 +108,19 @@ This gives the model:
 - discretized *value semantics* (RVQ codes) that can condition downstream dynamics,
 - access to raw value normalization and conditioning (age/sex/dt_prev) inside the cVAE.
 
+### 3.1b Qualitative Measurement Surface (`OBS_QUAL`)
+Non-numeric measurement/charted events (for example `LAB//<itemid>//UNK|N/A`) are not
+sent through cVAE/RVQ. They are emitted as a 2-token categorical bundle:
+- `OBS_CODE(itemid_or_code_hash)`
+- `OBS_VALUE(value_text_or_code_tail_hash)`
+
+Ordering:
+- `OBS_CODE` carries `dt_from_prev_hours = dt_event`
+- `OBS_VALUE` carries `dt_from_prev_hours = 0`
+
+These remain `TokenCategory.MEASUREMENT` but use dedicated global-id ranges from
+`vocab_manifest.json` (`observation_code`, `observation_value`).
+
 ### 3.2 Medications / Diagnoses / Procedures: MedTok-backed codes
 Medications, diagnoses, and procedures are mapped to MedTok vocab ids (from ontology-graph
 pretraining) and emitted as `EventToken(value_id=<global_id>)`.
@@ -118,6 +131,10 @@ Metadata:
 - `cat_attrs`: route/form/frequency/unit ids (optional, if configured)
 - `num_attrs`: normalized numeric attributes (optional; currently not projected by the collator
   except for `num_attrs["numeric_value"]`)
+
+Process start/stop markers are additionally emitted as structural process tokens
+(`STRUCT_ACT`, `STRUCT_ENT`) when configured, so transition dynamics are explicit and
+auditable without relying on MedTok UNKs.
 
 ### 3.3 Numeric side-channel (`numeric_values`)
 The collator extracts `EventToken.num_attrs["numeric_value"]` into a dense tensor
@@ -143,7 +160,7 @@ needs **sizes** and **routing rules** (which ids are predicted by which head).
 AET uses multiple output heads to avoid a monolithic softmax:
 - `logits_struct`: special + window markers + (often) structural signifiers
 - `logits_rvq`: RVQ value tokens
-- `logits_meas`: measurement identity tokens
+- `logits_meas`: measurement identity tokens + qualitative observation bundles
 - `logits_medtok`: MedTok semantic tokens (diagnosis/procedure/medication, etc.)
 
 The loss routes targets to heads by **token id ranges** (see `src/ehr_hier/transformer/loss.py`).

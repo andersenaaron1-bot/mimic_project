@@ -24,6 +24,8 @@ def _is_measurement_code_token(
 ) -> bool:
     if tok.category_id != int(TokenCategory.MEASUREMENT):
         return False
+    if tok.cat_attrs and int(tok.cat_attrs.get("obs_bundle_pos", 0)) > 0:
+        return False
     if tok.cat_attrs and "codebook" in tok.cat_attrs:
         return False
     value_id = int(tok.value_id)
@@ -128,7 +130,11 @@ def decode_timeline_tokens(
     procedure_id2code: Mapping[int, str] | None = None,
     medication_offset: int | None = None,
     medication_id2code: Mapping[int, str] | None = None,
+    observation_code_offset: int | None = None,
+    observation_value_offset: int | None = None,
     structural_offset: int | None = None,
+    structural_action_offset: int | None = None,
+    structural_entity_offset: int | None = None,
     structural_id2label: Mapping[int, str] | None = None,
     structural_id2code: Mapping[int, str] | None = None,
     special_id2name: Mapping[int, str] | None = None,
@@ -146,6 +152,30 @@ def decode_timeline_tokens(
     while i < len(toks):
         tok = toks[i]
         category = TokenCategory(int(tok.category_id))
+
+        if (
+            category == TokenCategory.MEASUREMENT
+            and tok.cat_attrs
+            and int(tok.cat_attrs.get("obs_bundle_pos", 0)) == 1
+        ):
+            next_tok = toks[i + 1] if i + 1 < len(toks) else None
+            if next_tok is not None and next_tok.cat_attrs and int(next_tok.cat_attrs.get("obs_bundle_pos", 0)) == 2:
+                out.append(
+                    {
+                        "kind": "observation_bundle",
+                        "category": "MEASUREMENT",
+                        "obs_code_id": int(tok.value_id),
+                        "obs_value_id": int(next_tok.value_id),
+                        "obs_code_local_id": int(tok.cat_attrs.get("obs_code_local_id", 0)),
+                        "obs_value_local_id": int(next_tok.cat_attrs.get("obs_value_local_id", 0)),
+                        "t_from_start_hours": float(tok.t_from_start_hours),
+                        "dt_from_prev_hours": float(tok.dt_from_prev_hours),
+                        "window_hook": tok.window_hook,
+                        "token_span": [i, i + 1],
+                    }
+                )
+                i += 2
+                continue
 
         if (
             category == TokenCategory.MEASUREMENT
@@ -187,6 +217,18 @@ def decode_timeline_tokens(
 
         if category == TokenCategory.SPECIAL and special_id2name is not None:
             entry["label"] = special_id2name.get(int(tok.value_id), f"SPECIAL::{int(tok.value_id)}")
+        elif (
+            category == TokenCategory.MEASUREMENT
+            and observation_code_offset is not None
+            and observation_value_offset is not None
+        ):
+            vid = int(tok.value_id)
+            obs_code_off = int(observation_code_offset)
+            obs_val_off = int(observation_value_offset)
+            if vid >= obs_val_off:
+                entry["label"] = f"OBS_VAL::{vid - obs_val_off}"
+            elif vid >= obs_code_off:
+                entry["label"] = f"OBS_CODE::{vid - obs_code_off}"
         elif category == TokenCategory.DIAGNOSIS and diagnosis_offset is not None:
             entry["label"] = _decode_vocab_gid(
                 int(tok.value_id),
@@ -210,7 +252,19 @@ def decode_timeline_tokens(
                     id2code=medication_id2code,
                 )
         elif category == TokenCategory.STRUCTURAL and structural_offset is not None:
-            if tok.cat_attrs and "struct_label_id" in tok.cat_attrs and structural_id2label is not None:
+            if (
+                structural_action_offset is not None
+                and int(tok.value_id) >= int(structural_action_offset)
+                and structural_entity_offset is not None
+                and int(tok.value_id) < int(structural_entity_offset)
+            ):
+                entry["label"] = f"STRUCT_ACT::{int(tok.value_id) - int(structural_action_offset)}"
+            elif (
+                structural_entity_offset is not None
+                and int(tok.value_id) >= int(structural_entity_offset)
+            ):
+                entry["label"] = f"STRUCT_ENT::{int(tok.value_id) - int(structural_entity_offset)}"
+            elif tok.cat_attrs and "struct_label_id" in tok.cat_attrs and structural_id2label is not None:
                 entry["label"] = structural_id2label.get(int(tok.cat_attrs["struct_label_id"]))
             elif structural_id2code is not None:
                 entry["label"] = structural_id2code.get(int(tok.value_id) - int(structural_offset))
