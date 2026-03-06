@@ -1,4 +1,5 @@
 from __future__ import annotations
+import ast
 import re
 from typing import Dict, List, Any, Optional, Iterable, Callable
 
@@ -74,19 +75,82 @@ class MedTokenWithAttrsEncoder:
                 return base, label
         return s, None
 
-    def _candidate_codes(self, base_code: Optional[str], raw_code: Optional[str]) -> List[str]:
+    def _iter_parent_codes(self, ev: Any) -> List[str]:
+        """
+        Extract parent code candidates from event metadata when available.
+        Accepts:
+          - ev.parent_code: scalar/string
+          - ev.parent_codes: iterable or serialized iterable string
+        """
+        out: List[str] = []
+
+        def _append(v: Any) -> None:
+            if v is None:
+                return
+            s = str(v).strip()
+            if s:
+                out.append(s)
+
+        parent_code = getattr(ev, "parent_code", None)
+        _append(parent_code)
+
+        parent_codes = getattr(ev, "parent_codes", None)
+        if parent_codes is None:
+            return list(dict.fromkeys(out))
+
+        if isinstance(parent_codes, (list, tuple, set)):
+            for v in parent_codes:
+                _append(v)
+            return list(dict.fromkeys(out))
+
+        if isinstance(parent_codes, str):
+            s = parent_codes.strip()
+            if not s:
+                return list(dict.fromkeys(out))
+            parsed = None
+            if s.startswith("[") and s.endswith("]"):
+                try:
+                    parsed = ast.literal_eval(s)
+                except Exception:
+                    parsed = None
+            if isinstance(parsed, (list, tuple, set)):
+                for v in parsed:
+                    _append(v)
+            else:
+                _append(s)
+            return list(dict.fromkeys(out))
+
+        _append(parent_codes)
+        return list(dict.fromkeys(out))
+
+    def _candidate_codes(
+        self,
+        base_code: Optional[str],
+        raw_code: Optional[str],
+        *,
+        parent_codes: Optional[Iterable[str]] = None,
+    ) -> List[str]:
         if base_code is None and raw_code is None:
             return []
         candidates: List[str] = []
+
+        def _extend_for(src: Optional[str]) -> None:
+            if src is None:
+                return
+            if self.canonicalize_fn:
+                canonicalized = self.canonicalize_fn(src)
+                candidates.extend(ensure_list(canonicalized))
+            if self.fallback_to_raw:
+                candidates.append(str(src))
+
+        # Prefer parent ontology link if present, then regular code path.
+        for pc in list(parent_codes or []):
+            _extend_for(pc)
         canon_input = base_code if base_code is not None else raw_code
-        if self.canonicalize_fn:
-            canonicalized = self.canonicalize_fn(canon_input)
-            candidates.extend(ensure_list(canonicalized))
-        if self.fallback_to_raw:
-            if canon_input is not None:
-                candidates.append(str(canon_input))
-            if raw_code is not None and raw_code != canon_input:
-                candidates.append(str(raw_code))
+        _extend_for(canon_input)
+        if self.fallback_to_raw and raw_code is not None and raw_code != canon_input:
+            candidates.append(str(raw_code))
+
         # dedupe while preserving order
         seen = set()
         uniq = []
@@ -97,15 +161,22 @@ class MedTokenWithAttrsEncoder:
             seen.add(c)
         return uniq
 
-    def _encode_base(self, base_code: Optional[str], raw_code: Optional[str]) -> Optional[int]:
+    def _encode_base(
+        self,
+        base_code: Optional[str],
+        raw_code: Optional[str],
+        *,
+        parent_codes: Optional[Iterable[str]] = None,
+    ) -> Optional[int]:
         if base_code is None and raw_code is None:
             return None if self.drop_unknowns else self.unk_gid
 
-        cache_key = str(raw_code)
+        parent_key = "|".join(sorted(str(x) for x in (parent_codes or [])))
+        cache_key = f"{raw_code}||{parent_key}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for cand in self._candidate_codes(base_code, raw_code):
+        for cand in self._candidate_codes(base_code, raw_code, parent_codes=parent_codes):
             gid = self.base_vocab.maybe_encode(cand)
             if gid is not None:
                 self._cache[cache_key] = gid
@@ -135,7 +206,8 @@ class MedTokenWithAttrsEncoder:
     def encode_event(self, ev: Any, dt_hours: float) -> List[EventToken]:
         raw_code = getattr(ev, "code", None)
         base_code, marker = self._strip_marker(raw_code)
-        base_gid = self._encode_base(base_code, raw_code)
+        parent_codes = self._iter_parent_codes(ev)
+        base_gid = self._encode_base(base_code, raw_code, parent_codes=parent_codes)
         if base_gid is None:
             return []
         cat_attrs = self._encode_categorical_attrs(ev)
