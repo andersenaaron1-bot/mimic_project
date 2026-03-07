@@ -178,6 +178,25 @@ def _has_medtok_match(raw_code: object, vocab: CategoryVocab, canonicalize_fn) -
     return False
 
 
+def _is_expected_process_reroute(raw_code: object, category: TokenCategory) -> bool:
+    s = str(raw_code).upper() if raw_code is not None else ""
+    if category == TokenCategory.MEDICATION:
+        return (
+            s.startswith("INFUSION_START//")
+            or s.startswith("INFUSION_END//")
+            or s.startswith("MEDICATION//START//")
+            or s.startswith("MEDICATION//END//")
+            or s.startswith("MEDICATION//STOP//")
+        )
+    if category == TokenCategory.PROCEDURE:
+        return (
+            s.startswith("PROCEDURE//START//")
+            or s.startswith("PROCEDURE//END//")
+            or s.startswith("PROCEDURE//STOP//")
+        )
+    return False
+
+
 def _maybe_attr_vocab(path: Path, offset: int, name: str) -> Optional[CategoryVocab]:
     return load_attr_vocab(str(path), offset=offset, name=name) if path.exists() else None
 
@@ -543,7 +562,9 @@ def _audit_subject_tokenization(
     emitted_events_by_category = Counter()
     emitted_tokens_by_category = Counter()
     unknown_base_tokens_by_category = Counter()
+    process_reroute_events_by_category = Counter()
     bundle_sizes_by_category: Dict[str, Counter[int]] = defaultdict(Counter)
+    semantic_base_outcomes_by_category: Dict[str, Counter[str]] = defaultdict(Counter)
     family_counts = Counter()
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
     family_min_id: Dict[str, int] = {}
@@ -566,7 +587,10 @@ def _audit_subject_tokenization(
         code = getattr(ev_view, "code", None)
         code_str = str(code) if code is not None else None
         category = classify_code_to_category(code)
+        is_process_reroute = _is_expected_process_reroute(code_str, category)
         raw_events_by_category[category.name] += 1
+        if is_process_reroute:
+            process_reroute_events_by_category[category.name] += 1
         encoder = encoders.get(category)
 
         t = getattr(ev_view, "time", None)
@@ -582,6 +606,11 @@ def _audit_subject_tokenization(
             emitted_events_by_category[category.name] += 1
             emitted_tokens_by_category[category.name] += emitted_for_event
             bundle_sizes_by_category[category.name][emitted_for_event] += 1
+            if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
+                if is_process_reroute:
+                    semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                else:
+                    semantic_base_outcomes_by_category[category.name]["structural_only"] += 1
             last_emitted_time = t if emitted_for_event > 0 and t is not None else last_emitted_time
             continue
 
@@ -592,6 +621,11 @@ def _audit_subject_tokenization(
                 emitted_events_by_category[category.name] += 1
                 emitted_tokens_by_category[category.name] += emitted_for_event
                 bundle_sizes_by_category[category.name][emitted_for_event] += 1
+            if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
+                if is_process_reroute:
+                    semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                else:
+                    semantic_base_outcomes_by_category[category.name]["dropped_or_no_encoder"] += 1
             last_emitted_time = t if emitted_for_event > 0 and t is not None else last_emitted_time
             continue
 
@@ -605,6 +639,15 @@ def _audit_subject_tokenization(
             unk_gid = getattr(encoder, "unk_gid", None)
             if unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
                 unknown_base_tokens_by_category[category.name] += 1
+            if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
+                if is_process_reroute:
+                    semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                elif unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
+                    semantic_base_outcomes_by_category[category.name]["unknown_base"] += 1
+                elif int(base_tok.cat_attrs.get("residual_fallback", 0) or 0) == 1:
+                    semantic_base_outcomes_by_category[category.name]["residual_base"] += 1
+                else:
+                    semantic_base_outcomes_by_category[category.name]["medtok_base"] += 1
             if t is not None:
                 last_emitted_time = t
         else:
@@ -614,8 +657,18 @@ def _audit_subject_tokenization(
                 bundle_sizes_by_category[category.name][emitted_for_event] += 1
                 if t is not None:
                     last_emitted_time = t
+                if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
+                    if is_process_reroute:
+                        semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                    else:
+                        semantic_base_outcomes_by_category[category.name]["structural_only"] += 1
             else:
                 dropped_events_by_category[category.name] += 1
+                if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
+                    if is_process_reroute:
+                        semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                    else:
+                        semantic_base_outcomes_by_category[category.name]["dropped_or_no_encoder"] += 1
 
     for tok in timeline:
         family = _family_name_for_token(tok, artifacts=artifacts)
@@ -631,6 +684,8 @@ def _audit_subject_tokenization(
         "emitted_events_by_category": emitted_events_by_category,
         "emitted_tokens_by_category": emitted_tokens_by_category,
         "unknown_base_tokens_by_category": unknown_base_tokens_by_category,
+        "process_reroute_events_by_category": process_reroute_events_by_category,
+        "semantic_base_outcomes_by_category": semantic_base_outcomes_by_category,
         "bundle_sizes_by_category": bundle_sizes_by_category,
         "family_counts": family_counts,
         "family_unique_ids": family_unique_ids,
@@ -669,6 +724,8 @@ def _summarize_tokenization_and_collation(
     dropped_events_by_category = Counter()
     emitted_events_by_category = Counter()
     unknown_base_tokens_by_category = Counter()
+    process_reroute_events_by_category = Counter()
+    semantic_base_outcomes_by_category: Dict[str, Counter[str]] = defaultdict(Counter)
     bundle_sizes_by_category: Dict[str, Counter[int]] = defaultdict(Counter)
     family_counts = Counter()
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
@@ -706,6 +763,9 @@ def _summarize_tokenization_and_collation(
         emitted_events_by_category.update(audited["emitted_events_by_category"])
         emitted_tokens_by_category.update(audited["emitted_tokens_by_category"])
         unknown_base_tokens_by_category.update(audited["unknown_base_tokens_by_category"])
+        process_reroute_events_by_category.update(audited["process_reroute_events_by_category"])
+        for cat_name, outcome_counter in audited["semantic_base_outcomes_by_category"].items():
+            semantic_base_outcomes_by_category[cat_name].update(outcome_counter)
         family_counts.update(audited["family_counts"])
         for family, ids in audited["family_unique_ids"].items():
             family_unique_ids[family].update(ids)
@@ -820,6 +880,11 @@ def _summarize_tokenization_and_collation(
         "emitted_events_by_category": _as_plain_counter(emitted_events_by_category),
         "emitted_tokens_by_category": _as_plain_counter(emitted_tokens_by_category),
         "unknown_base_tokens_by_category": _as_plain_counter(unknown_base_tokens_by_category),
+        "process_reroute_events_by_category": _as_plain_counter(process_reroute_events_by_category),
+        "semantic_base_outcomes_by_category": {
+            k: _as_plain_counter(v) for k, v in semantic_base_outcomes_by_category.items()
+        },
+        "semantic_effective_capture_by_category": {},
         "bundle_sizes_by_category": {
             k: _as_plain_counter(v) for k, v in bundle_sizes_by_category.items()
         },
@@ -841,6 +906,38 @@ def _summarize_tokenization_and_collation(
             for family, ids in family_unique_ids.items()
         },
     }
+
+    semantic_capture: Dict[str, Dict[str, Any]] = {}
+    semantic_cats = ["DIAGNOSIS", "PROCEDURE", "MEDICATION"]
+    for cat_name in semantic_cats:
+        outcomes = semantic_base_outcomes_by_category.get(cat_name, Counter())
+        raw_total = int(raw_events_by_category.get(cat_name, 0))
+        process_reroute = int(process_reroute_events_by_category.get(cat_name, 0))
+        semantic_total = max(0, raw_total - process_reroute)
+        medtok_base = int(outcomes.get("medtok_base", 0))
+        residual_base = int(outcomes.get("residual_base", 0))
+        unknown_base = int(outcomes.get("unknown_base", 0))
+        dropped = int(outcomes.get("dropped_or_no_encoder", 0))
+        structural_only = int(outcomes.get("structural_only", 0))
+        mapped = medtok_base + residual_base
+        semantic_capture[cat_name] = {
+            "raw_total": raw_total,
+            "process_reroute": process_reroute,
+            "semantic_total": semantic_total,
+            "medtok_base": medtok_base,
+            "residual_base": residual_base,
+            "mapped_non_unk": mapped,
+            "unknown_base": unknown_base,
+            "dropped_or_no_encoder": dropped,
+            "structural_only": structural_only,
+            "mapped_rate_over_semantic_total": (
+                float(mapped) / float(semantic_total) if semantic_total > 0 else 0.0
+            ),
+            "medtok_only_rate_over_semantic_total": (
+                float(medtok_base) / float(semantic_total) if semantic_total > 0 else 0.0
+            ),
+        }
+    timeline_summary["semantic_effective_capture_by_category"] = semantic_capture
 
     collation_summary = {
         "windows": _as_plain_counter(window_counts),
@@ -887,6 +984,7 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Timeline emitted tokens by category:", timeline["emitted_tokens_by_category"])
     print("Timeline dropped events by category:", timeline["dropped_events_by_category"])
     print("Average tokens per emitted event:", timeline["avg_tokens_per_emitted_event_by_category"])
+    print("Semantic effective capture by category:", timeline.get("semantic_effective_capture_by_category", {}))
     print("Collation windows:", coll["windows"])
     print("Collation chunks:", coll.get("chunks", {}))
     print("Collation truncation:", coll["truncation"])
