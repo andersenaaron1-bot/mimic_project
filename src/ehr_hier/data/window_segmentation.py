@@ -32,6 +32,10 @@ class WindowSegmentationConfig:
     rebalance_min_tokens: int = 32
     rebalance_tail_tokens: int = 16
     unk_window_type_id: int = 0
+    # Optional fallback type for leading windows before the first typed transition.
+    default_first_window_type_id: int | None = None
+    # Carry forward the most recent known type for untyped windows.
+    propagate_prev_type_for_unknown_windows: bool = True
 
 
 @dataclass
@@ -144,6 +148,47 @@ def _resolve_opening_window_type(
     if previous_type_id != int(config.unk_window_type_id):
         return int(previous_type_id)
     return int(config.unk_window_type_id)
+
+
+def _apply_window_type_fallbacks(
+    windows: List[SegmentedWindow],
+    *,
+    config: WindowSegmentationConfig,
+) -> List[SegmentedWindow]:
+    if not windows:
+        return []
+
+    unk = int(config.unk_window_type_id)
+    first_default = (
+        int(config.default_first_window_type_id)
+        if config.default_first_window_type_id is not None
+        else None
+    )
+    carry_prev = bool(config.propagate_prev_type_for_unknown_windows)
+
+    out: List[SegmentedWindow] = []
+    prev_known: int | None = None
+    for idx, window in enumerate(windows):
+        w_type = int(window.window_type_id)
+        if w_type == unk:
+            if idx == 0 and first_default is not None:
+                w_type = int(first_default)
+            elif carry_prev and prev_known is not None:
+                w_type = int(prev_known)
+        if w_type != unk:
+            prev_known = int(w_type)
+
+        out.append(
+            SegmentedWindow(
+                tokens=list(window.tokens),
+                window_type_id=int(w_type),
+                start_time_hours=float(window.start_time_hours),
+                opening_action=window.opening_action,
+                closing_action=window.closing_action,
+                chunks=list(window.chunks),
+            )
+        )
+    return out
 
 
 def _has_explicit_transition(tokens: List[EventToken]) -> bool:
@@ -297,15 +342,18 @@ def segment_event_tokens(
 
     bundles = _build_boundary_bundles(events, config=config)
     if not bundles:
-        return [
-            SegmentedWindow(
-                tokens=list(events),
-                window_type_id=_infer_window_type_from_tokens(list(events), unk_type_id=config.unk_window_type_id),
-                start_time_hours=float(events[0].t_from_start_hours),
-                opening_action=None,
-                closing_action=None,
-            )
-        ]
+        return _apply_window_type_fallbacks(
+            [
+                SegmentedWindow(
+                    tokens=list(events),
+                    window_type_id=_infer_window_type_from_tokens(list(events), unk_type_id=config.unk_window_type_id),
+                    start_time_hours=float(events[0].t_from_start_hours),
+                    opening_action=None,
+                    closing_action=None,
+                )
+            ],
+            config=config,
+        )
 
     windows: List[SegmentedWindow] = []
     current_tokens: List[EventToken] = []
@@ -413,7 +461,7 @@ def segment_event_tokens(
             )
         )
 
-    return windows
+    return _apply_window_type_fallbacks(windows, config=config)
 
 
 def rebalance_segmented_windows(

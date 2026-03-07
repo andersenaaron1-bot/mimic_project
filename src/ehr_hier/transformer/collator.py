@@ -101,7 +101,7 @@ class AETHierarchicalCollator:
             special_tokens, events = self._split_special(timeline)
             semantic_windows = self._segment_windows(events)[: self.max_windows]
             chunked_windows = self._chunk_windows(semantic_windows, special_tokens=special_tokens)
-            window_type_ids = [int(window.window_type_id) for window in chunked_windows]
+            window_type_ids = [self._clamp_window_type_id(int(window.window_type_id)) for window in chunked_windows]
             window_start_abs_times = [float(window.start_time_hours) for window in chunked_windows]
 
             subj_ids: List[List[List[int]]] = []
@@ -169,7 +169,7 @@ class AETHierarchicalCollator:
                 subj_types.append(chunk_types)
                 subj_masks.append(chunk_masks)
                 subj_valmask.append(chunk_valmask)
-                subj_window_types.append(int(window.window_type_id))
+                subj_window_types.append(int(window_type_ids[wi]))
                 subj_window_start_times.append(float(window.start_time_hours))
                 subj_chunk_mask.append(chunk_mask)
                 subj_chunk_start_offsets.append(chunk_offsets)

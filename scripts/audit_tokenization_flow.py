@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import random
 import sys
 import time
 from collections import Counter, defaultdict
@@ -13,6 +14,7 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional
 
 import pandas as pd
 import torch
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -53,6 +55,7 @@ from src.ehr_hier.tokenizers.medtok_loader import (
 )
 from src.ehr_hier.tokenizers.medtok_attr_encoder import load_parent_lookup_from_codes_parquet
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
+from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
 
 
 SPECIAL_ID2NAME = {
@@ -110,11 +113,128 @@ def _load_manifest() -> Dict[str, Any]:
     return json.loads(fp.read_text(encoding="utf-8"))
 
 
-def _load_subject_ids(splits_parquet: str, split: str, max_subjects: int) -> List[int]:
+def _load_tokenization_contract(tokenization_yaml: Optional[str]) -> Dict[str, Any]:
+    if tokenization_yaml is None or not str(tokenization_yaml).strip():
+        return {}
+    fp = Path(str(tokenization_yaml))
+    if not fp.is_absolute():
+        fp = PROJECT_ROOT / fp
+    if not fp.exists():
+        return {}
+    payload = yaml.safe_load(fp.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def _build_window_marker_config(
+    *,
+    tokenization_contract: Mapping[str, Any],
+    structural_codebook: Optional[StructuralCodebook],
+) -> WindowMarkerConfig:
+    cfg = tokenization_contract.get("window_markers", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    codebook_num_types: Optional[int] = None
+    if structural_codebook is not None:
+        type_map = structural_codebook.window_type2id()
+        if type_map:
+            codebook_num_types = max(int(v) for v in type_map.values()) + 1
+
+    num_types = int(cfg.get("num_types", codebook_num_types if codebook_num_types is not None else 16))
+    num_types = max(1, num_types)
+    end_token_id = cfg.get("end_token_id", None)
+    continue_token_id = cfg.get("continue_token_id", None)
+
+    return WindowMarkerConfig(
+        enabled=bool(cfg.get("enabled", True)),
+        end_mode=str(cfg.get("end_mode", "end_token")),
+        type_token_offset=int(cfg.get("type_token_offset", 10)),
+        num_types=int(num_types),
+        end_token_id=int(end_token_id) if end_token_id is not None else None,
+        continue_token_id=int(continue_token_id) if continue_token_id is not None else None,
+        unk_type_id=int(cfg.get("unk_type_id", 0)),
+    )
+
+
+def _build_segmentation_config(
+    *,
+    tokenization_contract: Mapping[str, Any],
+    structural_codebook: Optional[StructuralCodebook],
+    unk_type_id: int,
+) -> WindowSegmentationConfig:
+    cfg = tokenization_contract.get("window_segmentation", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+
+    first_type_id = cfg.get("default_first_window_type_id", None)
+    if first_type_id is None:
+        first_type_name = cfg.get("default_first_window_type", None)
+        if first_type_name is not None and structural_codebook is not None:
+            first_type_id = structural_codebook.window_type2id().get(str(first_type_name))
+
+    return WindowSegmentationConfig(
+        bundle_gap_hours=float(cfg.get("bundle_gap_hours", 0.5)),
+        bundle_max_index_gap=int(cfg.get("bundle_max_index_gap", 2)),
+        merge_transition_chains=bool(cfg.get("merge_transition_chains", True)),
+        chain_gap_hours=float(cfg.get("chain_gap_hours", 6.0)),
+        chain_max_intervening_tokens=int(cfg.get("chain_max_intervening_tokens", 16)),
+        rebalance_dense_windows=bool(cfg.get("rebalance_dense_windows", True)),
+        rebalance_target_frac=float(cfg.get("rebalance_target_frac", 0.8)),
+        rebalance_min_tokens=int(cfg.get("rebalance_min_tokens", 32)),
+        rebalance_tail_tokens=int(cfg.get("rebalance_tail_tokens", 16)),
+        unk_window_type_id=int(unk_type_id),
+        default_first_window_type_id=(
+            int(first_type_id) if first_type_id is not None else None
+        ),
+        propagate_prev_type_for_unknown_windows=bool(
+            cfg.get("propagate_prev_type_for_unknown_windows", True)
+        ),
+    )
+
+
+def _resolve_residual_policy(
+    args: argparse.Namespace,
+    *,
+    tokenization_contract: Mapping[str, Any],
+) -> tuple[bool, int, Dict[str, int]]:
+    cfg = tokenization_contract.get("residual_fallback", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    offsets_cfg = cfg.get("offsets", {})
+    if not isinstance(offsets_cfg, dict):
+        offsets_cfg = {}
+
+    enabled_default = bool(cfg.get("enabled", True))
+    residual_enabled = False if bool(args.disable_residual_fallback) else enabled_default
+    residual_buckets = int(cfg.get("buckets", int(args.residual_fallback_buckets)))
+
+    offsets: Dict[str, int] = {}
+    for key, cli_val in (
+        ("diagnosis", args.diag_residual_offset),
+        ("procedure", args.proc_residual_offset),
+        ("medication", args.med_residual_offset),
+    ):
+        if cli_val is not None:
+            offsets[key] = int(cli_val)
+        elif key in offsets_cfg and offsets_cfg.get(key) is not None:
+            offsets[key] = int(offsets_cfg[key])
+    return residual_enabled, residual_buckets, offsets
+
+
+def _load_subject_ids(
+    splits_parquet: str,
+    split: str,
+    max_subjects: int,
+    *,
+    sample_seed: Optional[int] = None,
+) -> List[int]:
     split_df = pd.read_parquet(splits_parquet)[["subject_id", "split"]]
     aliases = {"val": "tuning", "test": "held_out"}
     target_split = aliases.get(split, split)
     ids = split_df.loc[split_df["split"] == target_split, "subject_id"].astype("int64").tolist()
+    if sample_seed is not None:
+        rng = random.Random(int(sample_seed))
+        rng.shuffle(ids)
     if max_subjects > 0:
         ids = ids[:max_subjects]
     return [int(x) for x in ids]
@@ -707,6 +827,8 @@ def _summarize_tokenization_and_collation(
     collate_batch_size: int,
     example_subjects: int,
     example_tokens: int,
+    window_markers: WindowMarkerConfig | None = None,
+    segmentation_config: WindowSegmentationConfig | None = None,
     progress_every: int = 0,
 ) -> Dict[str, Any]:
     struct_id2label = _make_structural_id2label(artifacts.structural_codebook)
@@ -715,7 +837,8 @@ def _summarize_tokenization_and_collation(
         max_chunks_per_window=max_chunks_per_window,
         max_len_per_window=max_len_per_window,
         pad_id=0,
-        window_markers=WindowMarkerConfig(),
+        window_markers=window_markers or WindowMarkerConfig(),
+        segmentation=segmentation_config,
     )
 
     total_tokens = 0
@@ -741,6 +864,18 @@ def _summarize_tokenization_and_collation(
     chunk_mask_ones = 0
     window_type_zero = 0
     window_type_total = 0
+    window_type_raw_counts = Counter()
+    window_type_clamped_counts = Counter()
+    unknown_window_opening_actions = Counter()
+    unknown_window_closing_actions = Counter()
+    unknown_window_first_categories = Counter()
+    unknown_window_first_families = Counter()
+    unknown_window_first_transition_action = Counter()
+    unknown_window_first_transition_type = Counter()
+    unknown_window_first_window_type_attr = Counter()
+    unknown_window_first_struct_label = Counter()
+    unknown_window_samples: List[Dict[str, Any]] = []
+    unknown_window_total = 0
     example_rows: List[Dict[str, Any]] = []
     batch_timelines: List[List[EventToken]] = []
 
@@ -789,8 +924,14 @@ def _summarize_tokenization_and_collation(
         chunk_counts["chunks_total_post_cap"] += sum(len(window.chunks) for window in chunked_windows)
         chunk_counts["semantic_windows_split_into_chunks"] += sum(1 for window in chunked_windows if len(window.chunks) > 1)
 
-        win_types = [int(window.window_type_id) for window in chunked_windows]
+        raw_win_types = [int(window.window_type_id) for window in chunked_windows]
+        win_types = [collator._clamp_window_type_id(w) for w in raw_win_types]
         win_starts = [float(window.start_time_hours) for window in chunked_windows]
+        for raw_w, clamped_w in zip(raw_win_types, win_types):
+            window_type_raw_counts[int(raw_w)] += 1
+            window_type_clamped_counts[int(clamped_w)] += 1
+            if int(raw_w) != int(clamped_w):
+                truncation_counts["windows_window_type_out_of_range"] += 1
         for wi, window in enumerate(chunked_windows):
             prefix_len = len(specials) + (1 if collator.window_markers.enabled else 0)
             suffix_len = 1 if collator.window_markers.enabled else 0
@@ -799,6 +940,112 @@ def _summarize_tokenization_and_collation(
                 truncation_counts["semantic_windows_truncated_by_max_chunks"] += 1
             if budget == 0 and len(window.tokens) > 0:
                 truncation_counts["marker_only_windows"] += 1
+
+            if int(win_types[wi]) == int(collator.window_markers.unk_type_id):
+                unknown_window_total += 1
+                unknown_window_opening_actions[str(window.opening_action)] += 1
+                unknown_window_closing_actions[str(window.closing_action)] += 1
+                if window.tokens:
+                    first_tok = window.tokens[0]
+                    try:
+                        first_cat_name = TokenCategory(int(first_tok.category_id)).name
+                    except Exception:
+                        first_cat_name = f"CATEGORY::{int(first_tok.category_id)}"
+                    unknown_window_first_categories[first_cat_name] += 1
+                    unknown_window_first_families[
+                        _family_name_for_token(first_tok, artifacts=artifacts)
+                    ] += 1
+                    if first_tok.cat_attrs is not None:
+                        unknown_window_first_transition_action[
+                            str(first_tok.cat_attrs.get("transition_action_id", "<none>"))
+                        ] += 1
+                        unknown_window_first_transition_type[
+                            str(first_tok.cat_attrs.get("transition_window_type_id", "<none>"))
+                        ] += 1
+                        unknown_window_first_window_type_attr[
+                            str(first_tok.cat_attrs.get("window_type_id", "<none>"))
+                        ] += 1
+                        unknown_window_first_struct_label[
+                            str(first_tok.cat_attrs.get("struct_label_id", "<none>"))
+                        ] += 1
+                    if len(unknown_window_samples) < 32:
+                        first_label = None
+                        try:
+                            dec = decode_timeline_tokens(
+                                [first_tok],
+                                code_token_offset=_offset(artifacts.manifest, "measurement_code", 2_000_000),
+                                rvq_token_offset=_offset(artifacts.manifest, "measurement_value", 2_100_000),
+                                rvq_codebook_stride=artifacts.measurement_stride or 256,
+                                measurement_num_codebooks=artifacts.measurement_num_codebooks,
+                                measurement_code2name=invert_code2id(artifacts.code2id or {}),
+                                diagnosis_offset=artifacts.diag_vocab.offset,
+                                diagnosis_id2code=invert_code2id(artifacts.diag_vocab.code2id),
+                                procedure_offset=artifacts.proc_vocab.offset,
+                                procedure_id2code=invert_code2id(artifacts.proc_vocab.code2id),
+                                medication_offset=artifacts.med_vocab.offset,
+                                medication_id2code=invert_code2id(artifacts.med_vocab.code2id),
+                                observation_code_offset=_offset(artifacts.manifest, "observation_code", 2_300_000),
+                                observation_value_offset=_offset(artifacts.manifest, "observation_value", 2_320_000),
+                                structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
+                                structural_action_offset=_offset(artifacts.manifest, "structural_action", 2_400_000),
+                                structural_entity_offset=_offset(artifacts.manifest, "structural_entity", 2_420_000),
+                                structural_id2label=struct_id2label,
+                                structural_id2code=struct_id2code,
+                                special_id2name=SPECIAL_ID2NAME,
+                            )
+                            if dec:
+                                first_label = (
+                                    dec[0].get("label")
+                                    or dec[0].get("raw_code")
+                                    or dec[0].get("kind")
+                                )
+                        except Exception:
+                            first_label = None
+
+                        unknown_window_samples.append(
+                            {
+                                "subject_id": int(sid),
+                                "window_index": int(wi),
+                                "raw_window_type_id": int(raw_win_types[wi]),
+                                "clamped_window_type_id": int(win_types[wi]),
+                                "opening_action": window.opening_action,
+                                "closing_action": window.closing_action,
+                                "start_time_hours": float(window.start_time_hours),
+                                "token_count": int(len(window.tokens)),
+                                "chunk_count": int(len(window.chunks)),
+                                "first_token_value_id": int(first_tok.value_id),
+                                "first_token_category": first_cat_name,
+                                "first_token_family": _family_name_for_token(
+                                    first_tok,
+                                    artifacts=artifacts,
+                                ),
+                                "first_token_label": first_label,
+                                "first_transition_action_id": (
+                                    int(first_tok.cat_attrs["transition_action_id"])
+                                    if first_tok.cat_attrs is not None
+                                    and "transition_action_id" in first_tok.cat_attrs
+                                    else None
+                                ),
+                                "first_transition_window_type_id": (
+                                    int(first_tok.cat_attrs["transition_window_type_id"])
+                                    if first_tok.cat_attrs is not None
+                                    and "transition_window_type_id" in first_tok.cat_attrs
+                                    else None
+                                ),
+                                "first_window_type_id_attr": (
+                                    int(first_tok.cat_attrs["window_type_id"])
+                                    if first_tok.cat_attrs is not None
+                                    and "window_type_id" in first_tok.cat_attrs
+                                    else None
+                                ),
+                                "first_struct_label_id": (
+                                    int(first_tok.cat_attrs["struct_label_id"])
+                                    if first_tok.cat_attrs is not None
+                                    and "struct_label_id" in first_tok.cat_attrs
+                                    else None
+                                ),
+                            }
+                        )
 
             next_type = win_types[wi + 1] if wi + 1 < len(win_types) else None
             next_start = win_starts[wi + 1] if wi + 1 < len(win_starts) else None
@@ -958,6 +1205,20 @@ def _summarize_tokenization_and_collation(
             if window_type_total > 0
             else 0.0
         ),
+        "window_type_raw_counts": _as_plain_counter(window_type_raw_counts),
+        "window_type_clamped_counts": _as_plain_counter(window_type_clamped_counts),
+        "unknown_window_diagnostics": {
+            "total_unknown_windows": int(unknown_window_total),
+            "by_opening_action": _as_plain_counter(unknown_window_opening_actions),
+            "by_closing_action": _as_plain_counter(unknown_window_closing_actions),
+            "by_first_token_category": _as_plain_counter(unknown_window_first_categories),
+            "by_first_token_family": _as_plain_counter(unknown_window_first_families),
+            "first_token_transition_action_id": _as_plain_counter(unknown_window_first_transition_action),
+            "first_token_transition_window_type_id": _as_plain_counter(unknown_window_first_transition_type),
+            "first_token_window_type_attr": _as_plain_counter(unknown_window_first_window_type_attr),
+            "first_token_struct_label_id": _as_plain_counter(unknown_window_first_struct_label),
+            "samples": unknown_window_samples,
+        },
         "attended_tokens": int(attention_mask_ones),
         "active_windows": int(window_mask_ones),
         "active_chunks": int(chunk_mask_ones),
@@ -990,6 +1251,10 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Collation truncation:", coll["truncation"])
     print("Collation numeric_mask_density_vs_attended:", f"{coll['numeric_mask_density_vs_attended']:.4f}")
     print("Collation window_type_unk_frac:", f"{coll['window_type_unk_frac']:.4f}")
+    unknown_diag = coll.get("unknown_window_diagnostics", {})
+    if unknown_diag:
+        print("Unknown windows by opening action:", unknown_diag.get("by_opening_action", {}))
+        print("Unknown windows by closing action:", unknown_diag.get("by_closing_action", {}))
 
 
 def main() -> None:
@@ -1000,11 +1265,17 @@ def main() -> None:
     ap.add_argument("--splits_parquet", required=True)
     ap.add_argument("--split", default="train")
     ap.add_argument("--max_subjects", type=int, default=100)
+    ap.add_argument("--sample_seed", type=int, default=None, help="Optional seed to randomly sample subject ids from split before truncation.")
     ap.add_argument("--subject_ids", default=None, help="Comma-separated subject ids to inspect.")
     ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument(
+        "--tokenization_yaml",
+        default="configs/data/tokenization_v1.yaml",
+        help="Optional token/window contract. Missing file falls back to built-in defaults.",
+    )
     ap.add_argument(
         "--codes_parquet_parent_lookup",
         default=None,
@@ -1032,16 +1303,36 @@ def main() -> None:
     args = ap.parse_args()
 
     artifacts = _build_static_artifacts(args)
+    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
+    window_markers_cfg = _build_window_marker_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+    )
+    segmentation_cfg = _build_segmentation_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+        unk_type_id=int(window_markers_cfg.unk_type_id),
+    )
+    residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
+        args,
+        tokenization_contract=tokenization_contract,
+    )
     db = mr.SubjectDatabase(args.meds_reader_db)
     subject_ids = _parse_subject_ids(args.subject_ids)
     if not subject_ids:
-        subject_ids = _load_subject_ids(args.splits_parquet, args.split, args.max_subjects)
+        subject_ids = _load_subject_ids(
+            args.splits_parquet,
+            args.split,
+            args.max_subjects,
+            sample_seed=args.sample_seed,
+        )
     if not subject_ids:
         raise ValueError(f"No subject IDs found for split={args.split}")
 
     if args.skip_raw_summary:
         raw_summary = {
             "subjects_scanned": len(subject_ids),
+            "sample_seed": args.sample_seed,
             "total_events": 0,
             "events_by_category": {},
             "numeric_events_by_category": {},
@@ -1088,17 +1379,9 @@ def main() -> None:
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
-        enable_residual_fallback=not bool(args.disable_residual_fallback),
-        residual_fallback_buckets=int(args.residual_fallback_buckets),
-        residual_fallback_offsets={
-            k: int(v)
-            for k, v in {
-                "diagnosis": args.diag_residual_offset,
-                "procedure": args.proc_residual_offset,
-                "medication": args.med_residual_offset,
-            }.items()
-            if v is not None
-        },
+        enable_residual_fallback=bool(residual_enabled),
+        residual_fallback_buckets=int(residual_buckets),
+        residual_fallback_offsets=dict(residual_offsets),
     )
 
     downstream = _summarize_tokenization_and_collation(
@@ -1113,6 +1396,8 @@ def main() -> None:
         collate_batch_size=args.collate_batch_size,
         example_subjects=args.example_subjects,
         example_tokens=args.example_tokens,
+        window_markers=window_markers_cfg,
+        segmentation_config=segmentation_cfg,
         progress_every=args.progress_every,
     )
 
@@ -1128,11 +1413,49 @@ def main() -> None:
             "measurement_codebook_size": artifacts.measurement_codebook_size,
             "measurement_stride": artifacts.measurement_stride,
             "medtok_parent_lookup_entries": len(artifacts.medtok_parent_lookup),
-            "residual_fallback_enabled": not bool(args.disable_residual_fallback),
-            "residual_fallback_buckets": int(args.residual_fallback_buckets),
-            "diag_residual_offset": args.diag_residual_offset,
-            "proc_residual_offset": args.proc_residual_offset,
-            "med_residual_offset": args.med_residual_offset,
+            "tokenization_yaml": args.tokenization_yaml,
+            "residual_fallback_enabled": bool(residual_enabled),
+            "residual_fallback_buckets": int(residual_buckets),
+            "diag_residual_offset": residual_offsets.get("diagnosis"),
+            "proc_residual_offset": residual_offsets.get("procedure"),
+            "med_residual_offset": residual_offsets.get("medication"),
+            "window_markers": {
+                "enabled": bool(window_markers_cfg.enabled),
+                "end_mode": str(window_markers_cfg.end_mode),
+                "type_token_offset": int(window_markers_cfg.type_token_offset),
+                "num_types": int(window_markers_cfg.num_types),
+                "end_token_id": (
+                    int(window_markers_cfg.end_token_id)
+                    if window_markers_cfg.end_token_id is not None
+                    else None
+                ),
+                "continue_token_id": (
+                    int(window_markers_cfg.continue_token_id)
+                    if window_markers_cfg.continue_token_id is not None
+                    else None
+                ),
+                "unk_type_id": int(window_markers_cfg.unk_type_id),
+            },
+            "window_segmentation": {
+                "bundle_gap_hours": float(segmentation_cfg.bundle_gap_hours),
+                "bundle_max_index_gap": int(segmentation_cfg.bundle_max_index_gap),
+                "merge_transition_chains": bool(segmentation_cfg.merge_transition_chains),
+                "chain_gap_hours": float(segmentation_cfg.chain_gap_hours),
+                "chain_max_intervening_tokens": int(segmentation_cfg.chain_max_intervening_tokens),
+                "rebalance_dense_windows": bool(segmentation_cfg.rebalance_dense_windows),
+                "rebalance_target_frac": float(segmentation_cfg.rebalance_target_frac),
+                "rebalance_min_tokens": int(segmentation_cfg.rebalance_min_tokens),
+                "rebalance_tail_tokens": int(segmentation_cfg.rebalance_tail_tokens),
+                "unk_window_type_id": int(segmentation_cfg.unk_window_type_id),
+                "default_first_window_type_id": (
+                    int(segmentation_cfg.default_first_window_type_id)
+                    if segmentation_cfg.default_first_window_type_id is not None
+                    else None
+                ),
+                "propagate_prev_type_for_unknown_windows": bool(
+                    segmentation_cfg.propagate_prev_type_for_unknown_windows
+                ),
+            },
         },
         "raw": raw_summary,
         "timeline": downstream["timeline"],

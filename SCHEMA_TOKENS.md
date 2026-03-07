@@ -156,6 +156,11 @@ Measurements typically do *not* rely on this side-channel (values are discretize
 This is enough for tokenizers and debug tooling. For training, the transformer additionally
 needs **sizes** and **routing rules** (which ids are predicted by which head).
 
+For v1 experiments, use `configs/data/tokenization_v1.yaml` as the frozen contract for:
+- residual fallback ranges (`diagnosis_residual`, `procedure_residual`, `medication_residual`)
+- window marker token ids (`WIN_<TYPE>`, `WIN_END`, `WIN_CONTINUE`)
+- default window segmentation fallback policy.
+
 ### 4.2 AET head lanes (recommended)
 AET uses multiple output heads to avoid a monolithic softmax:
 - `logits_struct`: special + window markers + (often) structural signifiers

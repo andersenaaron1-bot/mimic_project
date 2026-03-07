@@ -240,3 +240,40 @@ def test_collator_chunks_dense_semantic_window_without_creating_new_global_windo
     # Final chunk closes the semantic window.
     w1 = batch["input_ids"][0, 0, 1, :6].tolist()
     assert w1 == [1, 12, 104, 105, 106, 14]
+
+
+def test_collator_clamps_out_of_range_window_type_to_unk() -> None:
+    from ehr_hier.data.token_types import EventToken, TokenCategory
+    from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
+
+    summary = EventToken(
+        value_id=1,
+        category_id=int(TokenCategory.SPECIAL),
+        t_from_start_hours=0.0,
+        dt_from_prev_hours=0.0,
+        cat_attrs={},
+        num_attrs={},
+    )
+    # No transition metadata: segmentation falls back to first-token window_type_id=99.
+    token = EventToken(
+        value_id=101,
+        category_id=int(TokenCategory.MEASUREMENT),
+        t_from_start_hours=1.0,
+        dt_from_prev_hours=1.0,
+        cat_attrs={"window_type_id": 99},
+        num_attrs={"numeric_value": 1.0},
+    )
+
+    collator = AETHierarchicalCollator(
+        max_windows=4,
+        max_chunks_per_window=2,
+        max_len_per_window=6,
+        pad_id=0,
+        window_markers=WindowMarkerConfig(enabled=True, type_token_offset=10, num_types=4, unk_type_id=0),
+    )
+
+    batch = collator([[summary, token]])
+    # clamped to UNK=0
+    assert batch["window_type_ids"][0, 0].item() == 0
+    # WIN_TYPE marker should be offset + 0
+    assert batch["input_ids"][0, 0, 0, 1].item() == 10

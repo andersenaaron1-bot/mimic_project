@@ -15,19 +15,23 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.audit_tokenization_flow import (  # noqa: E402
     SPECIAL_ID2NAME,
+    _build_segmentation_config,
+    _build_window_marker_config,
     _build_measurement_config,
+    _load_tokenization_contract,
     _build_static_artifacts,
     _build_struct_vocab,
     _load_subject_ids,
     _make_structural_id2label,
     _offset,
+    _resolve_residual_policy,
 )
 from src.ehr_hier.data.event_router import classify_code_to_category  # noqa: E402
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline  # noqa: E402
 from src.ehr_hier.data.token_types import EventToken, TokenCategory  # noqa: E402
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders  # noqa: E402
 from src.ehr_hier.tokenizers.decode_tokens import decode_timeline_tokens, invert_code2id  # noqa: E402
-from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig  # noqa: E402
+from src.ehr_hier.transformer.collator import AETHierarchicalCollator  # noqa: E402
 
 
 def _parse_subject_ids(arg: str | None) -> List[int]:
@@ -283,6 +287,11 @@ def main() -> None:
     ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
     ap.add_argument(
+        "--tokenization_yaml",
+        default="configs/data/tokenization_v1.yaml",
+        help="Optional token/window contract. Missing file falls back to built-in defaults.",
+    )
+    ap.add_argument(
         "--codes_parquet_parent_lookup",
         default=None,
         help="Optional metadata/codes.parquet for code->parent_codes lookup used by MedTok encoders.",
@@ -306,6 +315,20 @@ def main() -> None:
     args = ap.parse_args()
 
     artifacts = _build_static_artifacts(args)
+    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
+    window_markers_cfg = _build_window_marker_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+    )
+    segmentation_cfg = _build_segmentation_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+        unk_type_id=int(window_markers_cfg.unk_type_id),
+    )
+    residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
+        args,
+        tokenization_contract=tokenization_contract,
+    )
     db = mr.SubjectDatabase(args.meds_reader_db)
 
     subject_id = args.subject_id
@@ -335,17 +358,9 @@ def main() -> None:
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
-        enable_residual_fallback=not bool(args.disable_residual_fallback),
-        residual_fallback_buckets=int(args.residual_fallback_buckets),
-        residual_fallback_offsets={
-            k: int(v)
-            for k, v in {
-                "diagnosis": args.diag_residual_offset,
-                "procedure": args.proc_residual_offset,
-                "medication": args.med_residual_offset,
-            }.items()
-            if v is not None
-        },
+        enable_residual_fallback=bool(residual_enabled),
+        residual_fallback_buckets=int(residual_buckets),
+        residual_fallback_offsets=dict(residual_offsets),
     )
     timeline = build_subject_timeline(
         db=db,
@@ -359,7 +374,8 @@ def main() -> None:
         max_chunks_per_window=int(args.max_chunks_per_window),
         max_len_per_window=int(args.max_len_per_window),
         pad_id=0,
-        window_markers=WindowMarkerConfig(),
+        window_markers=window_markers_cfg,
+        segmentation=segmentation_cfg,
     )
     special_tokens, events = collator._split_special(timeline)
     semantic_windows = collator._segment_windows(events)[: int(args.max_windows)]

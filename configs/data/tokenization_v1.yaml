@@ -1,0 +1,80 @@
+version: tokenization_v1
+
+# Frozen token family layout for v1 experiments.
+frozen_ranges:
+  special:
+    offset: 0
+    reserved_max_id: 99
+  diagnosis:
+    offset: 1000000
+  diagnosis_residual:
+    offset: 1160000
+    buckets: 40000
+  procedure:
+    offset: 1200000
+  procedure_residual:
+    offset: 1360000
+    buckets: 40000
+  medication:
+    offset: 1400000
+  medication_residual:
+    offset: 1800000
+    buckets: 40000
+  med_route:
+    offset: 1600000
+  med_form:
+    offset: 1620000
+  med_freq:
+    offset: 1640000
+  med_unit:
+    offset: 1660000
+  med_dosage:
+    offset: 1680000
+  med_rate:
+    offset: 1700000
+  med_duration:
+    offset: 1720000
+  measurement_code:
+    offset: 2000000
+  measurement_value:
+    offset: 2100000
+  structural:
+    offset: 2200000
+  observation_code:
+    offset: 2300000
+  observation_value:
+    offset: 2320000
+  structural_action:
+    offset: 2400000
+  structural_entity:
+    offset: 2420000
+
+residual_fallback:
+  enabled: true
+  buckets: 40000
+  offsets:
+    diagnosis: 1160000
+    procedure: 1360000
+    medication: 1800000
+
+window_markers:
+  enabled: true
+  end_mode: end_token
+  type_token_offset: 10
+  num_types: 7
+  unk_type_id: 0
+  end_token_id: 17
+  continue_token_id: 18
+
+window_segmentation:
+  bundle_gap_hours: 0.5
+  bundle_max_index_gap: 2
+  merge_transition_chains: true
+  chain_gap_hours: 6.0
+  chain_max_intervening_tokens: 16
+  rebalance_dense_windows: true
+  rebalance_target_frac: 0.8
+  rebalance_min_tokens: 32
+  rebalance_tail_tokens: 16
+  default_first_window_type: PROLOGUE
+  propagate_prev_type_for_unknown_windows: true
