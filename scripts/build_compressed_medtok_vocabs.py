@@ -288,6 +288,13 @@ def main() -> None:
     df = pd.read_csv(decision_fp)
     if "routed_category" not in df.columns or "code" not in df.columns:
         raise ValueError("decision_csv must include at least columns: code, routed_category")
+    if "captured_events" in df.columns:
+        captured_total = pd.to_numeric(df["captured_events"], errors="coerce").fillna(0.0).sum()
+        if float(captured_total) <= 0.0:
+            raise ValueError(
+                "decision_csv appears uncaptured-only (captured_events sums to 0). "
+                "Use a full decision table (captured+uncaptured), e.g. build_uncaptured_decision_table.py with --top_k 0."
+            )
 
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -381,6 +388,17 @@ def main() -> None:
         },
     }
 
+    mappable_total = (
+        int(diag_report.get("mappable_events", 0))
+        + int(proc_report.get("mappable_events", 0))
+        + int(med_report.get("mappable_events", 0))
+    )
+    if mappable_total <= 0:
+        raise ValueError(
+            "No mappable MedTok events found in decision_csv. "
+            "Likely input contains only uncaptured rows. Rebuild decision table with captured rows included."
+        )
+
     print(json.dumps(report, indent=2))
     out_report = Path(args.output_report_json) if args.output_report_json else (out_dir / "compression_report.json")
     out_report.parent.mkdir(parents=True, exist_ok=True)
@@ -393,4 +411,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
