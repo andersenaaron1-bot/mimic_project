@@ -9,17 +9,17 @@ frozen_ranges:
     offset: 1000000
   diagnosis_residual:
     offset: 1160000
-    buckets: 40000
+    buckets: 39999
   procedure:
     offset: 1200000
   procedure_residual:
     offset: 1360000
-    buckets: 40000
+    buckets: 39999
   medication:
     offset: 1400000
   medication_residual:
     offset: 1800000
-    buckets: 40000
+    buckets: 39999
   med_route:
     offset: 1600000
   med_form:
@@ -51,7 +51,7 @@ frozen_ranges:
 
 residual_fallback:
   enabled: true
-  buckets: 40000
+  buckets: 39999
   offsets:
     diagnosis: 1160000
     procedure: 1360000

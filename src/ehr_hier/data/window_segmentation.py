@@ -46,6 +46,9 @@ class SegmentedWindow:
     opening_action: Optional[str] = None
     closing_action: Optional[str] = None
     chunks: List["SegmentedChunk"] = field(default_factory=list)
+    truncated_chunks: int = 0
+    truncated_tokens: int = 0
+    truncated_structural_tokens: int = 0
 
 
 @dataclass
@@ -571,6 +574,9 @@ def chunk_segmented_windows(
                     opening_action=window.opening_action,
                     closing_action=window.closing_action,
                     chunks=[],
+                    truncated_chunks=0,
+                    truncated_tokens=0,
+                    truncated_structural_tokens=0,
                 )
             )
             continue
@@ -611,7 +617,19 @@ def chunk_segmented_windows(
                 raw_chunks[-2].extend(raw_chunks[-1])
                 raw_chunks.pop()
 
-        raw_chunks = raw_chunks[: int(max_chunks_per_window)]
+        raw_chunk_count_before_cap = len(raw_chunks)
+        raw_chunks_kept = raw_chunks[: int(max_chunks_per_window)]
+        dropped_chunk_groups = raw_chunks[int(max_chunks_per_window) :]
+        dropped_chunks = max(0, int(raw_chunk_count_before_cap) - len(raw_chunks_kept))
+        dropped_tokens = int(sum(len(chunk) for chunk in dropped_chunk_groups))
+        dropped_structural_tokens = int(
+            sum(
+                1
+                for chunk in dropped_chunk_groups
+                for tok in chunk
+                if int(tok.category_id) == int(TokenCategory.STRUCTURAL)
+            )
+        )
 
         chunks = [
             SegmentedChunk(
@@ -619,9 +637,9 @@ def chunk_segmented_windows(
                 start_time_hours=float(chunk[0].t_from_start_hours),
                 chunk_index=idx,
                 is_first_chunk=(idx == 0),
-                is_last_chunk=(idx == len(raw_chunks) - 1),
+                is_last_chunk=(idx == len(raw_chunks_kept) - 1),
             )
-            for idx, chunk in enumerate(raw_chunks)
+            for idx, chunk in enumerate(raw_chunks_kept)
             if chunk
         ]
 
@@ -633,6 +651,9 @@ def chunk_segmented_windows(
                 opening_action=window.opening_action,
                 closing_action=window.closing_action,
                 chunks=chunks,
+                truncated_chunks=int(dropped_chunks),
+                truncated_tokens=int(dropped_tokens),
+                truncated_structural_tokens=int(dropped_structural_tokens),
             )
         )
 

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Literal
+from typing import Any, Dict, List, Literal
 
 import torch
 
@@ -69,6 +69,8 @@ class AETHierarchicalCollator:
         pad_id: int = 0,
         window_markers: WindowMarkerConfig | None = None,
         segmentation: WindowSegmentationConfig | None = None,
+        id_remapper: Any | None = None,
+        emit_global_input_ids: bool = False,
     ) -> None:
         self.max_windows = max_windows
         self.max_chunks_per_window = max_chunks_per_window
@@ -78,8 +80,10 @@ class AETHierarchicalCollator:
         self.segmentation = segmentation or WindowSegmentationConfig(
             unk_window_type_id=int((window_markers or WindowMarkerConfig()).unk_type_id)
         )
+        self.id_remapper = id_remapper
+        self.emit_global_input_ids = bool(emit_global_input_ids)
 
-    def __call__(self, batch_timelines: List[List[EventToken]]) -> Dict[str, torch.Tensor]:
+    def __call__(self, batch_timelines: List[List[EventToken]]) -> Dict[str, Any]:
         batch_ids: List[List[List[List[int]]]] = []
         batch_times: List[List[List[List[float]]]] = []
         batch_vals: List[List[List[List[float]]]] = []
@@ -96,13 +100,61 @@ class AETHierarchicalCollator:
         batch_window_duration_hours: List[List[float]] = []
         batch_chunk_token_counts: List[List[List[float]]] = []
         batch_chunk_duration_hours: List[List[List[float]]] = []
+        semantic_windows_total = 0
+        semantic_windows_kept = 0
+        semantic_windows_dropped = 0
+        semantic_tokens_dropped = 0
+        semantic_structural_tokens_dropped = 0
+        chunks_dropped_by_cap = 0
+        chunk_tokens_dropped_by_cap = 0
+        chunk_structural_tokens_dropped_by_cap = 0
+        subjects_with_overflow = 0
 
         for timeline in batch_timelines:
             special_tokens, events = self._split_special(timeline)
-            semantic_windows = self._segment_windows(events)[: self.max_windows]
+            semantic_windows_all = self._segment_windows(events)
+            semantic_windows_total += int(len(semantic_windows_all))
+            dropped_windows = max(0, int(len(semantic_windows_all) - int(self.max_windows)))
+            subject_dropped_tokens = 0
+            subject_dropped_structural_tokens = 0
+            if dropped_windows > 0:
+                semantic_windows_dropped += int(dropped_windows)
+                for win in semantic_windows_all[int(self.max_windows) :]:
+                    n_tok = int(len(win.tokens))
+                    subject_dropped_tokens += n_tok
+                    subject_dropped_structural_tokens += int(
+                        sum(
+                            1
+                            for tok in win.tokens
+                            if int(tok.category_id) == int(TokenCategory.STRUCTURAL)
+                        )
+                    )
+            semantic_windows = semantic_windows_all[: self.max_windows]
+            semantic_windows_kept += int(len(semantic_windows))
+            semantic_tokens_dropped += int(subject_dropped_tokens)
+            semantic_structural_tokens_dropped += int(subject_dropped_structural_tokens)
             chunked_windows = self._chunk_windows(semantic_windows, special_tokens=special_tokens)
             window_type_ids = [self._clamp_window_type_id(int(window.window_type_id)) for window in chunked_windows]
             window_start_abs_times = [float(window.start_time_hours) for window in chunked_windows]
+            subject_dropped_chunks = 0
+            subject_dropped_chunk_tokens = 0
+            subject_dropped_chunk_structural_tokens = 0
+            for window in chunked_windows:
+                subject_dropped_chunks += int(getattr(window, "truncated_chunks", 0) or 0)
+                subject_dropped_chunk_tokens += int(getattr(window, "truncated_tokens", 0) or 0)
+                subject_dropped_chunk_structural_tokens += int(
+                    getattr(window, "truncated_structural_tokens", 0) or 0
+                )
+            chunks_dropped_by_cap += int(subject_dropped_chunks)
+            chunk_tokens_dropped_by_cap += int(subject_dropped_chunk_tokens)
+            chunk_structural_tokens_dropped_by_cap += int(subject_dropped_chunk_structural_tokens)
+            if (
+                dropped_windows > 0
+                or subject_dropped_chunks > 0
+                or subject_dropped_tokens > 0
+                or subject_dropped_chunk_tokens > 0
+            ):
+                subjects_with_overflow += 1
 
             subj_ids: List[List[List[int]]] = []
             subj_times: List[List[List[float]]] = []
@@ -200,7 +252,7 @@ class AETHierarchicalCollator:
             batch_chunk_token_counts.append(subj_chunk_token_counts)
             batch_chunk_duration_hours.append(subj_chunk_duration_hours)
 
-        return self._pad_batch(
+        out = self._pad_batch(
             batch_ids,
             batch_times,
             batch_vals,
@@ -218,6 +270,23 @@ class AETHierarchicalCollator:
             batch_chunk_token_counts,
             batch_chunk_duration_hours,
         )
+        total_windows_base = max(1, int(semantic_windows_total))
+        total_subjects_base = max(1, int(len(batch_timelines)))
+        out["overflow_stats"] = {
+            "subjects": int(len(batch_timelines)),
+            "subjects_with_overflow": int(subjects_with_overflow),
+            "subjects_with_overflow_frac": float(subjects_with_overflow) / float(total_subjects_base),
+            "semantic_windows_total": int(semantic_windows_total),
+            "semantic_windows_kept": int(semantic_windows_kept),
+            "semantic_windows_dropped_by_max_windows": int(semantic_windows_dropped),
+            "semantic_windows_dropped_frac": float(semantic_windows_dropped) / float(total_windows_base),
+            "semantic_tokens_dropped_by_max_windows": int(semantic_tokens_dropped),
+            "semantic_structural_tokens_dropped_by_max_windows": int(semantic_structural_tokens_dropped),
+            "chunks_dropped_by_max_chunks": int(chunks_dropped_by_cap),
+            "chunk_tokens_dropped_by_max_chunks": int(chunk_tokens_dropped_by_cap),
+            "chunk_structural_tokens_dropped_by_max_chunks": int(chunk_structural_tokens_dropped_by_cap),
+        }
+        return out
 
     def _split_special(self, timeline: List[EventToken]) -> tuple[List[EventToken], List[EventToken]]:
         specials: List[EventToken] = []
@@ -316,7 +385,7 @@ class AETHierarchicalCollator:
                     EventToken(
                         value_id=next_token_id,
                         category_id=int(self.window_markers.marker_category),
-                        t_from_start_hours=float(next_start_abs) if next_start_abs is not None else float(window_tokens[-1].t_from_start_hours),
+                        t_from_start_hours=float(next_start_abs) if next_start_abs is not None else float(chunk.tokens[-1].t_from_start_hours),
                         dt_from_prev_hours=0.0,
                         cat_attrs={"window_type_id": int(next_type_id_int)},
                         num_attrs={},
@@ -445,7 +514,7 @@ class AETHierarchicalCollator:
         batch_window_duration_hours: List[List[float]],
         batch_chunk_token_counts: List[List[List[float]]],
         batch_chunk_duration_hours: List[List[List[float]]],
-    ) -> Dict[str, torch.Tensor]:
+    ) -> Dict[str, Any]:
         B = len(batch_ids)
         W = max((len(x) for x in batch_ids), default=0)
         C = max((len(chunks) for subj in batch_ids for chunks in subj), default=0)
@@ -511,8 +580,17 @@ class AETHierarchicalCollator:
                     if b < len(batch_chunk_duration_hours) and w < len(batch_chunk_duration_hours[b]) and c < len(batch_chunk_duration_hours[b][w]):
                         chunk_duration_hours[b, w, c] = float(batch_chunk_duration_hours[b][w][c])
 
-        return {
-            "input_ids": input_ids,
+        input_ids_out = input_ids
+        remap_stats: Dict[str, Any] | None = None
+        input_ids_global = input_ids.clone() if self.emit_global_input_ids else None
+        if self.id_remapper is not None:
+            input_ids_out, remap_stats = self.id_remapper.map_tensor(
+                input_ids,
+                valid_mask=attention_mask,
+            )
+
+        out: Dict[str, Any] = {
+            "input_ids": input_ids_out,
             "time_ids": time_ids,
             "numeric_values": numeric_values,
             "numeric_mask": numeric_mask,
@@ -530,3 +608,8 @@ class AETHierarchicalCollator:
             "chunk_token_counts": chunk_token_counts,
             "chunk_duration_hours": chunk_duration_hours,
         }
+        if input_ids_global is not None:
+            out["input_ids_global"] = input_ids_global
+        if remap_stats is not None:
+            out["id_remap_stats"] = remap_stats
+        return out

@@ -1,0 +1,213 @@
+from __future__ import annotations
+
+import json
+
+import yaml
+
+
+def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
+    from ehr_hier.transformer.vocab_runtime import build_runtime_vocab_and_remapper
+
+    contract_fp = tmp_path / "tokenization_v1.yaml"
+    manifest_fp = tmp_path / "vocab_manifest.json"
+    medtok_dir = tmp_path / "medtok"
+    medtok_dir.mkdir(parents=True, exist_ok=True)
+
+    contract_fp.write_text(
+        yaml.safe_dump(
+            {
+                "frozen_ranges": {
+                    "special": {"offset": 0, "reserved_max_id": 31},
+                    "diagnosis": {"offset": 1000000},
+                    "diagnosis_residual": {"offset": 1160000, "buckets": 99},
+                    "procedure": {"offset": 1200000},
+                    "procedure_residual": {"offset": 1360000, "buckets": 99},
+                    "medication": {"offset": 1400000},
+                    "medication_residual": {"offset": 1800000, "buckets": 99},
+                    "measurement_code": {"offset": 2000000},
+                    "measurement_value": {"offset": 2100000},
+                    "structural": {"offset": 2200000},
+                    "observation_code": {"offset": 2300000},
+                    "observation_value": {"offset": 2320000},
+                    "structural_action": {"offset": 2400000},
+                    "structural_entity": {"offset": 2420000},
+                },
+                "residual_fallback": {
+                    "enabled": True,
+                    "buckets": 99,
+                    "offsets": {
+                        "diagnosis": 1160000,
+                        "procedure": 1360000,
+                        "medication": 1800000,
+                    },
+                },
+                "window_markers": {
+                    "enabled": True,
+                    "end_mode": "end_token",
+                    "type_token_offset": 10,
+                    "num_types": 7,
+                    "unk_type_id": 0,
+                    "end_token_id": 17,
+                    "continue_token_id": 18,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    manifest_fp.write_text(
+        json.dumps(
+            {
+                "special": {"offset": 0},
+                "diagnosis": {"offset": 1000000},
+                "diagnosis_residual": {"offset": 1160000, "buckets": 99},
+                "procedure": {"offset": 1200000},
+                "procedure_residual": {"offset": 1360000, "buckets": 99},
+                "medication": {"offset": 1400000},
+                "medication_residual": {"offset": 1800000, "buckets": 99},
+                "measurement_code": {"offset": 2000000},
+                "measurement_value": {"offset": 2100000},
+                "structural": {"offset": 2200000},
+                "observation_code": {"offset": 2300000},
+                "observation_value": {"offset": 2320000},
+                "structural_action": {"offset": 2400000},
+                "structural_entity": {"offset": 2420000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (medtok_dir / "diag_vocab.json").write_text(json.dumps({"<UNK>": 0, "I10": 1}), encoding="utf-8")
+    (medtok_dir / "proc_vocab.json").write_text(json.dumps({"<UNK>": 0, "XYZ": 1}), encoding="utf-8")
+    (medtok_dir / "med_vocab.json").write_text(json.dumps({"<UNK>": 0}), encoding="utf-8")
+
+    vocab_config, remapper = build_runtime_vocab_and_remapper(
+        tokenization_contract=contract_fp,
+        vocab_manifest=manifest_fp,
+        medtok_vocab_dir=medtok_dir,
+        measurement_code_size=128,
+        rvq_size=32,
+        structural_entity_source_size=10_000,
+        structural_entity_dense_size=256,
+    )
+
+    assert vocab_config["total_size"] > 0
+    assert "routing" in vocab_config
+    assert set(vocab_config["routing"].keys()) == {
+        "logits_struct",
+        "logits_rvq",
+        "logits_meas",
+        "logits_medtok",
+    }
+    assert vocab_config["window_markers"]["end_token_id"] == 17
+
+    import torch
+
+    ids = torch.tensor([[0, 17, 2000001, 2100010, 2429999, 9999999]], dtype=torch.long)
+    valid = torch.ones_like(ids, dtype=torch.long)
+    mapped, stats = remapper.map_tensor(ids, valid_mask=valid)
+    assert mapped.shape == ids.shape
+    assert stats["total_tokens"] == 6
+    assert stats["mapped_tokens"] >= 5
+    assert stats["unmapped_tokens"] <= 1
+    assert int(mapped[0, 0].item()) == 0
+
+    from ehr_hier.transformer.vocab_runtime import DenseIdRemapper
+
+    remapper_roundtrip = DenseIdRemapper.from_serialized(remapper.serialize())
+    mapped2, stats2 = remapper_roundtrip.map_tensor(ids, valid_mask=valid)
+    assert mapped2.tolist() == mapped.tolist()
+    assert stats2["unmapped_tokens"] == stats["unmapped_tokens"]
+
+
+def test_collator_reports_overflow_and_remap_stats_and_next_type_fallback() -> None:
+    from ehr_hier.data.token_types import EventToken, TokenCategory
+    from ehr_hier.data.window_segmentation import SegmentedChunk
+    from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
+    from ehr_hier.transformer.vocab_runtime import DenseIdBlock, DenseIdRemapper
+
+    remapper = DenseIdRemapper(
+        [
+            DenseIdBlock(
+                name="special",
+                head="logits_struct",
+                global_offset=0,
+                source_size=64,
+                dense_offset=0,
+                dense_size=64,
+                mode="identity",
+            ),
+            DenseIdBlock(
+                name="measurement_code",
+                head="logits_meas",
+                global_offset=2000000,
+                source_size=2048,
+                dense_offset=64,
+                dense_size=2048,
+                mode="identity",
+            ),
+        ],
+        unk_dense_id=0,
+    )
+
+    summary = EventToken(
+        value_id=1,
+        category_id=int(TokenCategory.SPECIAL),
+        t_from_start_hours=0.0,
+        dt_from_prev_hours=0.0,
+        cat_attrs={},
+        num_attrs={},
+    )
+    timeline = [summary]
+    for idx in range(24):
+        t = float(idx // 3)
+        timeline.append(
+            EventToken(
+                value_id=2000000 + (idx % 10) + 1,
+                category_id=int(TokenCategory.MEASUREMENT),
+                t_from_start_hours=t,
+                dt_from_prev_hours=0.0 if idx > 0 else 1.0,
+                cat_attrs={},
+                num_attrs={"numeric_value": float(idx)},
+            )
+        )
+
+    collator = AETHierarchicalCollator(
+        max_windows=4,
+        max_chunks_per_window=2,
+        max_len_per_window=6,
+        pad_id=0,
+        window_markers=WindowMarkerConfig(enabled=True, end_mode="next_type", type_token_offset=10, num_types=4),
+        id_remapper=remapper,
+    )
+
+    batch = collator([timeline])
+    assert "overflow_stats" in batch
+    assert "id_remap_stats" in batch
+    assert int(batch["overflow_stats"]["chunks_dropped_by_max_chunks"]) > 0
+    assert float(batch["id_remap_stats"]["unmapped_frac"]) == 0.0
+
+    # Exercise the private next-type fallback path where next_start_abs is None.
+    chunk = SegmentedChunk(
+        tokens=[
+            EventToken(
+                value_id=2000001,
+                category_id=int(TokenCategory.MEASUREMENT),
+                t_from_start_hours=12.0,
+                dt_from_prev_hours=0.0,
+                cat_attrs={},
+                num_attrs={"numeric_value": 1.0},
+            )
+        ],
+        start_time_hours=12.0,
+        chunk_index=0,
+        is_first_chunk=True,
+        is_last_chunk=True,
+    )
+    ids, *_ = collator._process_chunk(
+        chunk,
+        special_tokens=[],
+        w_type_id=1,
+        w_start_abs=12.0,
+        next_type_id=2,
+        next_start_abs=None,
+    )
+    assert ids[-1] == 12  # type_token_offset(10) + next_type_id(2)
