@@ -4,6 +4,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import re
 import sys
 from collections import defaultdict
 from pathlib import Path
@@ -82,6 +83,25 @@ def _is_rare_critical(raw_code: str, keywords_upper: List[str]) -> bool:
     return any(k in code_u for k in keywords_upper)
 
 
+def _is_low_specificity_med_candidate(code: str) -> bool:
+    c = str(code).upper().strip()
+    if not c:
+        return True
+    if c in {"UNK", "<UNK>", "MEDICATION//UNK"}:
+        return True
+    if re.fullmatch(r"[0-9]{1,4}", c):
+        return True
+    if c.startswith("RXNORM//"):
+        seg = c.split("//", 1)[1]
+        if re.fullmatch(r"[0-9]{1,4}", seg):
+            return True
+    if c.startswith("NDC//"):
+        seg = re.sub(r"\D", "", c.split("//", 1)[1])
+        if len(seg) < 10:
+            return True
+    return False
+
+
 def _load_full_vocab(
     *,
     name: str,
@@ -123,6 +143,7 @@ def _build_family_vocab(
     max_explicit: int,
     target_coverage: float,
     keywords_upper: List[str],
+    drop_low_specificity_med: bool = True,
 ) -> Tuple[Dict[str, int], Dict[str, Any]]:
     fam = df[df["routed_category"].fillna("").astype(str).str.upper() == str(routed_category).upper()].copy()
     rows_considered = int(len(fam))
@@ -159,6 +180,12 @@ def _build_family_vocab(
         primary: str | None = None
         for cand in candidates:
             cand_str = str(cand)
+            if (
+                str(routed_category).upper() == "MEDICATION"
+                and bool(drop_low_specificity_med)
+                and _is_low_specificity_med_candidate(cand_str)
+            ):
+                continue
             if cand_str in full_vocab.code2id and int(full_vocab.code2id[cand_str]) != int(full_vocab.unk_id):
                 primary = cand_str
                 break
@@ -174,9 +201,20 @@ def _build_family_vocab(
         st["rows"] += 1
         st["rare_critical"] = bool(st["rare_critical"] or rare_critical)
 
-    if max_explicit <= 0:
-        max_explicit = len(code_stats)
-    max_explicit = max(1, int(max_explicit))
+    if int(max_explicit) <= 0:
+        report = {
+            "rows_considered": rows_considered,
+            "total_events": int(total_events),
+            "mappable_events": int(mappable_events),
+            "unmappable_events": int(unmappable_events),
+            "rare_critical_rows": int(rare_critical_rows),
+            "explicit_codes_selected": 0,
+            "selected_event_coverage_over_mappable": 0.0,
+            "selected_events": 0,
+            "top_selected_preview": [],
+        }
+        return {"<UNK>": 0}, report
+    max_explicit = int(max_explicit)
     target_coverage = min(1.0, max(0.0, float(target_coverage)))
 
     ranked = sorted(
@@ -279,6 +317,11 @@ def main() -> None:
         default=",".join(_rare_keywords_default()),
         help="Comma-separated keyword list. Matching rows are force-prioritized in explicit selection.",
     )
+    ap.add_argument(
+        "--keep_low_specificity_med_codes",
+        action="store_true",
+        help="If set, allow low-specificity medication candidates (e.g., very short numeric IDs).",
+    )
     ap.add_argument("--output_report_json", default=None)
     args = ap.parse_args()
 
@@ -329,6 +372,7 @@ def main() -> None:
         max_explicit=int(args.diag_max_explicit),
         target_coverage=float(args.diag_target_coverage),
         keywords_upper=keywords_upper,
+        drop_low_specificity_med=False,
     )
     proc_code2id, proc_report = _build_family_vocab(
         df=df,
@@ -338,6 +382,7 @@ def main() -> None:
         max_explicit=int(args.proc_max_explicit),
         target_coverage=float(args.proc_target_coverage),
         keywords_upper=keywords_upper,
+        drop_low_specificity_med=False,
     )
     med_code2id, med_report = _build_family_vocab(
         df=df,
@@ -347,6 +392,7 @@ def main() -> None:
         max_explicit=int(args.med_max_explicit),
         target_coverage=float(args.med_target_coverage),
         keywords_upper=keywords_upper,
+        drop_low_specificity_med=not bool(args.keep_low_specificity_med_codes),
     )
 
     _write_vocab_json(out_dir / "diag_vocab.json", diag_code2id)
@@ -372,6 +418,7 @@ def main() -> None:
             "med_residual_buckets": int(args.med_residual_buckets),
             "assumed_non_medtok_vocab": int(args.assumed_non_medtok_vocab),
             "rare_critical_keywords": keywords_upper,
+            "keep_low_specificity_med_codes": bool(args.keep_low_specificity_med_codes),
         },
         "selected_vocab_sizes": {
             "diag_explicit": int(len(diag_code2id) - 1),
