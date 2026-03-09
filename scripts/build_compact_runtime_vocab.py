@@ -70,10 +70,15 @@ _WORKER_STATE: Dict[str, Any] = {}
 
 
 def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tuple[str, int, int]]) -> Dict[str, Any]:
+    # Avoid loading massive full MedTok code2embeddings in every worker unless explicitly requested.
+    worker_args = argparse.Namespace(**vars(args))
+    if not bool(getattr(worker_args, "allow_full_medtok_in_workers", False)):
+        worker_args.medtok_code2embeds = None
+
     tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
-    artifacts = _build_static_artifacts(args)
+    artifacts = _build_static_artifacts(worker_args)
     residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
-        args,
+        worker_args,
         tokenization_contract=tokenization_contract,
     )
 
@@ -82,7 +87,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
 
-    meas_cfg = _build_measurement_config(args, artifacts=artifacts)
+    meas_cfg = _build_measurement_config(worker_args, artifacts=artifacts)
     if meas_cfg is None:
         raise ValueError("Measurement artifacts missing; cannot build timelines for compact vocab.")
 
@@ -112,7 +117,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         "special_token_offset": 0,
     }
     timeline_kwargs = {k: v for k, v in timeline_kwargs.items() if k in sig.parameters}
-    db = mr.SubjectDatabase(str(args.meds_reader_db))
+    db = mr.SubjectDatabase(str(worker_args.meds_reader_db))
     return {
         "db": db,
         "encoders": encoders,
@@ -123,6 +128,17 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
 
 def _init_worker(payload: Mapping[str, Any]) -> None:
     global _WORKER_STATE
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    try:
+        import torch  # local import to avoid hard dependency during arg parsing
+
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(1)
+    except Exception:
+        pass
     args = argparse.Namespace(**dict(payload.get("args", {})))
     block_ranges_raw = payload.get("block_ranges", [])
     block_ranges: List[tuple[str, int, int]] = [
@@ -187,6 +203,11 @@ def main() -> None:
     ap.add_argument("--progress_every", type=int, default=100)
     ap.add_argument("--workers", type=int, default=0, help="Process workers (0/1 = serial).")
     ap.add_argument("--subject_chunk_size", type=int, default=128, help="Subjects per worker task.")
+    ap.add_argument(
+        "--allow_full_medtok_in_workers",
+        action="store_true",
+        help="If set, workers may load --medtok_code2embeds; default uses --medtok_vocab_dir only (lower RAM).",
+    )
 
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
@@ -265,6 +286,11 @@ def main() -> None:
     workers = int(args.workers)
     chunk_size = max(1, int(args.subject_chunk_size))
     subject_chunks = _chunk_subjects(subject_ids, chunk_size)
+    if workers > 1 and args.medtok_code2embeds and not bool(args.allow_full_medtok_in_workers):
+        print(
+            "[compact-vocab] workers>1: ignoring --medtok_code2embeds in workers and using --medtok_vocab_dir to avoid OOM",
+            flush=True,
+        )
 
     done_subjects = 0
     if workers <= 1:
