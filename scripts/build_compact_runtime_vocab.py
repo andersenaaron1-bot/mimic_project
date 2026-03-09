@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import concurrent.futures as cf
 import inspect
 import json
 import random
@@ -9,7 +10,7 @@ import sys
 import time
 from collections import defaultdict
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional
+from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -60,6 +61,120 @@ def _maybe_print_progress(*, idx: int, total: int, every: int, started_at: float
     )
 
 
+def _chunk_subjects(subject_ids: Sequence[int], chunk_size: int) -> List[List[int]]:
+    sz = max(1, int(chunk_size))
+    return [list(subject_ids[i : i + sz]) for i in range(0, len(subject_ids), sz)]
+
+
+_WORKER_STATE: Dict[str, Any] = {}
+
+
+def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tuple[str, int, int]]) -> Dict[str, Any]:
+    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
+    artifacts = _build_static_artifacts(args)
+    residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
+        args,
+        tokenization_contract=tokenization_contract,
+    )
+
+    struct_codes_union = set()
+    if artifacts.structural_codebook is not None:
+        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+    struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
+
+    meas_cfg = _build_measurement_config(args, artifacts=artifacts)
+    if meas_cfg is None:
+        raise ValueError("Measurement artifacts missing; cannot build timelines for compact vocab.")
+
+    encoders = build_base_encoders(
+        meas_cfg,
+        diag_vocab=artifacts.diag_vocab,
+        proc_vocab=artifacts.proc_vocab,
+        med_vocab=artifacts.med_vocab,
+        struct_vocab=struct_vocab,
+        med_attr_vocabs=artifacts.med_attr_vocabs,
+        med_numeric_attrs=artifacts.med_numeric_attrs,
+        medtok_parent_lookup=artifacts.medtok_parent_lookup,
+        enable_residual_fallback=bool(residual_enabled),
+        residual_fallback_buckets=int(residual_buckets),
+        residual_fallback_offsets=dict(residual_offsets),
+    )
+
+    sig = inspect.signature(build_subject_timeline)
+    timeline_kwargs = {
+        "encoders": encoders,
+        "structural_codebook": artifacts.structural_codebook,
+        "window_hook_label": "window_boundary",
+        "attach_med_numeric": True,
+        "emit_process_struct_tokens": True,
+        "drop_original_process_marker_tokens": True,
+        "emit_global_demographic_tokens": True,
+        "special_token_offset": 0,
+    }
+    timeline_kwargs = {k: v for k, v in timeline_kwargs.items() if k in sig.parameters}
+    db = mr.SubjectDatabase(str(args.meds_reader_db))
+    return {
+        "db": db,
+        "encoders": encoders,
+        "timeline_kwargs": timeline_kwargs,
+        "block_ranges": [(str(n), int(lo), int(hi)) for n, lo, hi in block_ranges],
+    }
+
+
+def _init_worker(payload: Mapping[str, Any]) -> None:
+    global _WORKER_STATE
+    args = argparse.Namespace(**dict(payload.get("args", {})))
+    block_ranges_raw = payload.get("block_ranges", [])
+    block_ranges: List[tuple[str, int, int]] = [
+        (str(t[0]), int(t[1]), int(t[2])) for t in block_ranges_raw
+    ]
+    _WORKER_STATE = _build_worker_runtime(args=args, block_ranges=block_ranges)
+
+
+def _scan_subject_chunk(subject_chunk: Sequence[int]) -> Dict[str, Any]:
+    db = _WORKER_STATE["db"]
+    encoders = _WORKER_STATE["encoders"]
+    timeline_kwargs = _WORKER_STATE["timeline_kwargs"]
+    block_ranges = _WORKER_STATE["block_ranges"]
+
+    observed_ids_by_block: Dict[str, set[int]] = {str(n): set() for n, _, _ in block_ranges}
+    total_tokens = 0
+    unmatched_tokens = 0
+    subjects_built = 0
+
+    for sid in subject_chunk:
+        for enc in encoders.values():
+            reset = getattr(enc, "reset_state", None)
+            if callable(reset):
+                reset()
+
+        timeline = build_subject_timeline(
+            db=db,
+            subject_id=int(sid),
+            **timeline_kwargs,
+        )
+        subjects_built += 1
+        total_tokens += int(len(timeline))
+
+        for tok in timeline:
+            gid = int(tok.value_id)
+            matched = False
+            for name, lo, hi in block_ranges:
+                if lo <= gid <= hi:
+                    observed_ids_by_block[name].add(gid)
+                    matched = True
+                    break
+            if not matched:
+                unmatched_tokens += 1
+
+    return {
+        "subjects_built": int(subjects_built),
+        "total_tokens": int(total_tokens),
+        "unmatched_tokens": int(unmatched_tokens),
+        "observed_ids_by_block": {k: sorted(v) for k, v in observed_ids_by_block.items()},
+    }
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(
         description="Build compact runtime vocab/remapper from actually observed token IDs in v1 timelines."
@@ -70,6 +185,8 @@ def main() -> None:
     ap.add_argument("--max_subjects", type=int, default=20000)
     ap.add_argument("--sample_seed", type=int, default=42)
     ap.add_argument("--progress_every", type=int, default=100)
+    ap.add_argument("--workers", type=int, default=0, help="Process workers (0/1 = serial).")
+    ap.add_argument("--subject_chunk_size", type=int, default=128, help="Subjects per worker task.")
 
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
@@ -104,36 +221,6 @@ def main() -> None:
 
     random.seed(int(args.sample_seed))
 
-    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
-    artifacts = _build_static_artifacts(args)
-    residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
-        args,
-        tokenization_contract=tokenization_contract,
-    )
-
-    struct_codes_union = set()
-    if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
-    struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
-
-    meas_cfg = _build_measurement_config(args, artifacts=artifacts)
-    if meas_cfg is None:
-        raise ValueError("Measurement artifacts missing; cannot build timelines for compact vocab.")
-
-    encoders = build_base_encoders(
-        meas_cfg,
-        diag_vocab=artifacts.diag_vocab,
-        proc_vocab=artifacts.proc_vocab,
-        med_vocab=artifacts.med_vocab,
-        struct_vocab=struct_vocab,
-        med_attr_vocabs=artifacts.med_attr_vocabs,
-        med_numeric_attrs=artifacts.med_numeric_attrs,
-        medtok_parent_lookup=artifacts.medtok_parent_lookup,
-        enable_residual_fallback=bool(residual_enabled),
-        residual_fallback_buckets=int(residual_buckets),
-        residual_fallback_offsets=dict(residual_offsets),
-    )
-
     base_vocab_config, base_remapper = build_runtime_vocab_and_remapper(
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
@@ -157,7 +244,6 @@ def main() -> None:
     observed_ids_by_block["special"].update({0, 1, 2, 3, end_id, cont_id})
     observed_ids_by_block["special"].update(range(t_off, t_off + max(0, n_types)))
 
-    db = mr.SubjectDatabase(str(args.meds_reader_db))
     subject_ids = _load_subject_ids(
         str(args.splits_parquet),
         str(args.split),
@@ -166,19 +252,6 @@ def main() -> None:
     )
     if not subject_ids:
         raise ValueError("No subjects loaded; cannot build compact runtime vocab.")
-
-    sig = inspect.signature(build_subject_timeline)
-    timeline_kwargs = {
-        "encoders": encoders,
-        "structural_codebook": artifacts.structural_codebook,
-        "window_hook_label": "window_boundary",
-        "attach_med_numeric": True,
-        "emit_process_struct_tokens": True,
-        "drop_original_process_marker_tokens": True,
-        "emit_global_demographic_tokens": True,
-        "special_token_offset": 0,
-    }
-    timeline_kwargs = {k: v for k, v in timeline_kwargs.items() if k in sig.parameters}
 
     block_ranges = [
         (str(b.name), int(b.global_offset), int(b.global_max))
@@ -189,35 +262,52 @@ def main() -> None:
     total = len(subject_ids)
     total_tokens = 0
     unmatched_tokens = 0
+    workers = int(args.workers)
+    chunk_size = max(1, int(args.subject_chunk_size))
+    subject_chunks = _chunk_subjects(subject_ids, chunk_size)
 
-    for idx, sid in enumerate(subject_ids, start=1):
-        for enc in encoders.values():
-            reset = getattr(enc, "reset_state", None)
-            if callable(reset):
-                reset()
-
-        timeline = build_subject_timeline(
-            db=db,
-            subject_id=int(sid),
-            **timeline_kwargs,
-        )
-        total_tokens += int(len(timeline))
-        for tok in timeline:
-            gid = int(tok.value_id)
-            matched = False
-            for name, lo, hi in block_ranges:
-                if lo <= gid <= hi:
-                    observed_ids_by_block[name].add(gid)
-                    matched = True
-                    break
-            if not matched:
-                unmatched_tokens += 1
-        _maybe_print_progress(
-            idx=idx,
-            total=total,
-            every=int(args.progress_every),
-            started_at=started_at,
-        )
+    done_subjects = 0
+    if workers <= 1:
+        global _WORKER_STATE
+        _WORKER_STATE = _build_worker_runtime(args=args, block_ranges=block_ranges)
+        for chunk in subject_chunks:
+            res = _scan_subject_chunk(chunk)
+            done_subjects += int(res["subjects_built"])
+            total_tokens += int(res["total_tokens"])
+            unmatched_tokens += int(res["unmatched_tokens"])
+            obs = dict(res.get("observed_ids_by_block", {}))
+            for name, vals in obs.items():
+                observed_ids_by_block[str(name)].update(int(v) for v in vals)
+            _maybe_print_progress(
+                idx=done_subjects,
+                total=total,
+                every=int(args.progress_every),
+                started_at=started_at,
+            )
+    else:
+        payload = {
+            "args": vars(args),
+            "block_ranges": block_ranges,
+        }
+        max_workers = max(1, workers)
+        with cf.ProcessPoolExecutor(
+            max_workers=max_workers,
+            initializer=_init_worker,
+            initargs=(payload,),
+        ) as ex:
+            for res in ex.map(_scan_subject_chunk, subject_chunks, chunksize=1):
+                done_subjects += int(res["subjects_built"])
+                total_tokens += int(res["total_tokens"])
+                unmatched_tokens += int(res["unmatched_tokens"])
+                obs = dict(res.get("observed_ids_by_block", {}))
+                for name, vals in obs.items():
+                    observed_ids_by_block[str(name)].update(int(v) for v in vals)
+                _maybe_print_progress(
+                    idx=done_subjects,
+                    total=total,
+                    every=int(args.progress_every),
+                    started_at=started_at,
+                )
 
     preserve_full_blocks = _parse_csv_set(args.preserve_full_blocks)
     compact_vocab_config, compact_remapper = build_compact_runtime_vocab_and_remapper(
