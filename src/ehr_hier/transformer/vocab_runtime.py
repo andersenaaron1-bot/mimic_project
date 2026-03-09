@@ -151,6 +151,10 @@ class DenseIdRemapper:
         out = torch.full_like(ids, fill_value=int(self.unk_dense_id))
         matched = torch.zeros_like(ids, dtype=torch.bool)
         block_hits: Dict[str, int] = {}
+        if valid_mask is not None:
+            valid = valid_mask.to(dtype=torch.bool)
+        else:
+            valid = torch.ones_like(matched, dtype=torch.bool)
 
         for block in self.blocks:
             go = int(block.global_offset)
@@ -168,12 +172,7 @@ class DenseIdRemapper:
             mapped = int(block.dense_offset) + local
             out[mask] = mapped
             matched = matched | mask
-            block_hits[block.name] = int(mask.sum().item())
-
-        if valid_mask is not None:
-            valid = valid_mask.to(dtype=torch.bool)
-        else:
-            valid = torch.ones_like(matched, dtype=torch.bool)
+            block_hits[block.name] = int((mask & valid).sum().item())
         unmapped = valid & ~matched
         stats = {
             "total_tokens": int(valid.sum().item()),

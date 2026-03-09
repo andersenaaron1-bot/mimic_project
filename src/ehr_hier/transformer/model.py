@@ -67,6 +67,17 @@ class AdaptiveEpisodicTransformer(nn.Module):
         self.next_window_type_head = (
             nn.Linear(config.d_model, self.num_window_types) if self.num_window_types > 0 else None
         )
+        self.enable_transition_control_heads = bool(
+            getattr(config, "enable_transition_control_heads", True)
+        )
+        self.transition_boundary_head = (
+            nn.Linear(config.d_model, 2) if self.enable_transition_control_heads else None
+        )
+        self.boundary_next_window_type_head = (
+            nn.Linear(config.d_model, self.num_window_types)
+            if self.enable_transition_control_heads and self.num_window_types > 0
+            else None
+        )
         self.window_len_head = (
             nn.Sequential(
                 nn.Linear(config.d_model, config.d_model),
@@ -238,8 +249,22 @@ class AdaptiveEpisodicTransformer(nn.Module):
             fused_representation = torch.where(mask, fused_representation, local_hidden)
 
         fused_representation = fused_representation * attention_mask.unsqueeze(-1)
+        fused_representation = torch.nan_to_num(
+            fused_representation,
+            nan=0.0,
+            posinf=0.0,
+            neginf=0.0,
+        )
 
         logits_dict = self.heads(fused_representation)
+        if self.transition_boundary_head is not None:
+            logits_dict["logits_transition_boundary"] = self.transition_boundary_head(
+                fused_representation
+            )
+        if self.boundary_next_window_type_head is not None:
+            logits_dict["logits_boundary_next_window_type"] = (
+                self.boundary_next_window_type_head(fused_representation)
+            )
         if self.next_window_type_head is not None:
             logits_dict["logits_next_window_type"] = self.next_window_type_head(global_states)
 
@@ -346,6 +371,15 @@ class AdaptiveEpisodicTransformer(nn.Module):
                 continue_local = self._window_continue_token_local_index()
                 if 0 <= int(continue_local) < int(self.size_special):
                     logits_struct[..., int(continue_local)] = logits_struct[..., int(continue_local)] + chunk_hazard_logit
+
+        for key, value in list(logits_dict.items()):
+            if torch.is_tensor(value):
+                logits_dict[key] = torch.nan_to_num(
+                    value,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                )
 
         if W == 0:
             final_state = torch.zeros((B, D), device=global_states.device, dtype=global_states.dtype)

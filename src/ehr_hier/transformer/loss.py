@@ -32,6 +32,8 @@ class AETLossModule(nn.Module):
             "med": 1.0,
             "val": 1.0,
             "win": 1.0,
+            "transition": 1.0,
+            "win_boundary": 1.0,
             "len": 0.0,
             "chunk": 0.0,
             "time": 0.0,
@@ -41,6 +43,28 @@ class AETLossModule(nn.Module):
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
         self.mse_loss = nn.MSELoss(reduction="none")
         self.routing = self._build_routing(self.vocab_config)
+        self._marker_info = self._build_marker_info(self.vocab_config)
+
+    @staticmethod
+    def _build_marker_info(vocab_config: dict) -> dict[str, int]:
+        offsets_raw = vocab_config.get("offsets", {})
+        offsets = {str(k).upper(): int(v) for k, v in offsets_raw.items()} if isinstance(offsets_raw, dict) else {}
+        special_offset = int(offsets.get("SPECIAL", 0))
+
+        markers = vocab_config.get("window_markers", {})
+        markers = markers if isinstance(markers, dict) else {}
+        type_rel = int(markers.get("type_token_offset", 0))
+        num_types = int(markers.get("num_types", 0))
+        end_rel = int(markers.get("end_token_id", type_rel + num_types))
+        continue_rel = int(markers.get("continue_token_id", end_rel + 1))
+        return {
+            "special_offset": special_offset,
+            "type_start": special_offset + type_rel,
+            "type_end_excl": special_offset + type_rel + max(0, num_types),
+            "num_types": max(0, num_types),
+            "end_id": special_offset + end_rel,
+            "continue_id": special_offset + continue_rel,
+        }
 
     @staticmethod
     def _build_routing(vocab_config: dict) -> dict[str, list[dict]]:
@@ -92,6 +116,45 @@ class AETLossModule(nn.Module):
         if token_type_ids is not None:
             mask = mask & (token_type_ids != 0)
         return mask
+
+    @staticmethod
+    def _chunk_end_positions(attention_mask: torch.Tensor) -> torch.Tensor:
+        valid = attention_mask.to(dtype=torch.bool)
+        if valid.ndim == 3:
+            B, W, L = valid.shape
+            lengths = valid.to(dtype=torch.long).sum(dim=-1)
+            has_tokens = lengths > 0
+            idx = (lengths - 1).clamp(min=0)
+            out = torch.zeros_like(valid)
+            b = torch.arange(B, device=valid.device)[:, None]
+            w = torch.arange(W, device=valid.device)[None, :]
+            out[b, w, idx] = has_tokens
+            return out & valid
+        if valid.ndim == 4:
+            B, W, C, L = valid.shape
+            lengths = valid.to(dtype=torch.long).sum(dim=-1)
+            has_tokens = lengths > 0
+            idx = (lengths - 1).clamp(min=0)
+            out = torch.zeros_like(valid)
+            b = torch.arange(B, device=valid.device)[:, None, None]
+            w = torch.arange(W, device=valid.device)[None, :, None]
+            c = torch.arange(C, device=valid.device)[None, None, :]
+            out[b, w, c, idx] = has_tokens
+            return out & valid
+        raise ValueError(
+            f"attention_mask must be 3D or 4D to derive chunk-end positions, got shape {tuple(valid.shape)}"
+        )
+
+    def _marker_masks(self, target_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        type_start = int(self._marker_info["type_start"])
+        type_end_excl = int(self._marker_info["type_end_excl"])
+        end_id = int(self._marker_info["end_id"])
+        continue_id = int(self._marker_info["continue_id"])
+
+        type_mask = (target_ids >= type_start) & (target_ids < type_end_excl)
+        end_mask = target_ids == end_id
+        continue_mask = target_ids == continue_id
+        return type_mask, end_mask, continue_mask
 
     @classmethod
     def _window_targets(
@@ -216,10 +279,21 @@ class AETLossModule(nn.Module):
         }
 
         routed = torch.zeros_like(valid, dtype=torch.bool)
+        has_transition_supervision = (
+            ("logits_transition_boundary" in head_outputs)
+            or ("logits_boundary_next_window_type" in head_outputs)
+        )
+        marker_type_mask_all, marker_end_mask_all, marker_continue_mask_all = self._marker_masks(target_ids)
+        marker_any_mask_all = marker_type_mask_all | marker_end_mask_all | marker_continue_mask_all
         for head_key, blocks in self.routing.items():
             if head_key not in head_outputs:
                 continue
-            logits = head_outputs[head_key]
+            logits = torch.nan_to_num(
+                head_outputs[head_key],
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            )
             if logits.shape[:-1] != target_ids.shape:
                 raise ValueError(
                     f"{head_key} logits shape {tuple(logits.shape)} incompatible with target_ids {tuple(target_ids.shape)}"
@@ -253,6 +327,9 @@ class AETLossModule(nn.Module):
                     f"but logits last dim is {int(logits.shape[-1])}"
                 )
 
+            if head_key == "logits_struct" and has_transition_supervision:
+                mask_head = mask_head & ~marker_any_mask_all
+
             if mask_head.any():
                 loss = self.ce_loss(logits[mask_head], local_targets[mask_head])
                 w = float(self.weights.get(head_to_weight.get(head_key, head_key), 1.0))
@@ -260,6 +337,9 @@ class AETLossModule(nn.Module):
                 logs[head_to_log.get(head_key, f"loss_{head_key}")] = float(loss.mean().item())
 
             routed |= mask_head
+
+        if has_transition_supervision:
+            routed = routed | (valid & marker_any_mask_all)
 
         unrouted = valid & ~routed
         valid_count = int(valid.sum().item()) if valid.numel() else 0
@@ -271,10 +351,85 @@ class AETLossModule(nn.Module):
                 "Update vocab_config['routing'] (or offsets/sizes) to cover all tokens."
             )
 
+        attention_mask_local = targets_dict.get("attention_mask", None)
+        if attention_mask_local is not None:
+            boundary_positions = self._chunk_end_positions(attention_mask_local)
+        else:
+            boundary_positions = torch.zeros_like(target_ids, dtype=torch.bool)
+
+        type_mask = marker_type_mask_all
+        end_mask = marker_end_mask_all
+        continue_mask = marker_continue_mask_all
+
+        logits_transition_boundary = head_outputs.get("logits_transition_boundary", None)
+        if logits_transition_boundary is not None:
+            logits_transition_boundary = torch.nan_to_num(
+                logits_transition_boundary, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            if logits_transition_boundary.shape[:-1] != target_ids.shape or int(logits_transition_boundary.shape[-1]) != 2:
+                raise ValueError(
+                    "logits_transition_boundary must be (...,2) aligned with input_ids; "
+                    f"got {tuple(logits_transition_boundary.shape)} vs {tuple(target_ids.shape)}"
+                )
+
+            supervise_continue = boundary_positions & continue_mask & valid
+            supervise_end = boundary_positions & (end_mask | type_mask) & valid
+            supervise_mask = supervise_continue | supervise_end
+
+            if supervise_mask.any():
+                targets_boundary = torch.zeros_like(target_ids, dtype=torch.long)
+                targets_boundary[supervise_end] = 1
+                loss_boundary = self.ce_loss(
+                    logits_transition_boundary[supervise_mask],
+                    targets_boundary[supervise_mask],
+                ).mean()
+                total_loss = total_loss + float(self.weights.get("transition", 1.0)) * loss_boundary
+                logs["loss_transition_boundary"] = float(loss_boundary.item())
+                pred_boundary = logits_transition_boundary.argmax(dim=-1)
+                acc_boundary = (
+                    (pred_boundary[supervise_mask] == targets_boundary[supervise_mask])
+                    .to(dtype=torch.float32)
+                    .mean()
+                )
+                logs["acc_transition_boundary"] = float(acc_boundary.item())
+                logs["n_transition_boundary_supervised"] = int(supervise_mask.sum().item())
+
+        logits_boundary_next_window_type = head_outputs.get("logits_boundary_next_window_type", None)
+        if logits_boundary_next_window_type is not None and int(self._marker_info["num_types"]) > 0:
+            logits_boundary_next_window_type = torch.nan_to_num(
+                logits_boundary_next_window_type, nan=0.0, posinf=0.0, neginf=0.0
+            )
+            expected_shape = target_ids.shape + (int(self._marker_info["num_types"]),)
+            if logits_boundary_next_window_type.shape != expected_shape:
+                raise ValueError(
+                    "logits_boundary_next_window_type must be (*input_shape, num_window_types); "
+                    f"got {tuple(logits_boundary_next_window_type.shape)} expected {tuple(expected_shape)}"
+                )
+
+            type_boundary_mask = boundary_positions & type_mask & valid
+            if type_boundary_mask.any():
+                type_start = int(self._marker_info["type_start"])
+                targets_next_type = (target_ids - type_start).to(dtype=torch.long)
+                loss_next_type_boundary = self.ce_loss(
+                    logits_boundary_next_window_type[type_boundary_mask],
+                    targets_next_type[type_boundary_mask],
+                ).mean()
+                total_loss = total_loss + float(self.weights.get("win_boundary", 1.0)) * loss_next_type_boundary
+                logs["loss_next_window_type_boundary"] = float(loss_next_type_boundary.item())
+                pred_next_type = logits_boundary_next_window_type.argmax(dim=-1)
+                acc_next_type_boundary = (
+                    (pred_next_type[type_boundary_mask] == targets_next_type[type_boundary_mask])
+                    .to(dtype=torch.float32)
+                    .mean()
+                )
+                logs["acc_next_window_type_boundary"] = float(acc_next_type_boundary.item())
+                logs["n_next_window_type_boundary_supervised"] = int(type_boundary_mask.sum().item())
+
         pred_val = head_outputs.get("pred_values", None)
         target_vals = targets_dict.get("numeric_values", None)
         numeric_mask = targets_dict.get("numeric_mask", None)
         if pred_val is not None and target_vals is not None:
+            pred_val = torch.nan_to_num(pred_val, nan=0.0, posinf=0.0, neginf=0.0)
             if numeric_mask is not None:
                 mask_val = numeric_mask.to(dtype=torch.bool) & valid
             else:
@@ -288,6 +443,9 @@ class AETLossModule(nn.Module):
         window_type_ids = targets_dict.get("window_type_ids", None)
         window_mask = targets_dict.get("window_mask", None)
         if logits_next_window_type is not None and window_type_ids is not None:
+            logits_next_window_type = torch.nan_to_num(
+                logits_next_window_type, nan=0.0, posinf=0.0, neginf=0.0
+            )
             if logits_next_window_type.ndim != 3:
                 raise ValueError(
                     f"logits_next_window_type must be (B,W,K), got shape {tuple(logits_next_window_type.shape)}"
@@ -321,6 +479,8 @@ class AETLossModule(nn.Module):
         pred_len_tokens = head_outputs.get("pred_window_len_tokens", None)
         pred_len_hours = head_outputs.get("pred_window_len_hours", None)
         if pred_len_tokens is not None and pred_len_hours is not None:
+            pred_len_tokens = torch.nan_to_num(pred_len_tokens, nan=1.0, posinf=1e6, neginf=1.0)
+            pred_len_hours = torch.nan_to_num(pred_len_hours, nan=0.0, posinf=1e6, neginf=0.0)
             win_mask, true_len_tokens, true_len_hours = self._window_targets(targets_dict, window_mask=window_mask)
             if pred_len_tokens.shape != true_len_tokens.shape or pred_len_hours.shape != true_len_hours.shape:
                 raise ValueError(
@@ -346,6 +506,8 @@ class AETLossModule(nn.Module):
         pred_dur_mu = head_outputs.get("pred_window_dur_mu", None)
         pred_dur_sigma = head_outputs.get("pred_window_dur_sigma", None)
         if pred_dur_mu is not None and pred_dur_sigma is not None:
+            pred_dur_mu = torch.nan_to_num(pred_dur_mu, nan=0.0, posinf=0.0, neginf=0.0)
+            pred_dur_sigma = torch.nan_to_num(pred_dur_sigma, nan=1.0, posinf=1e6, neginf=1.0)
             win_mask, _, true_dur_h = self._window_targets(targets_dict, window_mask=window_mask)
             if pred_dur_mu.shape != true_dur_h.shape or pred_dur_sigma.shape != true_dur_h.shape:
                 raise ValueError(
@@ -366,6 +528,8 @@ class AETLossModule(nn.Module):
         pred_chunk_len_tokens = head_outputs.get("pred_chunk_len_tokens", None)
         pred_chunk_len_hours = head_outputs.get("pred_chunk_len_hours", None)
         if pred_chunk_len_tokens is not None and pred_chunk_len_hours is not None:
+            pred_chunk_len_tokens = torch.nan_to_num(pred_chunk_len_tokens, nan=1.0, posinf=1e6, neginf=1.0)
+            pred_chunk_len_hours = torch.nan_to_num(pred_chunk_len_hours, nan=0.0, posinf=1e6, neginf=0.0)
             chunk_mask, true_chunk_tokens, true_chunk_hours = self._chunk_targets(targets_dict)
             if pred_chunk_len_tokens.shape != true_chunk_tokens.shape or pred_chunk_len_hours.shape != true_chunk_hours.shape:
                 raise ValueError(
@@ -391,6 +555,8 @@ class AETLossModule(nn.Module):
         pred_dt_mu = head_outputs.get("pred_dt_next_mu", None)
         pred_dt_sigma = head_outputs.get("pred_dt_next_sigma", None)
         if pred_dt_mu is not None and pred_dt_sigma is not None:
+            pred_dt_mu = torch.nan_to_num(pred_dt_mu, nan=0.0, posinf=0.0, neginf=0.0)
+            pred_dt_sigma = torch.nan_to_num(pred_dt_sigma, nan=1.0, posinf=1e6, neginf=1.0)
             time_ids = targets_dict.get("time_ids", None)
             attention_mask = targets_dict.get("attention_mask", None)
             token_type_ids = targets_dict.get("token_type_ids", None)
@@ -434,5 +600,14 @@ class AETLossModule(nn.Module):
                     loss_dt = nll[mask].mean()
                     total_loss = total_loss + float(self.weights.get("dt", 0.0)) * loss_dt
                     logs["loss_dt_nll"] = float(loss_dt.item())
+
+        if not torch.isfinite(total_loss):
+            logs["non_finite_total_loss"] = 1.0
+            raise FloatingPointError("AETLossModule produced non-finite total_loss.")
+
+        for key, value in list(logs.items()):
+            if isinstance(value, float) and not math.isfinite(value):
+                logs[key] = 0.0
+                logs["non_finite_log_detected"] = 1.0
 
         return total_loss, logs

@@ -77,6 +77,18 @@ Marker semantics:
 This keeps the global chain at semantic-window granularity while still giving the local
 model a bounded sequence budget.
 
+### 2.3 Generation-time grammar (state machine)
+For constrained autoregressive rollout, marker tokens are handled by an explicit state
+machine (`src/ehr_hier/transformer/generation.py`):
+
+- `inside_chunk`: only non-marker content tokens are legal
+- `chunk_end`: `WIN_CONTINUE` is always legal; `WIN_END`/`WIN_<TYPE>` are legal only when the
+  current position is a semantic boundary candidate
+- `window_end`: only `WIN_<TYPE>` is legal to open the next semantic window
+
+This prevents invalid chains such as emitting `WIN_END` mid-chunk or using chunk overflow as a
+semantic transition signal.
+
 Configuration: `WindowMarkerConfig` (and `vocab_config["window_markers"]` for the model)
 - `type_token_offset`: global token id where `WIN_<TYPE>` starts.
 - `num_types`: number of supported window types.
@@ -120,6 +132,8 @@ Ordering:
 
 These remain `TokenCategory.MEASUREMENT` but use dedicated global-id ranges from
 `vocab_manifest.json` (`observation_code`, `observation_value`).
+The pragmatic v1 routing also sends high-volume chart aliases like `Blood Pressure`
+through this OBS path when they do not map to the numeric cVAE variable map.
 
 ### 3.2 Medications / Diagnoses / Procedures: MedTok-backed codes
 Medications, diagnoses, and procedures are mapped to MedTok vocab ids (from ontology-graph
@@ -145,6 +159,14 @@ Current intended uses:
 - any future scalar attributes that should be modeled as "continuous alongside discrete"
 
 Measurements typically do *not* rely on this side-channel (values are discretized via RVQ).
+
+### 3.4 Global demographic specials + rare-critical OTHER
+To keep timeline length controlled while retaining static context:
+- repeated anthropometric admin events (BMI/weight/height aliases) are handled via
+  **global demographic SPECIAL tokens** (sex, age bucket, BMI bucket) emitted once per subject;
+- collator behavior prefixes SPECIAL tokens to each window/chunk, making them globally attendable;
+- a lightweight clinically informed rare-critical keyword list is routed from `OTHER`
+  into `STRUCTURAL` to avoid dropping high-acuity events.
 
 ## 4) Vocabulary layout: global ids and head routing
 

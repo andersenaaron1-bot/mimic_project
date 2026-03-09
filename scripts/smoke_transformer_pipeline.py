@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import inspect
 import json
 import random
@@ -279,10 +280,18 @@ def main() -> None:
         chunk_is_last=tensor_batch.get("chunk_is_last", None),
     )
     loss, logs = criterion(head_outputs, tensor_batch)
+    if not torch.isfinite(loss):
+        raise FloatingPointError(f"Non-finite smoke loss: {float(loss.detach().cpu().item())}")
+    for k, v in logs.items():
+        if not math.isfinite(float(v)):
+            raise FloatingPointError(f"Non-finite smoke metric: {k}={v}")
+
     loss.backward()
     grad_norm = float(
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0).detach().cpu().item()
     )
+    if not math.isfinite(grad_norm):
+        raise FloatingPointError(f"Non-finite grad_norm: {grad_norm}")
     optim.step()
 
     payload = {
