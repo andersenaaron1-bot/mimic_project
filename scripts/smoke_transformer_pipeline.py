@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
 import random
 import sys
@@ -214,17 +215,21 @@ def main() -> None:
     token_counts: List[int] = []
     for sid in subject_ids:
         _reset_encoders(encoders)
+        timeline_kwargs = {
+            "db": db,
+            "subject_id": int(sid),
+            "encoders": encoders,
+            "structural_codebook": artifacts.structural_codebook,
+            "window_hook_label": "window_boundary",
+            "attach_med_numeric": True,
+            "emit_process_struct_tokens": True,
+            "drop_original_process_marker_tokens": True,
+            "emit_global_demographic_tokens": True,
+            "special_token_offset": 0,
+        }
+        sig = inspect.signature(build_subject_timeline)
         tl = build_subject_timeline(
-            db=db,
-            subject_id=int(sid),
-            encoders=encoders,
-            structural_codebook=artifacts.structural_codebook,
-            window_hook_label="window_boundary",
-            attach_med_numeric=True,
-            emit_process_struct_tokens=True,
-            drop_original_process_marker_tokens=True,
-            emit_global_demographic_tokens=True,
-            special_token_offset=0,
+            **{k: v for k, v in timeline_kwargs.items() if k in sig.parameters}
         )
         if tl:
             timelines.append(tl)
@@ -310,4 +315,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
