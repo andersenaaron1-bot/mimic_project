@@ -18,6 +18,20 @@ class AETIntraWindowAggregator(nn.Module):
     def __init__(self, config, rope_module):
         super().__init__()
         num_layers = int(getattr(config, "num_chunk_layers", 1))
+        self.semantic_summary_mode = str(getattr(config, "semantic_summary_mode", "gated")).lower()
+        if self.semantic_summary_mode not in {"last", "mean", "gated"}:
+            raise ValueError(
+                f"Unsupported semantic_summary_mode={self.semantic_summary_mode!r}; expected one of last|mean|gated"
+            )
+        self.semantic_summary_gate = (
+            nn.Sequential(
+                nn.Linear((2 * config.d_model) + 2, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1),
+            )
+            if self.semantic_summary_mode == "gated"
+            else None
+        )
         self.layers = nn.ModuleList([
             AETGlobalLayer(
                 d_model=config.d_model,
@@ -56,7 +70,30 @@ class AETIntraWindowAggregator(nn.Module):
         last_idx = (n_real - 1).clamp(min=0)
         batch_idx = torch.arange(B, device=chunk_summaries.device)[:, None]
         win_idx = torch.arange(W, device=chunk_summaries.device)[None, :]
-        semantic_summaries = chunk_states[batch_idx, win_idx, last_idx, :]
+        semantic_last = chunk_states[batch_idx, win_idx, last_idx, :]
+        chunk_mask_f = chunk_mask.to(dtype=chunk_states.dtype).unsqueeze(-1)
+        semantic_mean = (chunk_states * chunk_mask_f).sum(dim=2) / chunk_mask_f.sum(dim=2).clamp(min=1.0)
+
+        if self.semantic_summary_mode == "last":
+            semantic_summaries = semantic_last
+        elif self.semantic_summary_mode == "mean":
+            semantic_summaries = semantic_mean
+        else:
+            assert self.semantic_summary_gate is not None
+            valid = chunk_mask.to(dtype=torch.bool)
+            pos_inf = torch.tensor(float("inf"), device=chunk_times.device, dtype=chunk_times.dtype)
+            neg_inf = torch.tensor(float("-inf"), device=chunk_times.device, dtype=chunk_times.dtype)
+            t_first = torch.where(valid, chunk_times, pos_inf).amin(dim=2)
+            t_last = torch.where(valid, chunk_times, neg_inf).amax(dim=2)
+            t_first = torch.where(torch.isfinite(t_first), t_first, torch.zeros_like(t_first))
+            t_last = torch.where(torch.isfinite(t_last), t_last, torch.zeros_like(t_last))
+            duration_h = (t_last - t_first).clamp(min=0.0)
+            n_chunks = chunk_mask.to(dtype=chunk_summaries.dtype).sum(dim=2)
+            meta = torch.stack([torch.log1p(n_chunks), torch.log1p(duration_h)], dim=-1)
+            gate_in = torch.cat([semantic_last, semantic_mean, meta], dim=-1)
+            alpha = torch.sigmoid(self.semantic_summary_gate(gate_in))
+            semantic_summaries = alpha * semantic_last + (1.0 - alpha) * semantic_mean
+
         semantic_summaries = semantic_summaries * (chunk_mask.any(dim=2).unsqueeze(-1))
         return chunk_states, semantic_summaries
 

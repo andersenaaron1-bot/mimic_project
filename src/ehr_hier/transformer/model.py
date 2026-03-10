@@ -153,6 +153,61 @@ class AdaptiveEpisodicTransformer(nn.Module):
             continue_token_id = int(end_token_id) + 1
         return int(continue_token_id) - int(self.special_token_offset)
 
+    def _marker_masks_from_input_ids(self, input_ids: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        type_start = int(self.window_marker_type_offset)
+        num_types = int(self.window_marker_num_types)
+        if num_types > 0:
+            type_end = type_start + num_types
+            type_mask = (input_ids >= type_start) & (input_ids < type_end)
+        else:
+            type_mask = torch.zeros_like(input_ids, dtype=torch.bool)
+
+        end_token_id = (
+            int(self.window_marker_end_token_id)
+            if self.window_marker_end_token_id is not None
+            else int(self.window_marker_type_offset) + int(self.window_marker_num_types)
+        )
+        continue_token_id = (
+            int(self.window_marker_continue_token_id)
+            if self.window_marker_continue_token_id is not None
+            else int(end_token_id) + 1
+        )
+        end_mask = input_ids == int(end_token_id)
+        continue_mask = input_ids == int(continue_token_id)
+        return type_mask, end_mask, continue_mask
+
+    @staticmethod
+    def _chunk_end_positions(attention_mask: torch.Tensor) -> torch.Tensor:
+        """
+        Build a boolean mask with exactly one True at the last valid token of each chunk.
+        Shapes:
+            attention_mask: (B,W,C,L) or (B,W,L)
+            returns: same shape, bool
+        """
+        if attention_mask.ndim == 3:
+            attention_mask = attention_mask.unsqueeze(2)
+            squeeze = True
+        elif attention_mask.ndim == 4:
+            squeeze = False
+        else:
+            raise ValueError(
+                f"attention_mask must be 3D or 4D, got shape {tuple(attention_mask.shape)}"
+            )
+
+        am = attention_mask.to(dtype=torch.bool)
+        B, W, C, L = am.shape
+        out = torch.zeros_like(am, dtype=torch.bool)
+        if L > 0:
+            lengths = am.to(dtype=torch.long).sum(dim=-1)  # (B,W,C)
+            has_any = lengths > 0
+            last_idx = (lengths - 1).clamp(min=0, max=max(0, L - 1))
+            b_idx, w_idx, c_idx = torch.where(has_any)
+            if b_idx.numel() > 0:
+                out[b_idx, w_idx, c_idx, last_idx[b_idx, w_idx, c_idx]] = True
+        if squeeze:
+            out = out.squeeze(2)
+        return out
+
     def forward(
         self,
         input_ids,
@@ -304,6 +359,10 @@ class AdaptiveEpisodicTransformer(nn.Module):
             if token_type_ids is not None:
                 content_mask = content_mask & (token_type_ids != int(getattr(self.config, "special_type_id", 0)))
 
+            marker_type_mask, marker_end_mask, marker_continue_mask = self._marker_masks_from_input_ids(input_ids)
+            marker_any_mask = marker_type_mask | marker_end_mask | marker_continue_mask
+            boundary_positions = self._chunk_end_positions(attention_mask)
+
             pred_len_tokens = logits_dict.get("pred_window_len_tokens", None)
             pred_len_hours = logits_dict.get("pred_window_len_hours", None)
             if pred_len_hours is None:
@@ -346,31 +405,56 @@ class AdaptiveEpisodicTransformer(nn.Module):
             else:
                 chunk_hazard_logit = time_ids.new_zeros((B, W, C, L))
 
-            logits_struct = logits_dict.get("logits_struct", None)
-            if logits_struct is not None:
-                end_mode = self.window_marker_end_mode
-                if end_mode == "next_type" and self.window_marker_num_types > 0 and self.next_window_type_head is not None:
-                    K = int(self.window_marker_num_types)
-                    type_token_ids = self.window_marker_type_offset + torch.arange(K, device=logits_struct.device)
-                    type_local = type_token_ids - int(self.special_token_offset)
-                    valid = (type_local >= 0) & (type_local < int(self.size_special))
-                    if valid.any():
-                        prior = logits_dict.get("logits_next_window_type", None)
-                        if prior is not None and prior.shape[-1] == K:
-                            prior_logp = torch.log_softmax(prior, dim=-1)
-                        else:
-                            prior_logp = logits_struct.new_zeros((B, W, K))
-                        type_local_valid = type_local[valid].to(dtype=torch.long)
-                        bias = hazard_logit.unsqueeze(-1) + (self.transition_prior_scale * prior_logp).unsqueeze(2).unsqueeze(2)
-                        logits_struct[..., type_local_valid] = logits_struct[..., type_local_valid] + bias[..., valid]
-                else:
-                    end_local = self._window_end_token_local_index()
-                    if 0 <= int(end_local) < int(self.size_special):
-                        logits_struct[..., int(end_local)] = logits_struct[..., int(end_local)] + hazard_logit
+            # Localized transition biasing: only at boundary marker positions.
+            if "logits_transition_boundary" in logits_dict and logits_dict["logits_transition_boundary"] is not None:
+                logits_tb = logits_dict["logits_transition_boundary"]
+                last_chunk_boundary = boundary_positions & chunk_is_last.to(dtype=torch.bool).unsqueeze(-1)
+                nonlast_chunk_boundary = (
+                    boundary_positions
+                    & chunk_mask.to(dtype=torch.bool).unsqueeze(-1)
+                    & ~chunk_is_last.to(dtype=torch.bool).unsqueeze(-1)
+                )
 
-                continue_local = self._window_continue_token_local_index()
-                if 0 <= int(continue_local) < int(self.size_special):
-                    logits_struct[..., int(continue_local)] = logits_struct[..., int(continue_local)] + chunk_hazard_logit
+                end_candidates = marker_end_mask | marker_type_mask
+                continue_candidates = marker_continue_mask
+
+                end_apply = (last_chunk_boundary & end_candidates & marker_any_mask).to(dtype=logits_tb.dtype)
+                cont_apply = (nonlast_chunk_boundary & continue_candidates & marker_any_mask).to(dtype=logits_tb.dtype)
+
+                logits_tb[..., 1] = logits_tb[..., 1] + (hazard_logit * end_apply)
+                logits_tb[..., 0] = logits_tb[..., 0] + (chunk_hazard_logit * cont_apply)
+                logits_dict["logits_transition_boundary"] = logits_tb
+
+            if (
+                self.window_marker_end_mode == "next_type"
+                and self.window_marker_num_types > 0
+                and self.next_window_type_head is not None
+                and "logits_boundary_next_window_type" in logits_dict
+                and logits_dict["logits_boundary_next_window_type"] is not None
+            ):
+                logits_bnt = logits_dict["logits_boundary_next_window_type"]  # (B,W,C,L,K)
+                K = int(self.window_marker_num_types)
+                prior = logits_dict.get("logits_next_window_type", None)
+                if prior is not None and prior.shape[-1] == K:
+                    prior_logp = torch.log_softmax(prior, dim=-1)
+                else:
+                    prior_logp = logits_bnt.new_zeros((B, W, K))
+
+                type_boundary = (
+                    boundary_positions
+                    & chunk_is_last.to(dtype=torch.bool).unsqueeze(-1)
+                    & marker_type_mask
+                ).to(dtype=logits_bnt.dtype)  # (B,W,C,L)
+
+                if type_boundary.any():
+                    logits_bnt = logits_bnt + (
+                        type_boundary.unsqueeze(-1)
+                        * (
+                            hazard_logit.unsqueeze(-1)
+                            + (self.transition_prior_scale * prior_logp).unsqueeze(2).unsqueeze(2)
+                        )
+                    )
+                    logits_dict["logits_boundary_next_window_type"] = logits_bnt
 
         for key, value in list(logits_dict.items()):
             if torch.is_tensor(value):
@@ -398,6 +482,8 @@ class AdaptiveEpisodicTransformer(nn.Module):
                 "pred_values",
                 "pred_dt_next_mu",
                 "pred_dt_next_sigma",
+                "logits_transition_boundary",
+                "logits_boundary_next_window_type",
             ):
                 if key in logits_dict and logits_dict[key] is not None:
                     logits_dict[key] = logits_dict[key].squeeze(2)

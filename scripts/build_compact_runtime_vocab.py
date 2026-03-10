@@ -48,10 +48,6 @@ def _parse_csv_set(text: str | None) -> set[str]:
 
 
 def _maybe_print_progress(*, idx: int, total: int, every: int, started_at: float) -> None:
-    if every <= 0:
-        return
-    if idx != total and idx % every != 0:
-        return
     elapsed = max(0.0, time.time() - started_at)
     rate = float(idx) / elapsed if elapsed > 0 else 0.0
     remaining = (float(total - idx) / rate) if rate > 0 else float("inf")
@@ -284,6 +280,8 @@ def main() -> None:
     total = len(subject_ids)
     total_tokens = 0
     unmatched_tokens = 0
+    progress_every = int(args.progress_every)
+    next_progress = progress_every if progress_every > 0 else None
     workers = int(args.workers)
     chunk_size = max(1, int(args.subject_chunk_size))
     subject_chunks = _chunk_subjects(subject_ids, chunk_size)
@@ -305,12 +303,14 @@ def main() -> None:
             obs = dict(res.get("observed_ids_by_block", {}))
             for name, vals in obs.items():
                 observed_ids_by_block[str(name)].update(int(v) for v in vals)
-            _maybe_print_progress(
-                idx=done_subjects,
-                total=total,
-                every=int(args.progress_every),
-                started_at=started_at,
-            )
+            while next_progress is not None and done_subjects >= next_progress and next_progress < total:
+                _maybe_print_progress(
+                    idx=next_progress,
+                    total=total,
+                    every=progress_every,
+                    started_at=started_at,
+                )
+                next_progress += progress_every
     else:
         payload = {
             "args": vars(args),
@@ -329,12 +329,21 @@ def main() -> None:
                 obs = dict(res.get("observed_ids_by_block", {}))
                 for name, vals in obs.items():
                     observed_ids_by_block[str(name)].update(int(v) for v in vals)
-                _maybe_print_progress(
-                    idx=done_subjects,
-                    total=total,
-                    every=int(args.progress_every),
-                    started_at=started_at,
-                )
+                while next_progress is not None and done_subjects >= next_progress and next_progress < total:
+                    _maybe_print_progress(
+                        idx=next_progress,
+                        total=total,
+                        every=progress_every,
+                        started_at=started_at,
+                    )
+                    next_progress += progress_every
+
+    _maybe_print_progress(
+        idx=done_subjects,
+        total=total,
+        every=progress_every,
+        started_at=started_at,
+    )
 
     preserve_full_blocks = _parse_csv_set(args.preserve_full_blocks)
     compact_vocab_config, compact_remapper = build_compact_runtime_vocab_and_remapper(

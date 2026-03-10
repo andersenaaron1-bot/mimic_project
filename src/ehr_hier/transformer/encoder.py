@@ -266,15 +266,25 @@ class AETCausalAttention(nn.Module):
             attn_weights = attn_weights.masked_fill(extended_mask == 0, float('-inf'))
 
         attn_weights = F.softmax(attn_weights, dim=-1)
+        # Fully padded rows can produce all -inf before softmax; sanitize to avoid NaN
+        # propagation through the residual stream.
+        attn_weights = torch.nan_to_num(attn_weights, nan=0.0, posinf=0.0, neginf=0.0)
+        if attention_mask is not None:
+            q_mask = attention_mask[:, None, :, None].to(dtype=attn_weights.dtype)  # (B,1,S,1)
+            attn_weights = attn_weights * q_mask
         attn_weights = self.dropout(attn_weights)
 
         # 5. Output
         out = torch.matmul(attn_weights, v)  # (B, H, S, d_h)
         out = out.transpose(1, 2).contiguous().view(B, S, D)
+        q_mask_bool = None
         if attention_mask is not None:
-            q_mask = attention_mask.to(dtype=out.dtype)[:, :, None]  # (B,S,1)
-            out = out * q_mask
-        return self.out_proj(out)
+            q_mask_bool = attention_mask[:, :, None].to(dtype=torch.bool)  # (B,S,1)
+            out = torch.where(q_mask_bool, out, torch.zeros_like(out))
+        out = self.out_proj(out)
+        if q_mask_bool is not None:
+            out = torch.where(q_mask_bool, out, torch.zeros_like(out))
+        return out
 
 
 class AETEncoderLayer(nn.Module):
@@ -346,6 +356,16 @@ class AETLocalEncoder(nn.Module):
             getattr(config, "summary_num_queries", getattr(config, "num_summary_queries", 1))
         )
         self.summary_query_use_category_masks = bool(getattr(config, "summary_query_use_category_masks", True))
+        self.summary_fuse_terminal = bool(getattr(config, "summary_fuse_terminal", True))
+        self.summary_terminal_fuser = (
+            nn.Sequential(
+                nn.Linear(2 * config.d_model, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, 1),
+            )
+            if self.summary_fuse_terminal
+            else None
+        )
 
         if self.summary_num_queries <= 1:
             self.summary_pooler = WindowAttentionPooler(
@@ -483,6 +503,15 @@ class AETLocalEncoder(nn.Module):
                 window_summaries_flat[is_real_window] = self.summary_combine(
                     summaries_multi.reshape(summaries_multi.shape[0], self.summary_num_queries * D)
                 )
+
+        if self.summary_fuse_terminal and self.summary_terminal_fuser is not None and is_real_window.any():
+            lengths = mask_bool.to(dtype=torch.long).sum(dim=-1).clamp(min=1)
+            term_idx = (lengths - 1).clamp(min=0, max=max(0, L - 1))
+            row_idx = torch.nonzero(is_real_window, as_tuple=False).squeeze(-1)
+            terminal = x_flat[row_idx, term_idx[row_idx], :]  # (N_real, D)
+            pooled = window_summaries_flat[row_idx]  # (N_real, D)
+            alpha = torch.sigmoid(self.summary_terminal_fuser(torch.cat([pooled, terminal], dim=-1)))  # (N_real,1)
+            window_summaries_flat[row_idx] = alpha * terminal + (1.0 - alpha) * pooled
 
         if self.enable_window_meta and self.window_meta_proj is not None and self.window_meta_scale is not None:
             # Window-level features to help global transition modeling (and biasing).
