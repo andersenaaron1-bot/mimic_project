@@ -2,6 +2,7 @@ from __future__ import annotations
 import ast
 import re
 import zlib
+from dataclasses import dataclass
 from typing import Dict, List, Any, Optional, Iterable, Callable
 
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
@@ -25,6 +26,21 @@ _MED_ACTION_SUFFIXES = {
     "PAUSED",
     "RESUMED",
 }
+
+EXPLICIT_MEDTOK_RESOLUTION_STAGES = (
+    "exact",
+    "canonicalized",
+    "parent_lookup",
+    "lexical_bridge",
+)
+
+
+@dataclass(frozen=True)
+class MedTokResolution:
+    base_gid: Optional[int]
+    stage: str
+    matched_code: Optional[str] = None
+    source_code: Optional[str] = None
 
 
 def _normalize_lexical_key(raw: object) -> str:
@@ -161,7 +177,7 @@ class MedTokenWithAttrsEncoder:
         )
         self.residual_fallback_buckets = max(1, int(residual_fallback_buckets))
         self.unk_gid = self.base_vocab.offset + self.base_vocab.unk_id
-        self._cache: Dict[str, Optional[int]] = {}
+        self._cache: Dict[str, MedTokResolution] = {}
         self._lexical_bridge: Dict[str, str] = {}
         # START/END/STOP markers from MEDS-style medication/infusion/procedure events
         self._marker_attr = "event_marker"
@@ -312,6 +328,20 @@ class MedTokenWithAttrsEncoder:
         return out
 
     @staticmethod
+    def _dedupe_strs(values: Iterable[object]) -> List[str]:
+        seen = set()
+        out: List[str] = []
+        for value in values:
+            if value is None:
+                continue
+            s = str(value).strip()
+            if not s or s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
+    @staticmethod
     def _stable_bucket(raw: str, buckets: int) -> int:
         data = str(raw).encode("utf-8", errors="ignore")
         return 1 + (zlib.crc32(data) % max(1, int(buckets)))
@@ -323,78 +353,153 @@ class MedTokenWithAttrsEncoder:
         hi = lo + int(self.residual_fallback_buckets)
         return lo <= int(gid) <= hi
 
-    def _candidate_codes(
+    def _exact_candidates(
         self,
         base_code: Optional[str],
         raw_code: Optional[str],
-        *,
+    ) -> List[str]:
+        return self._dedupe_strs([base_code, raw_code])
+
+    def _canonical_candidates(
+        self,
+        base_code: Optional[str],
+        raw_code: Optional[str],
+    ) -> List[str]:
+        if self.canonicalize_fn is None:
+            return []
+        out: List[str] = []
+        seen = set()
+        for src in self._dedupe_strs([base_code, raw_code]):
+            for cand in ensure_list(self.canonicalize_fn(src)):
+                cand_str = str(cand).strip()
+                if not cand_str or cand_str in seen:
+                    continue
+                seen.add(cand_str)
+                out.append(cand_str)
+        return out
+
+    def _parent_candidates(
+        self,
         parent_codes: Optional[Iterable[str]] = None,
     ) -> List[str]:
-        if base_code is None and raw_code is None:
+        if not parent_codes:
             return []
-        candidates: List[str] = []
-
-        def _extend_for(src: Optional[str]) -> None:
-            if src is None:
-                return
-            if self.canonicalize_fn:
-                canonicalized = self.canonicalize_fn(src)
-                candidates.extend(ensure_list(canonicalized))
-            if self.fallback_to_raw:
-                candidates.append(str(src))
-
-        # Prefer parent ontology link if present, then regular code path.
-        for pc in list(parent_codes or []):
-            _extend_for(pc)
-        canon_input = base_code if base_code is not None else raw_code
-        _extend_for(canon_input)
-        if self.fallback_to_raw and raw_code is not None and raw_code != canon_input:
-            candidates.append(str(raw_code))
-
-        # dedupe while preserving order
+        out: List[str] = []
         seen = set()
-        uniq = []
-        for c in candidates:
-            if c in seen:
+        for src in self._dedupe_strs(parent_codes):
+            if src not in seen:
+                seen.add(src)
+                out.append(src)
+            if self.canonicalize_fn is None:
                 continue
-            uniq.append(c)
-            seen.add(c)
-
-        if self._lexical_bridge:
-            for c in list(uniq):
-                key = _normalize_lexical_key(c)
-                if not key:
+            for cand in ensure_list(self.canonicalize_fn(src)):
+                cand_str = str(cand).strip()
+                if not cand_str or cand_str in seen:
                     continue
-                bridged = self._lexical_bridge.get(key)
-                if bridged and bridged not in seen:
-                    uniq.append(bridged)
-                    seen.add(bridged)
-        return uniq
+                seen.add(cand_str)
+                out.append(cand_str)
+        return out
 
-    def _encode_base(
+    def _resolve_bridge(
+        self,
+        candidates: Iterable[str],
+        *,
+        seen_candidates: Optional[set[str]] = None,
+    ) -> Optional[MedTokResolution]:
+        if not self._lexical_bridge:
+            return None
+        for cand in self._dedupe_strs(candidates):
+            key = _normalize_lexical_key(cand)
+            if not key:
+                continue
+            bridged = self._lexical_bridge.get(key)
+            if not bridged:
+                continue
+            if seen_candidates is not None and bridged in seen_candidates:
+                continue
+            gid = self.base_vocab.maybe_encode(bridged)
+            if gid is None:
+                continue
+            return MedTokResolution(
+                base_gid=gid,
+                stage="lexical_bridge",
+                matched_code=bridged,
+                source_code=cand,
+            )
+        return None
+
+    def resolve_code(
         self,
         base_code: Optional[str],
         raw_code: Optional[str],
         *,
         parent_codes: Optional[Iterable[str]] = None,
-    ) -> Optional[int]:
+    ) -> MedTokResolution:
         if base_code is None and raw_code is None:
-            return None if self.drop_unknowns else self.unk_gid
+            if self.drop_unknowns:
+                return MedTokResolution(base_gid=None, stage="drop")
+            return MedTokResolution(base_gid=self.unk_gid, stage="unk")
 
         parent_key = "|".join(sorted(str(x) for x in (parent_codes or [])))
-        cache_key = f"{raw_code}||{parent_key}"
+        cache_key = f"{base_code}||{raw_code}||{parent_key}"
         if cache_key in self._cache:
             return self._cache[cache_key]
 
-        for cand in self._candidate_codes(base_code, raw_code, parent_codes=parent_codes):
-            gid = self.base_vocab.maybe_encode(cand)
-            if gid is not None:
-                self._cache[cache_key] = gid
-                return gid
+        seen_candidates: set[str] = set()
+
+        def _resolve_stage(stage: str, candidates: Iterable[str]) -> Optional[MedTokResolution]:
+            for cand in self._dedupe_strs(candidates):
+                seen_candidates.add(cand)
+                gid = self.base_vocab.maybe_encode(cand)
+                if gid is None:
+                    continue
+                return MedTokResolution(
+                    base_gid=gid,
+                    stage=stage,
+                    matched_code=cand,
+                    source_code=cand,
+                )
+            return None
+
+        exact = _resolve_stage("exact", self._exact_candidates(base_code, raw_code))
+        if exact is not None:
+            self._cache[cache_key] = exact
+            return exact
+
+        canonical_seen = set(seen_candidates)
+        canonical = _resolve_stage(
+            "canonicalized",
+            [cand for cand in self._canonical_candidates(base_code, raw_code) if cand not in canonical_seen],
+        )
+        if canonical is not None:
+            self._cache[cache_key] = canonical
+            return canonical
+
+        parent_seen = set(seen_candidates)
+        parent = _resolve_stage(
+            "parent_lookup",
+            [cand for cand in self._parent_candidates(parent_codes) if cand not in parent_seen],
+        )
+        if parent is not None:
+            self._cache[cache_key] = parent
+            return parent
+
+        bridge_inputs = self._dedupe_strs(
+            [
+                *(self._exact_candidates(base_code, raw_code)),
+                *(self._canonical_candidates(base_code, raw_code)),
+                *(self._parent_candidates(parent_codes)),
+            ]
+        )
+        bridge = self._resolve_bridge(bridge_inputs, seen_candidates=seen_candidates)
+        if bridge is not None:
+            self._cache[cache_key] = bridge
+            return bridge
 
         if self.drop_unknowns:
-            self._cache[cache_key] = None
-            return None
+            dropped = MedTokResolution(base_gid=None, stage="drop")
+            self._cache[cache_key] = dropped
+            return dropped
 
         if self.residual_fallback_offset is not None:
             seed = str(base_code if base_code is not None else raw_code)
@@ -402,11 +507,31 @@ class MedTokenWithAttrsEncoder:
                 seed,
                 int(self.residual_fallback_buckets),
             )
-            self._cache[cache_key] = fallback_gid
-            return fallback_gid
+            residual = MedTokResolution(
+                base_gid=fallback_gid,
+                stage="residual",
+                matched_code=None,
+                source_code=seed,
+            )
+            self._cache[cache_key] = residual
+            return residual
 
-        self._cache[cache_key] = self.unk_gid
-        return self.unk_gid
+        unk = MedTokResolution(
+            base_gid=self.unk_gid,
+            stage="unk",
+            matched_code=self.base_vocab.unk_token,
+            source_code=str(base_code if base_code is not None else raw_code),
+        )
+        self._cache[cache_key] = unk
+        return unk
+
+    def resolve_event(self, ev: Any) -> MedTokResolution:
+        raw_code = getattr(ev, "code", None)
+        base_code, _ = self._strip_marker(raw_code)
+        parent_codes = self._iter_parent_codes(ev)
+        parent_codes.extend(self._lookup_parent_codes(raw_code=raw_code, base_code=base_code))
+        parent_codes = list(dict.fromkeys(parent_codes))
+        return self.resolve_code(base_code, raw_code, parent_codes=parent_codes)
 
     def _encode_categorical_attrs(self, ev: Any) -> Dict[str, int]:
         cat_attrs: Dict[str, int] = {}
@@ -429,7 +554,8 @@ class MedTokenWithAttrsEncoder:
         parent_codes.extend(self._lookup_parent_codes(raw_code=raw_code, base_code=base_code))
         # de-dupe preserving order
         parent_codes = list(dict.fromkeys(parent_codes))
-        base_gid = self._encode_base(base_code, raw_code, parent_codes=parent_codes)
+        resolution = self.resolve_code(base_code, raw_code, parent_codes=parent_codes)
+        base_gid = resolution.base_gid
         if base_gid is None:
             return []
         cat_attrs = self._encode_categorical_attrs(ev)

@@ -43,7 +43,6 @@ from src.ehr_hier.tokenizers.medtok_canonicalize import (
     canonicalize_medication_code,
     canonicalize_procedure_code,
     diagnosis_filter,
-    ensure_list,
     medication_filter,
     procedure_filter,
 )
@@ -53,7 +52,11 @@ from src.ehr_hier.tokenizers.medtok_loader import (
     load_attr_vocab,
     load_medtok_vocab,
 )
-from src.ehr_hier.tokenizers.medtok_attr_encoder import load_parent_lookup_from_codes_parquet
+from src.ehr_hier.tokenizers.medtok_attr_encoder import (
+    EXPLICIT_MEDTOK_RESOLUTION_STAGES,
+    MedTokenWithAttrsEncoder,
+    load_parent_lookup_from_codes_parquet,
+)
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
 
@@ -300,13 +303,42 @@ def _is_finite_numeric(value: object) -> bool:
     return math.isfinite(fv)
 
 
-def _has_medtok_match(raw_code: object, vocab: CategoryVocab, canonicalize_fn) -> bool:
-    if raw_code is None:
-        return False
-    for cand in ensure_list(canonicalize_fn(raw_code)):
-        if vocab.maybe_encode(cand) is not None:
-            return True
-    return False
+def _build_semantic_resolution_encoders(
+    *,
+    artifacts: AuditArtifacts,
+    residual_enabled: bool,
+    residual_buckets: int,
+    residual_offsets: Mapping[str, int],
+) -> Dict[str, MedTokenWithAttrsEncoder]:
+    diag_residual = int(residual_offsets["diagnosis"]) if residual_enabled and "diagnosis" in residual_offsets else None
+    proc_residual = int(residual_offsets["procedure"]) if residual_enabled and "procedure" in residual_offsets else None
+    med_residual = int(residual_offsets["medication"]) if residual_enabled and "medication" in residual_offsets else None
+    return {
+        "diagnosis": MedTokenWithAttrsEncoder(
+            TokenCategory.DIAGNOSIS,
+            artifacts.diag_vocab,
+            canonicalize_fn=canonicalize_diagnosis_code,
+            parent_lookup=artifacts.medtok_parent_lookup,
+            residual_fallback_offset=diag_residual,
+            residual_fallback_buckets=int(residual_buckets),
+        ),
+        "procedure": MedTokenWithAttrsEncoder(
+            TokenCategory.PROCEDURE,
+            artifacts.proc_vocab,
+            canonicalize_fn=canonicalize_procedure_code,
+            parent_lookup=artifacts.medtok_parent_lookup,
+            residual_fallback_offset=proc_residual,
+            residual_fallback_buckets=int(residual_buckets),
+        ),
+        "medication": MedTokenWithAttrsEncoder(
+            TokenCategory.MEDICATION,
+            artifacts.med_vocab,
+            canonicalize_fn=canonicalize_medication_code,
+            parent_lookup=artifacts.medtok_parent_lookup,
+            residual_fallback_offset=med_residual,
+            residual_fallback_buckets=int(residual_buckets),
+        ),
+    }
 
 
 def _is_expected_process_reroute(raw_code: object, category: TokenCategory) -> bool:
@@ -462,6 +494,7 @@ def _summarize_raw_subjects(
     subject_ids: List[int],
     *,
     artifacts: AuditArtifacts,
+    semantic_resolvers: Mapping[str, MedTokenWithAttrsEncoder],
     top_k: int,
     progress_every: int = 0,
 ) -> tuple[Dict[str, Any], set[str]]:
@@ -472,6 +505,11 @@ def _summarize_raw_subjects(
     marker_counts = Counter()
     measurement_status = Counter()
     medtok_hits: Dict[str, Counter[str]] = {
+        "diagnosis": Counter(),
+        "procedure": Counter(),
+        "medication": Counter(),
+    }
+    medtok_resolution_stages: Dict[str, Counter[str]] = {
         "diagnosis": Counter(),
         "procedure": Counter(),
         "medication": Counter(),
@@ -527,19 +565,25 @@ def _summarize_raw_subjects(
                 else:
                     measurement_status["measurement_ok"] += 1
             elif category == TokenCategory.DIAGNOSIS:
-                if _has_medtok_match(code, artifacts.diag_vocab, canonicalize_diagnosis_code):
+                resolution = semantic_resolvers["diagnosis"].resolve_event(ev)
+                medtok_resolution_stages["diagnosis"][resolution.stage] += 1
+                if resolution.stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
                     medtok_hits["diagnosis"]["hit"] += 1
                 else:
                     medtok_hits["diagnosis"]["miss"] += 1
                     medtok_miss_samples["diagnosis"][code_str] += 1
             elif category == TokenCategory.PROCEDURE:
-                if _has_medtok_match(code, artifacts.proc_vocab, canonicalize_procedure_code):
+                resolution = semantic_resolvers["procedure"].resolve_event(ev)
+                medtok_resolution_stages["procedure"][resolution.stage] += 1
+                if resolution.stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
                     medtok_hits["procedure"]["hit"] += 1
                 else:
                     medtok_hits["procedure"]["miss"] += 1
                     medtok_miss_samples["procedure"][code_str] += 1
             elif category == TokenCategory.MEDICATION:
-                if _has_medtok_match(code, artifacts.med_vocab, canonicalize_medication_code):
+                resolution = semantic_resolvers["medication"].resolve_event(ev)
+                medtok_resolution_stages["medication"][resolution.stage] += 1
+                if resolution.stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
                     medtok_hits["medication"]["hit"] += 1
                 else:
                     medtok_hits["medication"]["miss"] += 1
@@ -574,6 +618,9 @@ def _summarize_raw_subjects(
         "numeric_events_by_category": _as_plain_counter(numeric_by_category),
         "measurement_status": _as_plain_counter(measurement_status),
         "medtok_hits": {k: _as_plain_counter(v) for k, v in medtok_hits.items()},
+        "medtok_resolution_stages": {
+            k: _as_plain_counter(v) for k, v in medtok_resolution_stages.items()
+        },
         "top_prefixes": _top_counter(prefix_counts, top_k),
         "top_other_codes": _top_counter(other_codes, top_k),
         "top_codes_by_category": {
@@ -723,6 +770,7 @@ def _audit_subject_tokenization(
         if is_process_reroute:
             process_reroute_events_by_category[category.name] += 1
         encoder = encoders.get(category)
+        resolution_stage: Optional[str] = None
 
         t = getattr(ev_view, "time", None)
         dt_hours = 0.0
@@ -760,6 +808,12 @@ def _audit_subject_tokenization(
             last_emitted_time = t if emitted_for_event > 0 and t is not None else last_emitted_time
             continue
 
+        if (
+            category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}
+            and hasattr(encoder, "resolve_event")
+        ):
+            resolution_stage = str(encoder.resolve_event(ev_view).stage)
+
         toks = encoder.encode_event(ev_view, dt_hours=dt_hours)
         if toks:
             emitted_for_event += len(toks)
@@ -768,17 +822,29 @@ def _audit_subject_tokenization(
             bundle_sizes_by_category[category.name][emitted_for_event] += 1
             base_tok = toks[0]
             unk_gid = getattr(encoder, "unk_gid", None)
-            if unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
+            if resolution_stage == "unk" or (
+                resolution_stage is None
+                and unk_gid is not None
+                and int(base_tok.value_id) == int(unk_gid)
+            ):
                 unknown_base_tokens_by_category[category.name] += 1
             if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
                 if is_process_reroute:
                     semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
-                elif unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
-                    semantic_base_outcomes_by_category[category.name]["unknown_base"] += 1
+                elif resolution_stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
+                    semantic_base_outcomes_by_category[category.name][str(resolution_stage)] += 1
+                elif resolution_stage == "residual":
+                    semantic_base_outcomes_by_category[category.name]["residual"] += 1
+                elif resolution_stage == "unk":
+                    semantic_base_outcomes_by_category[category.name]["unk"] += 1
+                elif resolution_stage == "drop":
+                    semantic_base_outcomes_by_category[category.name]["drop"] += 1
                 elif int(base_tok.cat_attrs.get("residual_fallback", 0) or 0) == 1:
-                    semantic_base_outcomes_by_category[category.name]["residual_base"] += 1
+                    semantic_base_outcomes_by_category[category.name]["residual"] += 1
+                elif unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
+                    semantic_base_outcomes_by_category[category.name]["unk"] += 1
                 else:
-                    semantic_base_outcomes_by_category[category.name]["medtok_base"] += 1
+                    semantic_base_outcomes_by_category[category.name]["exact"] += 1
             if t is not None:
                 last_emitted_time = t
         else:
@@ -798,6 +864,8 @@ def _audit_subject_tokenization(
                 if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
                     if is_process_reroute:
                         semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
+                    elif resolution_stage == "drop":
+                        semantic_base_outcomes_by_category[category.name]["drop"] += 1
                     else:
                         semantic_base_outcomes_by_category[category.name]["dropped_or_no_encoder"] += 1
 
@@ -1190,9 +1258,14 @@ def _summarize_tokenization_and_collation(
         raw_total = int(raw_events_by_category.get(cat_name, 0))
         process_reroute = int(process_reroute_events_by_category.get(cat_name, 0))
         semantic_total = max(0, raw_total - process_reroute)
-        medtok_base = int(outcomes.get("medtok_base", 0))
-        residual_base = int(outcomes.get("residual_base", 0))
-        unknown_base = int(outcomes.get("unknown_base", 0))
+        exact = int(outcomes.get("exact", 0))
+        canonicalized = int(outcomes.get("canonicalized", 0))
+        parent_lookup = int(outcomes.get("parent_lookup", 0))
+        lexical_bridge = int(outcomes.get("lexical_bridge", 0))
+        medtok_base = exact + canonicalized + parent_lookup + lexical_bridge
+        residual_base = int(outcomes.get("residual", 0))
+        unknown_base = int(outcomes.get("unk", 0))
+        drop = int(outcomes.get("drop", 0))
         dropped = int(outcomes.get("dropped_or_no_encoder", 0))
         structural_only = int(outcomes.get("structural_only", 0))
         mapped = medtok_base + residual_base
@@ -1200,10 +1273,15 @@ def _summarize_tokenization_and_collation(
             "raw_total": raw_total,
             "process_reroute": process_reroute,
             "semantic_total": semantic_total,
-            "medtok_base": medtok_base,
-            "residual_base": residual_base,
+            "exact": exact,
+            "canonicalized": canonicalized,
+            "parent_lookup": parent_lookup,
+            "lexical_bridge": lexical_bridge,
+            "explicit_medtok_base": medtok_base,
+            "residual": residual_base,
             "mapped_non_unk": mapped,
-            "unknown_base": unknown_base,
+            "unk": unknown_base,
+            "drop": drop,
             "dropped_or_no_encoder": dropped,
             "structural_only": structural_only,
             "mapped_rate_over_semantic_total": (
@@ -1268,6 +1346,7 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Raw events by category:", raw["events_by_category"])
     print("Measurement status:", raw.get("measurement_status", {}))
     print("MedTok hits:", raw.get("medtok_hits", {}))
+    print("MedTok resolution stages:", raw.get("medtok_resolution_stages", {}))
     print("Top prefixes:")
     for row in raw["top_prefixes"][:top_k]:
         print(f"  {row['key']}: {row['count']}")
@@ -1347,6 +1426,12 @@ def main() -> None:
         args,
         tokenization_contract=tokenization_contract,
     )
+    semantic_resolvers = _build_semantic_resolution_encoders(
+        artifacts=artifacts,
+        residual_enabled=bool(residual_enabled),
+        residual_buckets=int(residual_buckets),
+        residual_offsets=dict(residual_offsets),
+    )
     db = mr.SubjectDatabase(args.meds_reader_db)
     subject_ids = _parse_subject_ids(args.subject_ids)
     if not subject_ids:
@@ -1368,6 +1453,7 @@ def main() -> None:
             "numeric_events_by_category": {},
             "measurement_status": {},
             "medtok_hits": {},
+            "medtok_resolution_stages": {},
             "top_prefixes": [],
             "top_other_codes": [],
             "top_codes_by_category": {},
@@ -1383,6 +1469,7 @@ def main() -> None:
             db,
             subject_ids,
             artifacts=artifacts,
+            semantic_resolvers=semantic_resolvers,
             top_k=args.top_k,
             progress_every=args.progress_every,
         )

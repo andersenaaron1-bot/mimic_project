@@ -8,6 +8,18 @@ It is intentionally concrete and path-specific. Update it whenever the active LR
 - Preserve the current successful MEDS/meds_reader state on LRZ.
 - Use the measurement cVAE results as evidence for routing decisions, not as a reason to force all numeric-valued events through a single encoder.
 
+## Pinned tokenization cleanup plan
+- The active ticket order is pinned in `MEDTOK_CODE_SYSTEM_CONTRACT.md`.
+- Current implementation focus:
+  - step 1: freeze the MedTok code-system contract
+  - step 2: audit exact MedTok resolution stages from the live encoder path
+  - step 3: refactor the structural family to use real emitted structural events
+  - step 4: keep window markers independent from structural-token OOVs
+  - step 5: collapse sparse/base vocab sources into one generated spec
+  - step 6: derive dense/runtime vocab only from the sparse spec plus observed-id compaction
+  - step 7: remove smoke-vocab fallthrough from production tokenization
+  - step 8: add one tokenization freeze audit gate before the first transformer run
+
 ## Active LRZ artifact paths
 - DSS base:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2`

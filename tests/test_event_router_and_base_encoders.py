@@ -4,7 +4,7 @@ from typing import Dict
 
 import pytest
 
-from src.ehr_hier.data.event_router import classify_code_to_category
+from src.ehr_hier.data.event_router import classify_code_to_category, is_rare_critical_other_code
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 import src.ehr_hier.tokenizers.base_encoder as base_encoder
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
@@ -14,16 +14,24 @@ from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
     "code,expected",
     [
         ("LAB//GLUCOSE", TokenCategory.MEASUREMENT),
+        ("Blood Pressure", TokenCategory.MEASUREMENT),
+        ("BMI (kg/m2)", TokenCategory.OTHER),
         ("ICD10PCS//0JH", TokenCategory.PROCEDURE),
         ("ICD10CM//A000", TokenCategory.DIAGNOSIS),
         ("NDC//1234-5678", TokenCategory.MEDICATION),
         ("HOSPITAL_ADMISSION", TokenCategory.STRUCTURAL),
+        ("Event//Code Blue activated", TokenCategory.STRUCTURAL),
         ("UNKNOWN_PREFIX//X", TokenCategory.OTHER),
         (None, TokenCategory.OTHER),
     ],
 )
 def test_classify_code_to_category_handles_common_prefixes(code, expected):
     assert classify_code_to_category(code) == expected
+
+
+def test_rare_critical_detection_only_for_other_surface():
+    assert is_rare_critical_other_code("Event//Code Blue activated")
+    assert not is_rare_critical_other_code("LAB//CPR")
 
 
 def _dummy_encoders(monkeypatch, drop_unknowns: bool) -> Dict[TokenCategory, object]:
@@ -70,6 +78,8 @@ def _dummy_encoders(monkeypatch, drop_unknowns: bool) -> Dict[TokenCategory, obj
 def test_base_encoders_emit_unk_instead_of_drop(monkeypatch):
     enc = _dummy_encoders(monkeypatch, drop_unknowns=False)
     diag_enc = enc[TokenCategory.DIAGNOSIS]
+    resolution = diag_enc.resolve_event(SimpleNamespace(code="ICD10CM//ZZZ"))
+    assert resolution.stage == "unk"
     out = diag_enc.encode_event(SimpleNamespace(code="ICD10CM//ZZZ"), dt_hours=1.5)
     assert out, "Unknown diagnosis codes should map to UNK token, not be dropped"
     assert out[0].value_id == enc[TokenCategory.DIAGNOSIS].base_vocab.offset + enc[TokenCategory.DIAGNOSIS].base_vocab.unk_id
@@ -78,6 +88,8 @@ def test_base_encoders_emit_unk_instead_of_drop(monkeypatch):
 def test_base_encoders_can_drop_unknowns_when_requested(monkeypatch):
     enc = _dummy_encoders(monkeypatch, drop_unknowns=True)
     diag_enc = enc[TokenCategory.DIAGNOSIS]
+    resolution = diag_enc.resolve_event(SimpleNamespace(code="ICD10CM//ZZZ"))
+    assert resolution.stage == "drop"
     out = diag_enc.encode_event(SimpleNamespace(code="ICD10CM//ZZZ"), dt_hours=1.5)
     assert out == []
 
@@ -118,6 +130,10 @@ def test_medication_residual_fallback_enabled(monkeypatch):
         SimpleNamespace(code="MEDICATION//Acetaminophen//Administered"),
         dt_hours=0.0,
     )
+    resolution = med_enc.resolve_event(
+        SimpleNamespace(code="MEDICATION//Acetaminophen//Administered")
+    )
+    assert resolution.stage == "residual"
     assert out, "Unknown medication should emit a residual fallback token when enabled"
     tok = out[0]
     assert tok.value_id != med_vocab.offset + med_vocab.unk_id

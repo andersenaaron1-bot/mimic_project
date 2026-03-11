@@ -186,6 +186,63 @@ def test_canonicalizers_basic():
     assert "ACETAMINOPHEN" in med_name_cands
 
 
+def test_medtok_resolution_stages_basic(tiny_vocabs):
+    diag_vocab, _proc_vocab, med_vocab, _struct_vocab, _med_attr_vocabs, _med_numeric_attrs = tiny_vocabs
+
+    diag_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.DIAGNOSIS,
+        diag_vocab,
+        canonicalize_fn=canonicalize_diagnosis_code,
+    )
+    med_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.MEDICATION,
+        med_vocab,
+        canonicalize_fn=canonicalize_medication_code,
+    )
+
+    exact = diag_encoder.resolve_event(SimpleNamespace(code="ICD10CM//A123"))
+    assert exact.stage == "exact"
+    assert exact.matched_code == "ICD10CM//A123"
+
+    canonicalized = diag_encoder.resolve_event(SimpleNamespace(code="dx A12.3"))
+    assert canonicalized.stage == "canonicalized"
+    assert canonicalized.matched_code == "ICD10CM//A123"
+
+    unk = med_encoder.resolve_event(SimpleNamespace(code="RXNORM//999"))
+    assert unk.stage == "unk"
+    assert unk.base_gid == med_vocab.offset + med_vocab.unk_id
+
+
+def test_medtok_resolution_parent_lookup_and_lexical_bridge():
+    med_vocab = CategoryVocab(
+        name="med",
+        offset=1_400_000,
+        code2id={
+            "<UNK>": 0,
+            "RXNORM//123": 1,
+            "MEDICATION//ACETAMINOPHEN TABLET//ADMINISTERED": 2,
+        },
+    )
+    med_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.MEDICATION,
+        med_vocab,
+        canonicalize_fn=canonicalize_medication_code,
+    )
+
+    parent_hit = med_encoder.resolve_event(
+        SimpleNamespace(
+            code="MEDICATION//UNKNOWN DRUG//ADMINISTERED",
+            parent_codes=["RXNORM//123"],
+        )
+    )
+    assert parent_hit.stage == "parent_lookup"
+    assert parent_hit.matched_code == "RXNORM//123"
+
+    lexical = med_encoder.resolve_event(SimpleNamespace(code="Acetaminophen Tablet"))
+    assert lexical.stage == "lexical_bridge"
+    assert lexical.matched_code == "MEDICATION//ACETAMINOPHEN TABLET//ADMINISTERED"
+
+
 def test_drop_unknown_diagnosis(monkeypatch, tiny_vocabs):
     diag_vocab, proc_vocab, med_vocab, struct_vocab, med_attr_vocabs, med_numeric_attrs = tiny_vocabs
 
@@ -195,6 +252,8 @@ def test_drop_unknown_diagnosis(monkeypatch, tiny_vocabs):
         canonicalize_fn=canonicalize_diagnosis_code,
         drop_unknowns=True,
     )
+    resolution = encoder.resolve_event(SimpleNamespace(code="UNKNOWN"))
+    assert resolution.stage == "drop"
     out = encoder.encode_event(SimpleNamespace(code="UNKNOWN"), dt_hours=1.0)
     assert out == []
 

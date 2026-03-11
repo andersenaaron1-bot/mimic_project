@@ -140,6 +140,7 @@ Medications, diagnoses, and procedures are mapped to MedTok vocab ids (from onto
 pretraining) and emitted as `EventToken(value_id=<global_id>)`.
 
 See: `src/ehr_hier/tokenizers/medtok_*` and `artifacts/medtok/*`.
+The pinned source-to-key contract for v1 lives in `MEDTOK_CODE_SYSTEM_CONTRACT.md`.
 
 Metadata:
 - `cat_attrs`: route/form/frequency/unit ids (optional, if configured)
