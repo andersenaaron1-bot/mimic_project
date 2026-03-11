@@ -10,6 +10,7 @@ from .event_router import classify_code_to_category
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 from src.ehr_hier.data.structural_codes import StructuralCodebook
 from src.ehr_hier.data.demographics import (
+    age_years_from_timestamps,
     infer_subject_sex,
     infer_birth_timestamp,
     infer_event_age_years,
@@ -46,6 +47,44 @@ OBS_SPECIAL_VALUE_IDS = {
     "": 4,
 }
 
+GLOBAL_DEMOGRAPHIC_TOKEN_IDS = {
+    "SEX_F": 30,
+    "SEX_M": 31,
+    "AGE_0_17": 32,
+    "AGE_18_39": 33,
+    "AGE_40_64": 34,
+    "AGE_65_79": 35,
+    "AGE_80P": 36,
+    "BMI_UNDER": 37,
+    "BMI_NORMAL": 38,
+    "BMI_OVER": 39,
+    "BMI_OBESE_1": 40,
+    "BMI_OBESE_2": 41,
+    "BMI_OBESE_3": 42,
+}
+
+DEMOGRAPHIC_ANCHOR_PREFIXES = {
+    "ED_REGISTRATION",
+    "ADMISSION",
+    "HOSPITAL_ADMISSION",
+    "ICU_ADMISSION",
+    "TRANSFER_TO",
+}
+
+LEGACY_STRUCTURAL_BOUNDARY_PREFIXES = {
+    "MEDS_DEATH",
+    "ADMISSION",
+    "DISCHARGE",
+    "CAREUNIT_CHANGE",
+    "HOSPITAL_ADMISSION",
+    "HOSPITAL_DISCHARGE",
+    "ICU_ADMISSION",
+    "ICU_DISCHARGE",
+    "TRANSFER_TO",
+    "ED_REGISTRATION",
+    "ED_OUT",
+}
+
 
 def build_subject_timeline(
     db: mr.SubjectDatabase,
@@ -62,6 +101,8 @@ def build_subject_timeline(
     struct_entity_offset: int = 2_420_000,
     emit_process_struct_tokens: bool = True,
     drop_original_process_marker_tokens: bool = True,
+    emit_global_demographic_tokens: bool = True,
+    special_token_offset: int = 0,
 ) -> List[EventToken]:
     """
     Build a flat token timeline for a single subject using rich EventToken bundles.
@@ -87,6 +128,10 @@ def build_subject_timeline(
         Label attached to EventToken.window_hook when an event hits the map.
     attach_med_numeric : bool
         If True, copy ev.numeric_value into EventToken.num_attrs["numeric_value"] for meds.
+    emit_global_demographic_tokens : bool
+        If True, emit lightweight global demographic tokens (sex, age bucket, BMI bucket)
+        as SPECIAL tokens. Collation prefixes SPECIAL tokens into each window/chunk,
+        making these globally attendable without creating extra timeline events.
     structural_codebook : Optional[StructuralCodebook]
         Optional codebook to force structural tokens for specific codes. Codes listed
         in structural_only will skip medtok tokens; codes listed in keep_original will
@@ -114,6 +159,30 @@ def build_subject_timeline(
         if isinstance(t_ev, datetime):
             timeline_start = t_ev
             break
+
+    # Demographic age token should anchor on first clinical event, not on MEDS_BIRTH.
+    first_clinical_time: Optional[datetime] = None
+    for ev in events:
+        code_norm = str(getattr(ev, "code", "")).strip().upper()
+        if code_norm == "MEDS_BIRTH" or code_norm.startswith("GENDER//"):
+            continue
+        t_ev = getattr(ev, "time", None)
+        if isinstance(t_ev, datetime):
+            first_clinical_time = t_ev
+            break
+
+    demographic_anchor_time: Optional[datetime] = None
+    for ev in events:
+        code_norm = str(getattr(ev, "code", "")).strip().upper()
+        prefix = code_norm.split("//", 1)[0] if code_norm else ""
+        if prefix not in DEMOGRAPHIC_ANCHOR_PREFIXES:
+            continue
+        t_ev = getattr(ev, "time", None)
+        if isinstance(t_ev, datetime):
+            demographic_anchor_time = t_ev
+            break
+    if demographic_anchor_time is None:
+        demographic_anchor_time = first_clinical_time
 
     # 1) Reset per-subject state in encoders (dt_prev etc.)
     for enc in encoders.values():
@@ -152,12 +221,37 @@ def build_subject_timeline(
             action=transition_action,
         )
         attrs: Dict[str, int] = {}
+        code_prefix = str(code_str).split("//", 1)[0].upper()
         if transition_action_id is not None:
             attrs["transition_action_id"] = int(transition_action_id)
         if transition_window_type_id is not None:
             attrs["transition_window_type_id"] = int(transition_window_type_id)
             if transition_action in {"open_next", "close_open"}:
                 attrs["window_type_id"] = int(transition_window_type_id)
+        if code_prefix in {
+            "TRANSFER_TO",
+            "HOSPITAL_ADMISSION",
+            "ADMISSION",
+            "ICU_ADMISSION",
+            "ED_REGISTRATION",
+            "STRUCT_START_ADM",
+            "STRUCT_CAREUNIT_CHANGE",
+            "STRUCT_START_OR",
+        }:
+            attrs["transition_admission_like"] = 1
+        if code_prefix == "TRANSFER_TO":
+            attrs["transition_transfer_like"] = 1
+        if code_prefix in {
+            "HOSPITAL_DISCHARGE",
+            "DISCHARGE",
+            "ICU_DISCHARGE",
+            "ED_OUT",
+            "STRUCT_END_ADM",
+            "STRUCT_END_OR",
+        }:
+            attrs["transition_discharge_like"] = 1
+        if code_prefix == "MEDS_DEATH":
+            attrs["transition_death_like"] = 1
         return attrs, transition_action
 
     def _extract_med_numeric(ev: object) -> Optional[float]:
@@ -218,6 +312,13 @@ def build_subject_timeline(
                 raw = getattr(ev_obj, attr)
                 if raw is not None and str(raw).strip():
                     return _normalize_obs_value(raw)
+        if hasattr(ev_obj, "numeric_value"):
+            try:
+                nval = float(getattr(ev_obj, "numeric_value"))
+            except (TypeError, ValueError):
+                nval = None
+            if nval is not None and math.isfinite(nval):
+                return _normalize_obs_value(f"{nval:.3f}".rstrip("0").rstrip("."))
         parts = _code_parts(code_value)
         if len(parts) >= 3:
             return _normalize_obs_value(parts[2])
@@ -235,7 +336,15 @@ def build_subject_timeline(
         if not parts:
             return []
         prefix = parts[0].upper()
-        if prefix not in {"LAB", "VITAL", "MEAS", "SUBJECT_FLUID_OUTPUT", "SUBJECT_WEIGHT_AT_INFUSION", "OMR"}:
+        if prefix not in {
+            "LAB",
+            "VITAL",
+            "MEAS",
+            "SUBJECT_FLUID_OUTPUT",
+            "SUBJECT_WEIGHT_AT_INFUSION",
+            "OMR",
+            "BLOOD PRESSURE",
+        }:
             return []
 
         obs_code_lane = max(16, int(qual_obs_value_offset) - int(qual_obs_code_offset) - 1)
@@ -351,6 +460,174 @@ def build_subject_timeline(
             ),
         ]
 
+    def _normalize_code(code_value: Optional[str]) -> str:
+        if code_value is None:
+            return ""
+        return str(code_value).strip().upper()
+
+    def _code_matches_alias(code_value: Optional[str], alias: str) -> bool:
+        code_norm = _normalize_code(code_value)
+        alias_norm = str(alias).strip().upper()
+        return code_norm == alias_norm or code_norm.endswith(f"//{alias_norm}")
+
+    def _extract_finite_numeric(ev_obj: object) -> Optional[float]:
+        for attr in ("numeric_value", "value_as_number", "value", "result_value"):
+            if not hasattr(ev_obj, attr):
+                continue
+            raw = getattr(ev_obj, attr)
+            if raw is None:
+                continue
+            try:
+                val = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(val):
+                return float(val)
+        return None
+
+    def _latest_numeric_for_aliases_at_or_before(
+        aliases: Set[str],
+        *,
+        anchor_time: Optional[datetime],
+    ) -> Optional[float]:
+        if anchor_time is None:
+            return None
+        latest_val: Optional[float] = None
+        latest_ts: Optional[datetime] = None
+        alias_norm = {str(a).strip().upper() for a in aliases}
+        for ev_obj in events:
+            code_value = getattr(ev_obj, "code", None)
+            if not any(_code_matches_alias(code_value, alias) for alias in alias_norm):
+                continue
+            val = _extract_finite_numeric(ev_obj)
+            if val is None:
+                continue
+            t_ev = getattr(ev_obj, "time", None)
+            if not isinstance(t_ev, datetime):
+                continue
+            if t_ev > anchor_time:
+                continue
+            if latest_ts is None or t_ev >= latest_ts:
+                latest_ts = t_ev
+                latest_val = val
+        return latest_val
+
+    def _parse_sex_to_float(val: object) -> Optional[float]:
+        if val is None:
+            return None
+        if isinstance(val, bool):
+            return 1.0 if val else 0.0
+        if isinstance(val, (int, float)):
+            try:
+                f = float(val)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(f):
+                return None
+            return 1.0 if f >= 0.5 else 0.0
+        s = str(val).strip().lower()
+        if not s:
+            return None
+        if s.startswith("m"):
+            return 1.0
+        if s.startswith("f"):
+            return 0.0
+        return None
+
+    def _infer_causal_sex_at_or_before(anchor_time: Optional[datetime]) -> Optional[float]:
+        if anchor_time is None:
+            return None
+        for ev_obj in events:
+            t_ev = getattr(ev_obj, "time", None)
+            if not isinstance(t_ev, datetime) or t_ev > anchor_time:
+                continue
+            sex_attr = _parse_sex_to_float(getattr(ev_obj, "sex", None))
+            if sex_attr is not None:
+                return sex_attr
+            gender_attr = _parse_sex_to_float(getattr(ev_obj, "gender", None))
+            if gender_attr is not None:
+                return gender_attr
+            code_norm = _normalize_code(getattr(ev_obj, "code", None))
+            if code_norm.startswith("GENDER//"):
+                suffix = code_norm.split("//")[-1]
+                parsed = _parse_sex_to_float(suffix)
+                if parsed is not None:
+                    return parsed
+        return None
+
+    def _age_bucket_token_id(age_years: float) -> int:
+        if age_years < 18.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["AGE_0_17"]
+        if age_years < 40.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["AGE_18_39"]
+        if age_years < 65.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["AGE_40_64"]
+        if age_years < 80.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["AGE_65_79"]
+        return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["AGE_80P"]
+
+    def _bmi_bucket_token_id(bmi_value: float) -> int:
+        if bmi_value < 18.5:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_UNDER"]
+        if bmi_value < 25.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_NORMAL"]
+        if bmi_value < 30.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_OVER"]
+        if bmi_value < 35.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_OBESE_1"]
+        if bmi_value < 40.0:
+            return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_OBESE_2"]
+        return GLOBAL_DEMOGRAPHIC_TOKEN_IDS["BMI_OBESE_3"]
+
+    def _build_global_demographic_tokens() -> List[EventToken]:
+        if not emit_global_demographic_tokens:
+            return []
+
+        out: List[EventToken] = []
+        seen_ids: Set[int] = set()
+
+        def _emit_demog_token(local_id: int, *, feature_id: int) -> None:
+            gid = int(special_token_offset) + int(local_id)
+            if gid in seen_ids:
+                return
+            seen_ids.add(gid)
+            out.append(
+                EventToken(
+                    value_id=int(gid),
+                    category_id=int(TokenCategory.SPECIAL),
+                    t_from_start_hours=0.0,
+                    dt_from_prev_hours=0.0,
+                    cat_attrs={"global_demographic": 1, "demographic_feature_id": int(feature_id)},
+                    num_attrs={},
+                    raw_time=None,
+                    window_hook=None,
+                )
+            )
+
+        # 1) Sex token (only if observed at/before admission anchor).
+        causal_sex = _infer_causal_sex_at_or_before(demographic_anchor_time)
+        if causal_sex is not None:
+            sex_tok = GLOBAL_DEMOGRAPHIC_TOKEN_IDS["SEX_M"] if float(causal_sex) >= 0.5 else GLOBAL_DEMOGRAPHIC_TOKEN_IDS["SEX_F"]
+            _emit_demog_token(sex_tok, feature_id=1)
+
+        # 2) Age bucket at admission anchor (if birth timestamp is known).
+        if birth_ts is not None and demographic_anchor_time is not None:
+            age_at_start = age_years_from_timestamps(float(demographic_anchor_time.timestamp()), float(birth_ts))
+            if math.isfinite(age_at_start) and age_at_start >= 0.0:
+                _emit_demog_token(_age_bucket_token_id(float(age_at_start)), feature_id=2)
+
+        # 3) BMI bucket from values known at/before admission anchor.
+        bmi_val = _latest_numeric_for_aliases_at_or_before({"BMI (KG/M2)"}, anchor_time=demographic_anchor_time)
+        if bmi_val is None:
+            wt_lbs = _latest_numeric_for_aliases_at_or_before({"WEIGHT (LBS)"}, anchor_time=demographic_anchor_time)
+            ht_in = _latest_numeric_for_aliases_at_or_before({"HEIGHT (INCHES)"}, anchor_time=demographic_anchor_time)
+            if wt_lbs is not None and ht_in is not None and ht_in > 0.0:
+                bmi_val = float(wt_lbs) * 703.0 / (float(ht_in) ** 2)
+        if bmi_val is not None and math.isfinite(bmi_val) and bmi_val > 0.0:
+            _emit_demog_token(_bmi_bucket_token_id(float(bmi_val)), feature_id=3)
+
+        return out
+
     # 2) Optional global summary/window-0 tokens (coerced to EventToken, t=0)
     if add_summary_tokens:
         for tok in add_summary_tokens:
@@ -366,6 +643,7 @@ def build_subject_timeline(
                     window_hook=None,
                 )
             )
+    tokens.extend(_build_global_demographic_tokens())
 
     # 3) Timeline tokens from events
     last_emitted_time: Optional[datetime] = None
@@ -466,8 +744,13 @@ def build_subject_timeline(
             elif routed_transition_action == "suppress":
                 should_hook = False
             else:
+                code_prefix = code_str.split("//", 1)[0].upper()
+                legacy_struct_boundary = (
+                    category == TokenCategory.STRUCTURAL
+                    and code_prefix in LEGACY_STRUCTURAL_BOUNDARY_PREFIXES
+                )
                 should_hook = (
-                    (structural_event_map is None and category == TokenCategory.STRUCTURAL)
+                    (structural_event_map is None and legacy_struct_boundary)
                     or (structural_event_map is not None and code_str in structural_codes)
                 )
 

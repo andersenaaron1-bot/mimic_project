@@ -28,7 +28,7 @@ def test_collator_can_end_windows_with_next_type_marker() -> None:
         category_id=int(TokenCategory.STRUCTURAL),
         t_from_start_hours=7.0,
         dt_from_prev_hours=2.0,
-        cat_attrs={"struct_label_id": 0},  # -> window_type_id = 1
+        cat_attrs={"struct_label_id": 0, "window_type_id": 1},
         num_attrs={},
         window_hook="episode",
     )

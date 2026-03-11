@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import Any, Dict, List, Literal
 
 import torch
@@ -415,14 +416,25 @@ class AETHierarchicalCollator:
         for tok in seq:
             ids.append(int(tok.value_id))
             types.append(int(tok.category_id))
-            val = tok.num_attrs.get("numeric_value") if tok.num_attrs is not None else None
-            has_val = val is not None
-            vals.append(float(val) if has_val else 0.0)
+            raw_val = tok.num_attrs.get("numeric_value") if tok.num_attrs is not None else None
+            has_val = False
+            safe_val = 0.0
+            if raw_val is not None:
+                try:
+                    parsed = float(raw_val)
+                    if math.isfinite(parsed):
+                        safe_val = parsed
+                        has_val = True
+                except (TypeError, ValueError):
+                    pass
+            vals.append(safe_val)
             val_mask.append(1 if has_val else 0)
             if tok in special_tokens:
                 times.append(0.0)
             else:
                 rel_t = max(0.0, float(tok.t_from_start_hours) - chunk_start_abs)
+                if not math.isfinite(rel_t):
+                    rel_t = 0.0
                 times.append(rel_t)
 
         return ids, times, vals, val_mask, types, float(chunk_start_abs), float(chunk_start_offset)
@@ -463,29 +475,23 @@ class AETHierarchicalCollator:
         Best-effort window type inference.
 
         Default behavior:
-          - If the first token carries a structural_codebook-derived `struct_label_id`,
-            treat it as a window type signal (shifted by +1 so 0 can remain UNK).
+          - Use the earliest explicit `window_type_id` / `transition_window_type_id`.
           - Otherwise fall back to UNK.
         """
         if not window_tokens:
             return int(self.window_markers.unk_type_id)
 
-        first = window_tokens[0]
-        # Explicit override if upstream encoders add it.
-        if first.cat_attrs is not None and "window_type_id" in first.cat_attrs:
-            try:
-                w = int(first.cat_attrs["window_type_id"])
-                return self._clamp_window_type_id(w)
-            except Exception:
-                return int(self.window_markers.unk_type_id)
-
-        # Structural codebook label id (0-based) -> shift to reserve 0 for UNK.
-        if first.cat_attrs is not None and "struct_label_id" in first.cat_attrs:
-            try:
-                w = int(first.cat_attrs["struct_label_id"]) + 1
-                return self._clamp_window_type_id(w)
-            except Exception:
-                return int(self.window_markers.unk_type_id)
+        for tok in window_tokens:
+            if tok.cat_attrs is None:
+                continue
+            for key in ("window_type_id", "transition_window_type_id"):
+                if key not in tok.cat_attrs:
+                    continue
+                try:
+                    w = int(tok.cat_attrs[key])
+                    return self._clamp_window_type_id(w)
+                except Exception:
+                    return int(self.window_markers.unk_type_id)
 
         return int(self.window_markers.unk_type_id)
 

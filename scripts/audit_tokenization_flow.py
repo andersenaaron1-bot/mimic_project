@@ -160,6 +160,7 @@ def _build_segmentation_config(
     *,
     tokenization_contract: Mapping[str, Any],
     structural_codebook: Optional[StructuralCodebook],
+    manifest: Optional[Mapping[str, Any]] = None,
     unk_type_id: int,
 ) -> WindowSegmentationConfig:
     cfg = tokenization_contract.get("window_segmentation", {})
@@ -171,6 +172,23 @@ def _build_segmentation_config(
         first_type_name = cfg.get("default_first_window_type", None)
         if first_type_name is not None and structural_codebook is not None:
             first_type_id = structural_codebook.window_type2id().get(str(first_type_name))
+
+    inter_type_id = cfg.get("inter_admission_window_type_id", None)
+    if inter_type_id is None:
+        inter_type_name = cfg.get("inter_admission_window_type", None)
+        if inter_type_name is not None and structural_codebook is not None:
+            inter_type_id = structural_codebook.window_type2id().get(str(inter_type_name))
+
+    inter_token_id = None
+    inter_struct_label_id = None
+    inter_structural_code = str(cfg.get("inter_admission_structural_code", "INTER_ADMISSION_GAP"))
+    if structural_codebook is not None and inter_structural_code in structural_codebook.code2label:
+        inter_label = structural_codebook.code2label.get(inter_structural_code)
+        if inter_label is not None:
+            inter_struct_label_id = structural_codebook.label2id().get(str(inter_label))
+            if inter_struct_label_id is not None:
+                struct_offset = _offset(manifest or {}, "structural", 2_200_000)
+                inter_token_id = int(struct_offset) + int(inter_struct_label_id)
 
     return WindowSegmentationConfig(
         bundle_gap_hours=float(cfg.get("bundle_gap_hours", 0.5)),
@@ -188,6 +206,17 @@ def _build_segmentation_config(
         ),
         propagate_prev_type_for_unknown_windows=bool(
             cfg.get("propagate_prev_type_for_unknown_windows", True)
+        ),
+        enable_inter_admission_windows=bool(cfg.get("enable_inter_admission_windows", False)),
+        inter_admission_window_type_id=(
+            int(inter_type_id) if inter_type_id is not None else None
+        ),
+        inter_admission_max_gap_hours=float(cfg.get("inter_admission_max_gap_hours", 24.0)),
+        inter_admission_token_id=(
+            int(inter_token_id) if inter_token_id is not None else None
+        ),
+        inter_admission_struct_label_id=(
+            int(inter_struct_label_id) if inter_struct_label_id is not None else None
         ),
     )
 
@@ -1152,6 +1181,24 @@ def _summarize_tokenization_and_collation(
             }
             for family, ids in family_unique_ids.items()
         },
+        "measurement_effective_capture_by_path": {},
+    }
+
+    raw_meas_events = int(raw_events_by_category.get("MEASUREMENT", 0))
+    cvae_meas_events = int(family_counts.get("measurement_code", 0))
+    obs_meas_events = int(family_counts.get("observation_code", 0))
+    kept_meas_events = int(cvae_meas_events + obs_meas_events)
+    timeline_summary["measurement_effective_capture_by_path"] = {
+        "raw_measurement_events": int(raw_meas_events),
+        "cvae_events": int(cvae_meas_events),
+        "obs_events": int(obs_meas_events),
+        "kept_events": int(kept_meas_events),
+        "dropped_events": int(max(0, raw_meas_events - kept_meas_events)),
+        "kept_rate": (
+            float(kept_meas_events) / float(raw_meas_events)
+            if raw_meas_events > 0
+            else 0.0
+        ),
     }
 
     semantic_capture: Dict[str, Dict[str, Any]] = {}
@@ -1244,6 +1291,7 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
         print(f"  {row['key']}: {row['count']}")
     print("Timeline emitted tokens by category:", timeline["emitted_tokens_by_category"])
     print("Timeline dropped events by category:", timeline["dropped_events_by_category"])
+    print("Measurement effective capture:", timeline.get("measurement_effective_capture_by_path", {}))
     print("Average tokens per emitted event:", timeline["avg_tokens_per_emitted_event_by_category"])
     print("Semantic effective capture by category:", timeline.get("semantic_effective_capture_by_category", {}))
     print("Collation windows:", coll["windows"])
@@ -1311,6 +1359,7 @@ def main() -> None:
     segmentation_cfg = _build_segmentation_config(
         tokenization_contract=tokenization_contract,
         structural_codebook=artifacts.structural_codebook,
+        manifest=artifacts.manifest,
         unk_type_id=int(window_markers_cfg.unk_type_id),
     )
     residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
@@ -1454,6 +1503,18 @@ def main() -> None:
                 ),
                 "propagate_prev_type_for_unknown_windows": bool(
                     segmentation_cfg.propagate_prev_type_for_unknown_windows
+                ),
+                "enable_inter_admission_windows": bool(segmentation_cfg.enable_inter_admission_windows),
+                "inter_admission_window_type_id": (
+                    int(segmentation_cfg.inter_admission_window_type_id)
+                    if segmentation_cfg.inter_admission_window_type_id is not None
+                    else None
+                ),
+                "inter_admission_max_gap_hours": float(segmentation_cfg.inter_admission_max_gap_hours),
+                "inter_admission_token_id": (
+                    int(segmentation_cfg.inter_admission_token_id)
+                    if segmentation_cfg.inter_admission_token_id is not None
+                    else None
                 ),
             },
         },

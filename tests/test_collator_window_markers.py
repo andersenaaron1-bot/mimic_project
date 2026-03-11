@@ -28,7 +28,7 @@ def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
         category_id=int(TokenCategory.STRUCTURAL),
         t_from_start_hours=7.0,
         dt_from_prev_hours=2.0,
-        cat_attrs={"struct_label_id": 0},  # -> window_type_id = 1
+        cat_attrs={"struct_label_id": 0, "window_type_id": 1},
         num_attrs={},
         window_hook="episode",
     )
@@ -277,3 +277,96 @@ def test_collator_clamps_out_of_range_window_type_to_unk() -> None:
     assert batch["window_type_ids"][0, 0].item() == 0
     # WIN_TYPE marker should be offset + 0
     assert batch["input_ids"][0, 0, 0, 1].item() == 10
+
+
+def test_collator_emits_real_inter_admission_window_chunk() -> None:
+    from ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
+    from ehr_hier.data.token_types import EventToken, TokenCategory
+    from ehr_hier.data.window_segmentation import WindowSegmentationConfig
+    from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
+
+    summary = EventToken(
+        value_id=1,
+        category_id=int(TokenCategory.SPECIAL),
+        t_from_start_hours=0.0,
+        dt_from_prev_hours=0.0,
+        cat_attrs={},
+        num_attrs={},
+    )
+    admit = EventToken(
+        value_id=300,
+        category_id=int(TokenCategory.STRUCTURAL),
+        t_from_start_hours=0.0,
+        dt_from_prev_hours=0.0,
+        cat_attrs={
+            "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+            "transition_window_type_id": 3,
+            "window_type_id": 3,
+            "transition_admission_like": 1,
+        },
+        num_attrs={},
+        window_hook="episode",
+    )
+    discharge = EventToken(
+        value_id=301,
+        category_id=int(TokenCategory.STRUCTURAL),
+        t_from_start_hours=2.0,
+        dt_from_prev_hours=2.0,
+        cat_attrs={
+            "transition_action_id": TRANSITION_ACTION_TO_ID["close_current"],
+            "transition_discharge_like": 1,
+        },
+        num_attrs={},
+        window_hook="episode",
+    )
+    readmit = EventToken(
+        value_id=302,
+        category_id=int(TokenCategory.STRUCTURAL),
+        t_from_start_hours=6.0,
+        dt_from_prev_hours=4.0,
+        cat_attrs={
+            "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+            "transition_window_type_id": 2,
+            "window_type_id": 2,
+            "transition_admission_like": 1,
+        },
+        num_attrs={},
+        window_hook="episode",
+    )
+    meas = EventToken(
+        value_id=100,
+        category_id=int(TokenCategory.MEASUREMENT),
+        t_from_start_hours=6.5,
+        dt_from_prev_hours=0.5,
+        cat_attrs={},
+        num_attrs={"numeric_value": 1.23},
+    )
+
+    collator = AETHierarchicalCollator(
+        max_windows=8,
+        max_chunks_per_window=2,
+        max_len_per_window=8,
+        pad_id=0,
+        window_markers=WindowMarkerConfig(enabled=True, type_token_offset=10, num_types=8, unk_type_id=0),
+        segmentation=WindowSegmentationConfig(
+            unk_window_type_id=0,
+            default_first_window_type_id=1,
+            propagate_prev_type_for_unknown_windows=True,
+            enable_inter_admission_windows=True,
+            inter_admission_window_type_id=6,
+            inter_admission_max_gap_hours=24.0,
+            inter_admission_token_id=2200999,
+            inter_admission_struct_label_id=9,
+        ),
+    )
+
+    batch = collator([[summary, admit, discharge, readmit, meas]])
+
+    assert batch["window_mask"][0, :3].tolist() == [1, 1, 1]
+    assert batch["window_type_ids"][0, :3].tolist() == [3, 6, 2]
+    assert batch["chunk_mask"][0, :3, 0].tolist() == [1, 1, 1]
+    assert batch["window_start_times"][0, :3].tolist() == pytest.approx([0.0, 4.0, 6.0], rel=1e-6)
+    inter_ids = batch["input_ids"][0, 1, 0, :4].tolist()
+    assert inter_ids == [1, 16, 2200999, 18]
+    assert batch["numeric_mask"][0, 1, 0, 2].item() == 1
+    assert batch["numeric_values"][0, 1, 0, 2, 0].item() == pytest.approx(4.0, rel=1e-6)

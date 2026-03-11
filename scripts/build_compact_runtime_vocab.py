@@ -20,6 +20,7 @@ if str(PROJECT_ROOT) not in sys.path:
 import meds_reader as mr
 
 from scripts.audit_tokenization_flow import (
+    _build_segmentation_config,
     _build_measurement_config,
     _build_static_artifacts,
     _build_struct_vocab,
@@ -27,6 +28,7 @@ from scripts.audit_tokenization_flow import (
     _load_tokenization_contract,
     _resolve_residual_policy,
 )
+from src.ehr_hier.data.event_router import classify_code_to_category
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
@@ -63,6 +65,39 @@ def _chunk_subjects(subject_ids: Sequence[int], chunk_size: int) -> List[List[in
     return [list(subject_ids[i : i + sz]) for i in range(0, len(subject_ids), sz)]
 
 
+def _collect_structural_raw_codes(
+    db: mr.SubjectDatabase,
+    subject_ids: Sequence[int],
+    *,
+    progress_every: int = 0,
+) -> set[str]:
+    out: set[str] = set()
+    started_at = time.time()
+    total = len(subject_ids)
+    for idx, sid in enumerate(subject_ids, start=1):
+        subj = db[int(sid)]
+        for ev in subj.events:
+            code = getattr(ev, "code", None)
+            if classify_code_to_category(code) != TokenCategory.STRUCTURAL:
+                continue
+            if code is not None:
+                out.add(str(code))
+        if progress_every > 0 and (idx == total or idx % progress_every == 0):
+            elapsed = max(0.0, time.time() - started_at)
+            rate = float(idx) / elapsed if elapsed > 0 else 0.0
+            remaining = (float(total - idx) / rate) if rate > 0 else float("inf")
+            eta_text = (
+                f"{remaining / 60.0:.1f}m"
+                if remaining == remaining and remaining != float("inf")
+                else "unknown"
+            )
+            print(
+                f"[compact-vocab:struct] {idx}/{total} subjects | elapsed={elapsed / 60.0:.1f}m | eta={eta_text}",
+                flush=True,
+            )
+    return out
+
+
 _WORKER_STATE: Dict[str, Any] = {}
 
 
@@ -79,7 +114,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         tokenization_contract=tokenization_contract,
     )
 
-    struct_codes_union = set()
+    struct_codes_union = set(getattr(worker_args, "structural_raw_codes", []) or [])
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
@@ -262,6 +297,17 @@ def main() -> None:
     observed_ids_by_block["special"].update({0, 1, 2, 3, end_id, cont_id})
     observed_ids_by_block["special"].update(range(t_off, t_off + max(0, n_types)))
 
+    artifacts = _build_static_artifacts(args)
+    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
+    segmentation_cfg = _build_segmentation_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+        manifest=artifacts.manifest,
+        unk_type_id=int(marker_cfg.get("unk_type_id", 0)),
+    )
+    if segmentation_cfg.enable_inter_admission_windows and segmentation_cfg.inter_admission_token_id is not None:
+        observed_ids_by_block["structural"].add(int(segmentation_cfg.inter_admission_token_id))
+
     subject_ids = _load_subject_ids(
         str(args.splits_parquet),
         str(args.split),
@@ -270,6 +316,14 @@ def main() -> None:
     )
     if not subject_ids:
         raise ValueError("No subjects loaded; cannot build compact runtime vocab.")
+
+    db = mr.SubjectDatabase(str(args.meds_reader_db))
+    structural_raw_codes = _collect_structural_raw_codes(
+        db,
+        subject_ids,
+        progress_every=max(0, int(args.progress_every)),
+    )
+    setattr(args, "structural_raw_codes", sorted(str(x) for x in structural_raw_codes))
 
     block_ranges = [
         (str(b.name), int(b.global_offset), int(b.global_max))
@@ -316,6 +370,7 @@ def main() -> None:
             "args": vars(args),
             "block_ranges": block_ranges,
         }
+        payload["args"]["structural_raw_codes"] = list(getattr(args, "structural_raw_codes", []))
         max_workers = max(1, workers)
         with cf.ProcessPoolExecutor(
             max_workers=max_workers,
@@ -362,6 +417,7 @@ def main() -> None:
             "subjects_scanned": int(len(subject_ids)),
             "tokens_scanned": int(total_tokens),
             "tokens_unmatched_to_base_blocks": int(unmatched_tokens),
+            "structural_raw_codes_seen": int(len(structural_raw_codes)),
             "preserve_full_blocks": sorted(preserve_full_blocks),
             "total_size_base": int(base_vocab_config.get("total_size", 0)),
             "total_size_compact": int(compact_vocab_config.get("total_size", 0)),

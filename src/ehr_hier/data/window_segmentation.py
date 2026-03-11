@@ -36,6 +36,12 @@ class WindowSegmentationConfig:
     default_first_window_type_id: int | None = None
     # Carry forward the most recent known type for untyped windows.
     propagate_prev_type_for_unknown_windows: bool = True
+    # Optionally synthesize a short discharge-to-readmission gap window.
+    enable_inter_admission_windows: bool = False
+    inter_admission_window_type_id: int | None = None
+    inter_admission_max_gap_hours: float = 24.0
+    inter_admission_token_id: int | None = None
+    inter_admission_struct_label_id: int | None = None
 
 
 @dataclass
@@ -122,10 +128,6 @@ def _infer_window_type_from_tokens(window_tokens: List[EventToken], *, unk_type_
         val = _cat_attr_int(window_tokens[0], key)
         if val is not None:
             return int(val)
-
-    struct_label_id = _cat_attr_int(window_tokens[0], "struct_label_id")
-    if struct_label_id is not None:
-        return int(struct_label_id) + 1
     return int(unk_type_id)
 
 
@@ -198,6 +200,104 @@ def _has_explicit_transition(tokens: List[EventToken]) -> bool:
     return any(_cat_attr_int(tok, "transition_action_id") is not None for tok in tokens)
 
 
+def _token_has_flag(tok: EventToken, key: str) -> bool:
+    val = _cat_attr_int(tok, key)
+    return val is not None and int(val) != 0
+
+
+def _window_has_flag(window: SegmentedWindow, key: str) -> bool:
+    return any(_token_has_flag(tok, key) for tok in window.tokens)
+
+
+def _window_end_time_hours(window: SegmentedWindow) -> float:
+    if window.tokens:
+        return float(window.tokens[-1].t_from_start_hours)
+    return float(window.start_time_hours)
+
+
+def _build_inter_admission_window(
+    *,
+    left_window: SegmentedWindow,
+    gap_hours: float,
+    config: WindowSegmentationConfig,
+) -> SegmentedWindow | None:
+    inter_type_id = config.inter_admission_window_type_id
+    token_id = config.inter_admission_token_id
+    if inter_type_id is None or token_id is None:
+        return None
+
+    left_end = _window_end_time_hours(left_window)
+    gap_midpoint = float(left_end) + (0.5 * float(gap_hours))
+    token_attrs = {
+        "window_type_id": int(inter_type_id),
+        "inter_admission_window": 1,
+    }
+    if config.inter_admission_struct_label_id is not None:
+        token_attrs["struct_label_id"] = int(config.inter_admission_struct_label_id)
+
+    gap_token = EventToken(
+        value_id=int(token_id),
+        category_id=int(TokenCategory.STRUCTURAL),
+        t_from_start_hours=float(gap_midpoint),
+        dt_from_prev_hours=max(0.0, 0.5 * float(gap_hours)),
+        cat_attrs=token_attrs,
+        num_attrs={"numeric_value": float(gap_hours)},
+        raw_time=None,
+        window_hook=None,
+    )
+    return SegmentedWindow(
+        tokens=[gap_token],
+        window_type_id=int(inter_type_id),
+        start_time_hours=float(gap_midpoint),
+        opening_action=None,
+        closing_action=None,
+    )
+
+
+def _inject_inter_admission_windows(
+    windows: List[SegmentedWindow],
+    *,
+    config: WindowSegmentationConfig,
+) -> List[SegmentedWindow]:
+    if (
+        not config.enable_inter_admission_windows
+        or config.inter_admission_window_type_id is None
+        or config.inter_admission_max_gap_hours <= 0.0
+        or len(windows) < 2
+    ):
+        return list(windows)
+
+    inter_type_id = int(config.inter_admission_window_type_id)
+    out: List[SegmentedWindow] = []
+    for idx, window in enumerate(windows[:-1]):
+        out.append(window)
+        next_window = windows[idx + 1]
+
+        if int(window.window_type_id) == inter_type_id or int(next_window.window_type_id) == inter_type_id:
+            continue
+        if not _window_has_flag(window, "transition_discharge_like"):
+            continue
+        if _window_has_flag(window, "transition_death_like"):
+            continue
+        if not _window_has_flag(next_window, "transition_admission_like"):
+            continue
+
+        gap_hours = max(0.0, float(next_window.start_time_hours) - _window_end_time_hours(window))
+        if gap_hours <= 0.0 or gap_hours > float(config.inter_admission_max_gap_hours):
+            continue
+
+        inter_window = _build_inter_admission_window(
+            left_window=window,
+            gap_hours=float(gap_hours),
+            config=config,
+        )
+        if inter_window is not None:
+            out.append(inter_window)
+
+    out.append(windows[-1])
+    return out
+
+
 def _should_merge_transition_chain(
     left_bundle: Dict[str, object],
     right_bundle: Dict[str, object],
@@ -211,6 +311,12 @@ def _should_merge_transition_chain(
     left_tokens = events[int(left_bundle["start_idx"]) : int(left_bundle["end_idx"]) + 1]
     right_tokens = events[int(right_bundle["start_idx"]) : int(right_bundle["end_idx"]) + 1]
     if not (_has_explicit_transition(left_tokens) and _has_explicit_transition(right_tokens)):
+        return False
+    if (
+        any(_token_has_flag(tok, "transition_discharge_like") for tok in left_tokens)
+        and not any(_token_has_flag(tok, "transition_death_like") for tok in left_tokens)
+        and any(_token_has_flag(tok, "transition_admission_like") for tok in right_tokens)
+    ):
         return False
 
     start = int(left_bundle["end_idx"]) + 1
@@ -464,7 +570,8 @@ def segment_event_tokens(
             )
         )
 
-    return _apply_window_type_fallbacks(windows, config=config)
+    windows = _apply_window_type_fallbacks(windows, config=config)
+    return _inject_inter_admission_windows(windows, config=config)
 
 
 def rebalance_segmented_windows(
