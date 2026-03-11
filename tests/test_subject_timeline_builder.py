@@ -412,3 +412,97 @@ def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():
     age_years, sex = meas_enc.seen[0]
     assert sex == pytest.approx(1.0)
     assert age_years == pytest.approx(20.0, rel=1e-6)
+
+
+def test_subject_timeline_emits_global_demographic_special_tokens():
+    t_birth = datetime(1980, 1, 1, 0, 0, 0)
+    t_obs = datetime(2020, 1, 1, 0, 0, 0)
+    events = [
+        SimpleNamespace(code="MEDS_BIRTH", time=t_birth),
+        SimpleNamespace(code="GENDER//F", time=t_birth),
+        SimpleNamespace(code="BMI (kg/m2)", time=t_obs, numeric_value=31.2),
+    ]
+    db = DummyDB({8: DummySubject(events)})
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=8,
+        encoders={},
+    )
+    ids = {int(tok.value_id) for tok in tokens if tok.category_id == int(TokenCategory.SPECIAL)}
+
+    # SEX_F, AGE_40_64, BMI_OBESE_1 in GLOBAL_DEMOGRAPHIC_TOKEN_IDS.
+    assert 30 in ids
+    assert 34 in ids
+    assert 40 in ids
+
+
+def test_blood_pressure_routes_to_measurement_obs_fallback():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="Blood Pressure", time=t0, value="120/80")]
+    db = DummyDB({9: DummySubject(events)})
+
+    class EmptyMeasEncoder(DummyEncoder):
+        def __init__(self):
+            super().__init__(TokenCategory.MEASUREMENT, 123)
+
+        def encode_event(self, ev, dt_hours: float):
+            return []
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=9,
+        encoders={TokenCategory.MEASUREMENT: EmptyMeasEncoder()},
+    )
+
+    obs_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.MEASUREMENT)]
+    assert len(obs_tokens) == 2
+    assert obs_tokens[0].cat_attrs.get("obs_bundle_pos") == 1
+    assert obs_tokens[1].cat_attrs.get("obs_bundle_pos") == 2
+
+
+def test_rare_critical_structural_event_does_not_force_window_boundary():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    code = "Event//Code Blue activated"
+    events = [SimpleNamespace(code=code, time=t0)]
+    db = DummyDB({10: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0, code: 1})
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=10,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 1
+    assert tokens[0].category_id == int(TokenCategory.STRUCTURAL)
+    assert tokens[0].window_hook is None
+
+
+def test_demographic_tokens_use_admission_anchor_only():
+    t_birth = datetime(1980, 1, 1, 0, 0, 0)
+    t_adm = datetime(2020, 1, 10, 0, 0, 0)
+    t_late = datetime(2020, 1, 11, 0, 0, 0)
+    events = [
+        SimpleNamespace(code="MEDS_BIRTH", time=t_birth),
+        SimpleNamespace(code="HOSPITAL_ADMISSION", time=t_adm),
+        SimpleNamespace(code="BMI (kg/m2)", time=t_late, numeric_value=33.0),
+    ]
+    db = DummyDB({11: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0, "HOSPITAL_ADMISSION": 1})
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=11,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+    )
+    special_ids = {int(tok.value_id) for tok in tokens if tok.category_id == int(TokenCategory.SPECIAL)}
+
+    # Age token can exist via MEDS_BIRTH, but BMI should not leak from post-admission measurement.
+    assert 34 in special_ids  # AGE_40_64
+    assert 40 not in special_ids  # BMI_OBESE_1

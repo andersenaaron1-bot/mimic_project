@@ -28,7 +28,6 @@ from scripts.audit_tokenization_flow import (
     _load_tokenization_contract,
     _resolve_residual_policy,
 )
-from src.ehr_hier.data.event_router import classify_code_to_category
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
@@ -65,37 +64,21 @@ def _chunk_subjects(subject_ids: Sequence[int], chunk_size: int) -> List[List[in
     return [list(subject_ids[i : i + sz]) for i in range(0, len(subject_ids), sz)]
 
 
-def _collect_structural_raw_codes(
-    db: mr.SubjectDatabase,
-    subject_ids: Sequence[int],
-    *,
-    progress_every: int = 0,
-) -> set[str]:
-    out: set[str] = set()
-    started_at = time.time()
-    total = len(subject_ids)
-    for idx, sid in enumerate(subject_ids, start=1):
-        subj = db[int(sid)]
-        for ev in subj.events:
-            code = getattr(ev, "code", None)
-            if classify_code_to_category(code) != TokenCategory.STRUCTURAL:
-                continue
-            if code is not None:
-                out.add(str(code))
-        if progress_every > 0 and (idx == total or idx % progress_every == 0):
-            elapsed = max(0.0, time.time() - started_at)
-            rate = float(idx) / elapsed if elapsed > 0 else 0.0
-            remaining = (float(total - idx) / rate) if rate > 0 else float("inf")
-            eta_text = (
-                f"{remaining / 60.0:.1f}m"
-                if remaining == remaining and remaining != float("inf")
-                else "unknown"
-            )
-            print(
-                f"[compact-vocab:struct] {idx}/{total} subjects | elapsed={elapsed / 60.0:.1f}m | eta={eta_text}",
-                flush=True,
-            )
-    return out
+def _auto_worker_count(requested_workers: int) -> int:
+    if int(requested_workers) > 0:
+        return int(requested_workers)
+    cpu_budget = 0
+    raw_slurm = os.environ.get("SLURM_CPUS_PER_TASK", "").strip()
+    if raw_slurm:
+        try:
+            cpu_budget = int(raw_slurm)
+        except ValueError:
+            cpu_budget = 0
+    if cpu_budget <= 0:
+        cpu_budget = int(os.cpu_count() or 1)
+    if cpu_budget <= 2:
+        return 1
+    return max(1, min(8, cpu_budget // 2))
 
 
 _WORKER_STATE: Dict[str, Any] = {}
@@ -114,7 +97,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         tokenization_contract=tokenization_contract,
     )
 
-    struct_codes_union = set(getattr(worker_args, "structural_raw_codes", []) or [])
+    struct_codes_union = set()
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
@@ -143,8 +126,8 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         "structural_codebook": artifacts.structural_codebook,
         "window_hook_label": "window_boundary",
         "attach_med_numeric": True,
-        "emit_process_struct_tokens": True,
-        "drop_original_process_marker_tokens": True,
+        "emit_process_struct_tokens": False,
+        "drop_original_process_marker_tokens": False,
         "emit_global_demographic_tokens": True,
         "special_token_offset": 0,
     }
@@ -233,7 +216,7 @@ def main() -> None:
     ap.add_argument("--max_subjects", type=int, default=20000)
     ap.add_argument("--sample_seed", type=int, default=42)
     ap.add_argument("--progress_every", type=int, default=100)
-    ap.add_argument("--workers", type=int, default=0, help="Process workers (0/1 = serial).")
+    ap.add_argument("--workers", type=int, default=0, help="Process workers (0 = auto, 1 = serial).")
     ap.add_argument("--subject_chunk_size", type=int, default=128, help="Subjects per worker task.")
     ap.add_argument(
         "--allow_full_medtok_in_workers",
@@ -261,13 +244,10 @@ def main() -> None:
     ap.add_argument("--proc_residual_offset", type=int, default=None)
     ap.add_argument("--med_residual_offset", type=int, default=None)
 
-    ap.add_argument("--structural_entity_dense_size", type=int, default=65536)
-    ap.add_argument("--structural_entity_source_size", type=int, default=900000)
-
     ap.add_argument(
         "--preserve_full_blocks",
-        default="",
-        help="Comma-separated block names to keep full (default: compact all blocks).",
+        default="special,structural",
+        help="Comma-separated block names to keep full (default: preserve special,structural).",
     )
     ap.add_argument("--out_json", required=True)
     args = ap.parse_args()
@@ -277,11 +257,10 @@ def main() -> None:
     base_vocab_config, base_remapper = build_runtime_vocab_and_remapper(
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
+        structural_yaml=args.structural_yaml,
         medtok_vocab_dir=args.medtok_vocab_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
-        structural_entity_dense_size=int(args.structural_entity_dense_size),
-        structural_entity_source_size=int(args.structural_entity_source_size),
     )
 
     observed_ids_by_block: Dict[str, set[int]] = defaultdict(set)
@@ -297,17 +276,6 @@ def main() -> None:
     observed_ids_by_block["special"].update({0, 1, 2, 3, end_id, cont_id})
     observed_ids_by_block["special"].update(range(t_off, t_off + max(0, n_types)))
 
-    artifacts = _build_static_artifacts(args)
-    tokenization_contract = _load_tokenization_contract(args.tokenization_yaml)
-    segmentation_cfg = _build_segmentation_config(
-        tokenization_contract=tokenization_contract,
-        structural_codebook=artifacts.structural_codebook,
-        manifest=artifacts.manifest,
-        unk_type_id=int(marker_cfg.get("unk_type_id", 0)),
-    )
-    if segmentation_cfg.enable_inter_admission_windows and segmentation_cfg.inter_admission_token_id is not None:
-        observed_ids_by_block["structural"].add(int(segmentation_cfg.inter_admission_token_id))
-
     subject_ids = _load_subject_ids(
         str(args.splits_parquet),
         str(args.split),
@@ -316,14 +284,6 @@ def main() -> None:
     )
     if not subject_ids:
         raise ValueError("No subjects loaded; cannot build compact runtime vocab.")
-
-    db = mr.SubjectDatabase(str(args.meds_reader_db))
-    structural_raw_codes = _collect_structural_raw_codes(
-        db,
-        subject_ids,
-        progress_every=max(0, int(args.progress_every)),
-    )
-    setattr(args, "structural_raw_codes", sorted(str(x) for x in structural_raw_codes))
 
     block_ranges = [
         (str(b.name), int(b.global_offset), int(b.global_max))
@@ -336,9 +296,10 @@ def main() -> None:
     unmatched_tokens = 0
     progress_every = int(args.progress_every)
     next_progress = progress_every if progress_every > 0 else None
-    workers = int(args.workers)
+    workers = _auto_worker_count(int(args.workers))
     chunk_size = max(1, int(args.subject_chunk_size))
     subject_chunks = _chunk_subjects(subject_ids, chunk_size)
+    print(f"[compact-vocab] using workers={workers} chunk_size={chunk_size}", flush=True)
     if workers > 1 and args.medtok_code2embeds and not bool(args.allow_full_medtok_in_workers):
         print(
             "[compact-vocab] workers>1: ignoring --medtok_code2embeds in workers and using --medtok_vocab_dir to avoid OOM",
@@ -370,7 +331,6 @@ def main() -> None:
             "args": vars(args),
             "block_ranges": block_ranges,
         }
-        payload["args"]["structural_raw_codes"] = list(getattr(args, "structural_raw_codes", []))
         max_workers = max(1, workers)
         with cf.ProcessPoolExecutor(
             max_workers=max_workers,
@@ -417,7 +377,6 @@ def main() -> None:
             "subjects_scanned": int(len(subject_ids)),
             "tokens_scanned": int(total_tokens),
             "tokens_unmatched_to_base_blocks": int(unmatched_tokens),
-            "structural_raw_codes_seen": int(len(structural_raw_codes)),
             "preserve_full_blocks": sorted(preserve_full_blocks),
             "total_size_base": int(base_vocab_config.get("total_size", 0)),
             "total_size_compact": int(compact_vocab_config.get("total_size", 0)),

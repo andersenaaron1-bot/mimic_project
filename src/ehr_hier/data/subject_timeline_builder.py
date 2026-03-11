@@ -99,8 +99,8 @@ def build_subject_timeline(
     qual_obs_value_offset: int = 2_320_000,
     struct_action_offset: int = 2_400_000,
     struct_entity_offset: int = 2_420_000,
-    emit_process_struct_tokens: bool = True,
-    drop_original_process_marker_tokens: bool = True,
+    emit_process_struct_tokens: bool = False,
+    drop_original_process_marker_tokens: bool = False,
     emit_global_demographic_tokens: bool = True,
     special_token_offset: int = 0,
 ) -> List[EventToken]:
@@ -707,8 +707,9 @@ def build_subject_timeline(
 
         # Skip original token if structural-only, or if the routed category is already
         # STRUCTURAL and the codebook emitted the canonical structural marker.
-        if struct_hit and code_str not in struct_keep_orig and (
-            code_str in struct_only or category == TokenCategory.STRUCTURAL
+        if struct_hit and (
+            category == TokenCategory.STRUCTURAL
+            or (code_str not in struct_keep_orig and code_str in struct_only)
         ):
             # nothing else; record timestamp advance
             tokens.extend(emitted_for_event)

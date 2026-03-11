@@ -160,7 +160,6 @@ def _build_segmentation_config(
     *,
     tokenization_contract: Mapping[str, Any],
     structural_codebook: Optional[StructuralCodebook],
-    manifest: Optional[Mapping[str, Any]] = None,
     unk_type_id: int,
 ) -> WindowSegmentationConfig:
     cfg = tokenization_contract.get("window_segmentation", {})
@@ -178,17 +177,6 @@ def _build_segmentation_config(
         inter_type_name = cfg.get("inter_admission_window_type", None)
         if inter_type_name is not None and structural_codebook is not None:
             inter_type_id = structural_codebook.window_type2id().get(str(inter_type_name))
-
-    inter_token_id = None
-    inter_struct_label_id = None
-    inter_structural_code = str(cfg.get("inter_admission_structural_code", "INTER_ADMISSION_GAP"))
-    if structural_codebook is not None and inter_structural_code in structural_codebook.code2label:
-        inter_label = structural_codebook.code2label.get(inter_structural_code)
-        if inter_label is not None:
-            inter_struct_label_id = structural_codebook.label2id().get(str(inter_label))
-            if inter_struct_label_id is not None:
-                struct_offset = _offset(manifest or {}, "structural", 2_200_000)
-                inter_token_id = int(struct_offset) + int(inter_struct_label_id)
 
     return WindowSegmentationConfig(
         bundle_gap_hours=float(cfg.get("bundle_gap_hours", 0.5)),
@@ -212,12 +200,6 @@ def _build_segmentation_config(
             int(inter_type_id) if inter_type_id is not None else None
         ),
         inter_admission_max_gap_hours=float(cfg.get("inter_admission_max_gap_hours", 24.0)),
-        inter_admission_token_id=(
-            int(inter_token_id) if inter_token_id is not None else None
-        ),
-        inter_admission_struct_label_id=(
-            int(inter_struct_label_id) if inter_struct_label_id is not None else None
-        ),
     )
 
 
@@ -1359,7 +1341,6 @@ def main() -> None:
     segmentation_cfg = _build_segmentation_config(
         tokenization_contract=tokenization_contract,
         structural_codebook=artifacts.structural_codebook,
-        manifest=artifacts.manifest,
         unk_type_id=int(window_markers_cfg.unk_type_id),
     )
     residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
@@ -1406,7 +1387,7 @@ def main() -> None:
             progress_every=args.progress_every,
         )
 
-    struct_codes_union = set(structural_raw_codes)
+    struct_codes_union = set()
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
@@ -1511,11 +1492,6 @@ def main() -> None:
                     else None
                 ),
                 "inter_admission_max_gap_hours": float(segmentation_cfg.inter_admission_max_gap_hours),
-                "inter_admission_token_id": (
-                    int(segmentation_cfg.inter_admission_token_id)
-                    if segmentation_cfg.inter_admission_token_id is not None
-                    else None
-                ),
             },
         },
         "raw": raw_summary,

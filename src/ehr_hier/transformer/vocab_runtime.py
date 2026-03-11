@@ -8,6 +8,8 @@ from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 import torch
 import yaml
 
+from src.ehr_hier.data.structural_codes import load_structural_codebook_yaml
+
 
 def _load_json(path: str | Path) -> Dict[str, Any]:
     fp = Path(path)
@@ -300,6 +302,7 @@ def build_runtime_vocab_and_remapper(
     *,
     tokenization_contract: str | Path = "configs/data/tokenization_v1.yaml",
     vocab_manifest: str | Path = "artifacts/vocab_manifest.json",
+    structural_yaml: str | Path = "configs/data/structural_codes.yaml",
     medtok_vocab_dir: str | Path | None = None,
     code2id_pt: str | Path | None = None,
     tokenizer_ckpt: str | Path | None = None,
@@ -352,7 +355,6 @@ def build_runtime_vocab_and_remapper(
     obs_code_offset = _offset("observation_code", 2_300_000)
     obs_val_offset = _offset("observation_value", 2_320_000)
     struct_action_offset = _offset("structural_action", 2_400_000)
-    struct_entity_offset = _offset("structural_entity", 2_420_000)
 
     def _size_from_gap(lo: int, hi: int, default: int) -> int:
         gap = int(hi) - int(lo)
@@ -373,24 +375,16 @@ def build_runtime_vocab_and_remapper(
     rvq_size_eff = int(rvq_size) if rvq_size is not None else (_rvq_size_from_ckpt(tokenizer_ckpt) or 1_024)
     obs_code_size = _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
     obs_val_source_size = _size_from_gap(obs_val_offset, struct_action_offset, 80_000)
-    structural_size = _size_from_gap(structural_offset, obs_code_offset, 100_000)
-    struct_action_size = _size_from_gap(struct_action_offset, struct_entity_offset, 20_000)
-    struct_entity_source_size_eff = max(1, int(structural_entity_source_size))
-    struct_entity_dense_size_eff = max(1, min(int(structural_entity_dense_size), int(struct_entity_source_size_eff)))
+    try:
+        structural_codebook = load_structural_codebook_yaml(str(structural_yaml), default_offset=int(structural_offset))
+        structural_size = max(1, int(len(structural_codebook.label2id())))
+    except Exception:
+        structural_size = _size_from_gap(structural_offset, obs_code_offset, 100_000)
 
     blocks_spec: List[tuple[str, str, int, int, int, str]] = [
         # (name, head, global_offset, source_size, dense_size, mode)
         ("special", "logits_struct", special_offset, special_size, special_size, "identity"),
         ("structural", "logits_struct", structural_offset, structural_size, structural_size, "identity"),
-        ("structural_action", "logits_struct", struct_action_offset, struct_action_size, struct_action_size, "identity"),
-        (
-            "structural_entity",
-            "logits_struct",
-            struct_entity_offset,
-            struct_entity_source_size_eff,
-            struct_entity_dense_size_eff,
-            "modulo" if struct_entity_dense_size_eff < struct_entity_source_size_eff else "identity",
-        ),
         ("measurement_value", "logits_rvq", meas_val_offset, rvq_size_eff, rvq_size_eff, "identity"),
         ("measurement_code", "logits_meas", meas_code_offset, meas_code_size_eff, meas_code_size_eff, "identity"),
         ("observation_code", "logits_meas", obs_code_offset, obs_code_size, obs_code_size, "identity"),

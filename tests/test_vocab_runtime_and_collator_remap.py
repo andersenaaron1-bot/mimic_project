@@ -29,8 +29,6 @@ def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
                     "structural": {"offset": 2200000},
                     "observation_code": {"offset": 2300000},
                     "observation_value": {"offset": 2320000},
-                    "structural_action": {"offset": 2400000},
-                    "structural_entity": {"offset": 2420000},
                 },
                 "residual_fallback": {
                     "enabled": True,
@@ -69,8 +67,20 @@ def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
                 "structural": {"offset": 2200000},
                 "observation_code": {"offset": 2300000},
                 "observation_value": {"offset": 2320000},
-                "structural_action": {"offset": 2400000},
-                "structural_entity": {"offset": 2420000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    structural_fp = tmp_path / "structural_codes.yaml"
+    structural_fp.write_text(
+        yaml.safe_dump(
+            {
+                "structural_map": {
+                    "ADMISSION": "START_ADM",
+                    "DISCHARGE": "END_ADM",
+                },
+                "window_types": {"UNK": 0, "INPATIENT": 1},
+                "window_type_map": {"ADMISSION": "INPATIENT"},
             }
         ),
         encoding="utf-8",
@@ -82,11 +92,10 @@ def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
     vocab_config, remapper = build_runtime_vocab_and_remapper(
         tokenization_contract=contract_fp,
         vocab_manifest=manifest_fp,
+        structural_yaml=structural_fp,
         medtok_vocab_dir=medtok_dir,
         measurement_code_size=128,
         rvq_size=32,
-        structural_entity_source_size=10_000,
-        structural_entity_dense_size=256,
     )
 
     assert vocab_config["total_size"] > 0
@@ -101,7 +110,7 @@ def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
 
     import torch
 
-    ids = torch.tensor([[0, 17, 2000001, 2100010, 2429999, 9999999]], dtype=torch.long)
+    ids = torch.tensor([[0, 17, 2000001, 2100010, 2200001, 9999999]], dtype=torch.long)
     valid = torch.ones_like(ids, dtype=torch.long)
     mapped, stats = remapper.map_tensor(ids, valid_mask=valid)
     assert mapped.shape == ids.shape

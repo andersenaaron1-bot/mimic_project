@@ -40,8 +40,6 @@ class WindowSegmentationConfig:
     enable_inter_admission_windows: bool = False
     inter_admission_window_type_id: int | None = None
     inter_admission_max_gap_hours: float = 24.0
-    inter_admission_token_id: int | None = None
-    inter_admission_struct_label_id: int | None = None
 
 
 @dataclass
@@ -222,33 +220,14 @@ def _build_inter_admission_window(
     config: WindowSegmentationConfig,
 ) -> SegmentedWindow | None:
     inter_type_id = config.inter_admission_window_type_id
-    token_id = config.inter_admission_token_id
-    if inter_type_id is None or token_id is None:
+    if inter_type_id is None:
         return None
 
     left_end = _window_end_time_hours(left_window)
-    gap_midpoint = float(left_end) + (0.5 * float(gap_hours))
-    token_attrs = {
-        "window_type_id": int(inter_type_id),
-        "inter_admission_window": 1,
-    }
-    if config.inter_admission_struct_label_id is not None:
-        token_attrs["struct_label_id"] = int(config.inter_admission_struct_label_id)
-
-    gap_token = EventToken(
-        value_id=int(token_id),
-        category_id=int(TokenCategory.STRUCTURAL),
-        t_from_start_hours=float(gap_midpoint),
-        dt_from_prev_hours=max(0.0, 0.5 * float(gap_hours)),
-        cat_attrs=token_attrs,
-        num_attrs={"numeric_value": float(gap_hours)},
-        raw_time=None,
-        window_hook=None,
-    )
     return SegmentedWindow(
-        tokens=[gap_token],
+        tokens=[],
         window_type_id=int(inter_type_id),
-        start_time_hours=float(gap_midpoint),
+        start_time_hours=float(left_end),
         opening_action=None,
         closing_action=None,
     )

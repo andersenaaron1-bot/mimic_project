@@ -80,5 +80,4 @@ window_segmentation:
   propagate_prev_type_for_unknown_windows: true
   enable_inter_admission_windows: true
   inter_admission_window_type: INTER_ADMISSION
-  inter_admission_structural_code: INTER_ADMISSION_GAP
   inter_admission_max_gap_hours: 24.0

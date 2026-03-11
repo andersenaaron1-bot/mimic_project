@@ -99,7 +99,7 @@ Configuration: `WindowMarkerConfig` (and `vocab_config["window_markers"]` for th
 Window type id inference:
 - If segmentation already assigned a typed regime window, use that type id.
 - Else if the first token in a window carries `cat_attrs["window_type_id"]`, use it.
-- Else if it carries `cat_attrs["struct_label_id"]`, use `struct_label_id + 1` (reserve `0` for UNK).
+- Else if an early token in the window carries `cat_attrs["transition_window_type_id"]`, use it.
 - Else fall back to `unk_type_id`.
 
 ## 3) Token families (what we model)
@@ -146,9 +146,9 @@ Metadata:
 - `num_attrs`: normalized numeric attributes (optional; currently not projected by the collator
   except for `num_attrs["numeric_value"]`)
 
-Process start/stop markers are additionally emitted as structural process tokens
-(`STRUCT_ACT`, `STRUCT_ENT`) when configured, so transition dynamics are explicit and
-auditable without relying on MedTok UNKs.
+For the minimal v1 structural contract, synthetic process action/entity tokens are disabled by
+default. Structural semantics should come from the structural codebook path, not from extra
+generated token families.
 
 ### 3.3 Numeric side-channel (`numeric_values`)
 The collator extracts `EventToken.num_attrs["numeric_value"]` into a dense tensor

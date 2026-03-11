@@ -76,11 +76,10 @@ def _build_runtime_bundle(
     vocab_config, remapper = build_runtime_vocab_and_remapper(
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
+        structural_yaml=args.structural_yaml,
         medtok_vocab_dir=args.medtok_vocab_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
-        structural_entity_dense_size=args.structural_entity_dense_size,
-        structural_entity_source_size=args.structural_entity_source_size,
     )
     if args.runtime_vocab_json:
         out_fp = Path(args.runtime_vocab_json)
@@ -172,7 +171,6 @@ def main() -> None:
     segmentation_cfg = _build_segmentation_config(
         tokenization_contract=tokenization_contract,
         structural_codebook=artifacts.structural_codebook,
-        manifest=artifacts.manifest,
         unk_type_id=int(window_markers_cfg.unk_type_id),
     )
     residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
@@ -224,8 +222,8 @@ def main() -> None:
             "structural_codebook": artifacts.structural_codebook,
             "window_hook_label": "window_boundary",
             "attach_med_numeric": True,
-            "emit_process_struct_tokens": True,
-            "drop_original_process_marker_tokens": True,
+            "emit_process_struct_tokens": False,
+            "drop_original_process_marker_tokens": False,
             "emit_global_demographic_tokens": True,
             "special_token_offset": 0,
         }

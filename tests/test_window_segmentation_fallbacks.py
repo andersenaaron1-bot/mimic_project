@@ -155,20 +155,11 @@ def test_segment_injects_inter_admission_window_for_short_discharge_gap() -> Non
         enable_inter_admission_windows=True,
         inter_admission_window_type_id=6,
         inter_admission_max_gap_hours=24.0,
-        inter_admission_token_id=2200999,
-        inter_admission_struct_label_id=9,
     )
 
     windows = segment_event_tokens(events, config=cfg)
     assert len(windows) == 3
     assert [window.window_type_id for window in windows] == [3, 6, 2]
     inter_window = windows[1]
-    assert inter_window.start_time_hours == 4.0
-    assert len(inter_window.tokens) == 1
-    gap_token = inter_window.tokens[0]
-    assert gap_token.value_id == 2200999
-    assert gap_token.category_id == int(TokenCategory.STRUCTURAL)
-    assert gap_token.cat_attrs["inter_admission_window"] == 1
-    assert gap_token.cat_attrs["window_type_id"] == 6
-    assert gap_token.cat_attrs["struct_label_id"] == 9
-    assert gap_token.num_attrs["numeric_value"] == 4.0
+    assert inter_window.start_time_hours == 2.0
+    assert inter_window.tokens == []

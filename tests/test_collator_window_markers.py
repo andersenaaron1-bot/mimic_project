@@ -355,8 +355,6 @@ def test_collator_emits_real_inter_admission_window_chunk() -> None:
             enable_inter_admission_windows=True,
             inter_admission_window_type_id=6,
             inter_admission_max_gap_hours=24.0,
-            inter_admission_token_id=2200999,
-            inter_admission_struct_label_id=9,
         ),
     )
 
@@ -364,9 +362,7 @@ def test_collator_emits_real_inter_admission_window_chunk() -> None:
 
     assert batch["window_mask"][0, :3].tolist() == [1, 1, 1]
     assert batch["window_type_ids"][0, :3].tolist() == [3, 6, 2]
-    assert batch["chunk_mask"][0, :3, 0].tolist() == [1, 1, 1]
-    assert batch["window_start_times"][0, :3].tolist() == pytest.approx([0.0, 4.0, 6.0], rel=1e-6)
-    inter_ids = batch["input_ids"][0, 1, 0, :4].tolist()
-    assert inter_ids == [1, 16, 2200999, 18]
-    assert batch["numeric_mask"][0, 1, 0, 2].item() == 1
-    assert batch["numeric_values"][0, 1, 0, 2, 0].item() == pytest.approx(4.0, rel=1e-6)
+    assert batch["chunk_mask"][0, :3, 0].tolist() == [1, 0, 1]
+    assert batch["window_start_times"][0, :3].tolist() == pytest.approx([0.0, 2.0, 6.0], rel=1e-6)
+    assert batch["semantic_token_counts"][0, 1].item() == pytest.approx(0.0, rel=1e-6)
+    assert batch["semantic_duration_hours"][0, 1].item() == pytest.approx(0.0, rel=1e-6)

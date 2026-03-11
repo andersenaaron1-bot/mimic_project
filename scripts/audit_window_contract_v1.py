@@ -31,7 +31,6 @@ from scripts.audit_tokenization_flow import (
     _offset,
     _parse_subject_ids,
     _resolve_residual_policy,
-    _summarize_raw_subjects,
 )
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.data.window_segmentation import (
@@ -209,10 +208,25 @@ def _window_preview(
     struct_id2code: Mapping[int, str],
     type_id2name: Mapping[int, str],
 ) -> Dict[str, Any]:
-    first = window.tokens[0]
-    last = window.tokens[-1]
     category_counts = Counter(TokenCategory(int(tok.category_id)).name for tok in window.tokens)
     clinical_count = sum(1 for tok in window.tokens if int(tok.category_id) in PRIMARY_CLINICAL_CATEGORIES)
+    if not window.tokens:
+        return {
+            "window_type_id": int(window.window_type_id),
+            "window_type_name": type_id2name.get(int(window.window_type_id), str(int(window.window_type_id))),
+            "opening_action": window.opening_action,
+            "closing_action": window.closing_action,
+            "start_time_hours": _round_hours(float(window.start_time_hours)),
+            "end_time_hours": _round_hours(float(window.start_time_hours)),
+            "duration_hours": 0.0,
+            "token_count": 0,
+            "clinical_token_count": 0,
+            "category_counts": {str(k): int(v) for k, v in category_counts.items()},
+            "first_token": None,
+            "last_token": None,
+        }
+    first = window.tokens[0]
+    last = window.tokens[-1]
     return {
         "window_type_id": int(window.window_type_id),
         "window_type_name": type_id2name.get(int(window.window_type_id), str(int(window.window_type_id))),
@@ -281,7 +295,6 @@ def _build_runtime_context(
     segmentation_cfg = _build_segmentation_config(
         tokenization_contract=tokenization_contract,
         structural_codebook=artifacts.structural_codebook,
-        manifest=artifacts.manifest,
         unk_type_id=int(window_markers_cfg.unk_type_id),
     )
     residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
@@ -301,15 +314,7 @@ def _build_runtime_context(
     if not subject_ids:
         raise ValueError(f"No subject IDs found for split={args.split}")
 
-    _, structural_raw_codes = _summarize_raw_subjects(
-        db,
-        subject_ids,
-        artifacts=artifacts,
-        top_k=max(20, int(args.top_k)),
-        progress_every=int(args.progress_every),
-    )
-
-    struct_codes_union = set(structural_raw_codes)
+    struct_codes_union = set()
     if artifacts.structural_codebook is not None:
         struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
@@ -427,8 +432,11 @@ def _audit_window_contract(
             if w_type_id == int(segmentation_cfg.unk_window_type_id):
                 summary["window_type_unknown"] += 1
 
-            last_tok = window.tokens[-1]
-            duration = max(0.0, float(last_tok.t_from_start_hours) - float(window.tokens[0].t_from_start_hours))
+            if window.tokens:
+                last_tok = window.tokens[-1]
+                duration = max(0.0, float(last_tok.t_from_start_hours) - float(window.tokens[0].t_from_start_hours))
+            else:
+                duration = 0.0
             clinical_count = sum(1 for tok in window.tokens if int(tok.category_id) in PRIMARY_CLINICAL_CATEGORIES)
             is_inter_window = (
                 segmentation_cfg.inter_admission_window_type_id is not None
@@ -659,6 +667,8 @@ def _audit_window_contract(
             )
 
         for left, right in zip(windows, windows[1:]):
+            if not left.tokens or not right.tokens:
+                continue
             left_last = left.tokens[-1]
             right_first = right.tokens[0]
             gap_hours = max(0.0, float(right.start_time_hours) - float(left_last.t_from_start_hours))
@@ -879,7 +889,6 @@ def main() -> None:
             "enable_inter_admission_windows": bool(segmentation_cfg.enable_inter_admission_windows),
             "inter_admission_window_type_id": segmentation_cfg.inter_admission_window_type_id,
             "inter_admission_max_gap_hours": float(segmentation_cfg.inter_admission_max_gap_hours),
-            "inter_admission_token_id": segmentation_cfg.inter_admission_token_id,
         },
         "results": results,
     }

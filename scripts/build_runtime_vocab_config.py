@@ -22,26 +22,24 @@ def main() -> None:
     )
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
+    ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
     ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--code2id_pt", default=None)
     ap.add_argument("--tokenizer_ckpt", default=None)
     ap.add_argument("--measurement_code_size", type=int, default=None)
     ap.add_argument("--rvq_size", type=int, default=None)
-    ap.add_argument("--structural_entity_dense_size", type=int, default=65_536)
-    ap.add_argument("--structural_entity_source_size", type=int, default=900_000)
     ap.add_argument("--output_json", required=True)
     args = ap.parse_args()
 
     vocab_config, remapper = build_runtime_vocab_and_remapper(
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
+        structural_yaml=args.structural_yaml,
         medtok_vocab_dir=args.medtok_vocab_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
         measurement_code_size=args.measurement_code_size,
         rvq_size=args.rvq_size,
-        structural_entity_dense_size=args.structural_entity_dense_size,
-        structural_entity_source_size=args.structural_entity_source_size,
     )
 
     payload = {
@@ -59,7 +57,6 @@ def main() -> None:
             "size_rvq": int(vocab_config["size_rvq"]),
             "size_meas_labels": int(vocab_config["size_meas_labels"]),
             "size_meds": int(vocab_config["size_meds"]),
-            "structural_entity_dense_size": int(args.structural_entity_dense_size),
         },
         indent=2,
     ))
