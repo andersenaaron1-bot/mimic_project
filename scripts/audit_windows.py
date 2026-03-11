@@ -19,14 +19,17 @@ from scripts.audit_tokenization_flow import (
     SPECIAL_ID2NAME,
     AuditArtifacts,
     _audit_subject_tokenization,
+    _build_semantic_resolution_encoders,
     _build_measurement_config,
     _build_static_artifacts,
     _build_struct_vocab,
     _load_subject_ids,
     _make_structural_id2label,
     _offset,
+    _resolve_residual_policy,
     _summarize_raw_subjects,
 )
+from src.ehr_hier.data.structural_codes import structural_surface_code, structural_surface_vocab_codes
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
 from src.ehr_hier.tokenizers.decode_tokens import decode_timeline_tokens, invert_code2id
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
@@ -888,9 +891,11 @@ def main() -> None:
     ap.add_argument("--subject_ids", default=None, help="Comma-separated subject ids to inspect.")
     ap.add_argument("--top_k", type=int, default=20)
 
-    ap.add_argument("--medtok_vocab_dir", default=str(PROJECT_ROOT / "artifacts" / "medtok"))
+    ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_attr_dir", default=str(PROJECT_ROOT / "artifacts" / "medtok_attrs"))
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
+    ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument(
         "--codes_parquet_parent_lookup",
         default=None,
@@ -954,6 +959,16 @@ def main() -> None:
 
     subject_ids = _parse_subject_ids(args.subject_ids)
     artifacts = _build_static_artifacts(args)
+    residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
+        args,
+        tokenization_contract={},
+    )
+    semantic_resolvers = _build_semantic_resolution_encoders(
+        artifacts=artifacts,
+        residual_enabled=bool(residual_enabled),
+        residual_buckets=int(residual_buckets),
+        residual_offsets=dict(residual_offsets),
+    )
     db = mr.SubjectDatabase(args.meds_reader_db)
     if not subject_ids:
         subject_ids = _load_subject_ids(args.splits_parquet, args.split, args.max_subjects)
@@ -964,12 +979,23 @@ def main() -> None:
         db,
         subject_ids,
         artifacts=artifacts,
+        semantic_resolvers=semantic_resolvers,
         top_k=args.top_k,
     )
 
-    struct_codes_union = set(structural_raw_codes)
-    if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+    struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
+    struct_codes_union.update(
+        str(surface)
+        for surface in (
+            structural_surface_code(
+                code,
+                codebook=artifacts.structural_codebook,
+                routed_category=TokenCategory.STRUCTURAL,
+            )
+            for code in structural_raw_codes
+        )
+        if surface
+    )
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
     struct_id2code = invert_code2id(struct_vocab.code2id)
 
@@ -989,17 +1015,9 @@ def main() -> None:
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
-        enable_residual_fallback=not bool(args.disable_residual_fallback),
-        residual_fallback_buckets=int(args.residual_fallback_buckets),
-        residual_fallback_offsets={
-            k: int(v)
-            for k, v in {
-                "diagnosis": args.diag_residual_offset,
-                "procedure": args.proc_residual_offset,
-                "medication": args.med_residual_offset,
-            }.items()
-            if v is not None
-        },
+        enable_residual_fallback=bool(residual_enabled),
+        residual_fallback_buckets=int(residual_buckets),
+        residual_fallback_offsets=dict(residual_offsets),
     )
 
     policies = _make_policies(args)

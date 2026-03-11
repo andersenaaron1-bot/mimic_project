@@ -30,6 +30,7 @@ from src.ehr_hier.tokenizers.medtok_loader import (  # noqa: E402
     build_vocab_from_code2embeddings,
     load_medtok_vocab,
 )
+from src.ehr_hier.tokenizers.vocab_contract import validate_medtok_inputs
 
 
 def _offset(manifest: Dict[str, Any], key: str, default: int) -> int:
@@ -298,7 +299,8 @@ def main() -> None:
     ap.add_argument("--decision_csv", required=True)
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--medtok_code2embeds", default=None)
-    ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
+    ap.add_argument("--medtok_vocab_dir", default=None)
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
 
     ap.add_argument("--diag_max_explicit", type=int, default=20_000)
     ap.add_argument("--proc_max_explicit", type=int, default=10_000)
@@ -343,22 +345,27 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     manifest = _load_manifest()
+    medtok_inputs = validate_medtok_inputs(
+        medtok_code2embeds=args.medtok_code2embeds,
+        medtok_vocab_dir=args.medtok_vocab_dir,
+        allow_smoke_medtok=bool(args.allow_smoke_medtok),
+    )
     full_diag = _load_full_vocab(
         name="diagnosis",
-        medtok_code2embeds=args.medtok_code2embeds,
-        medtok_vocab_dir=Path(args.medtok_vocab_dir),
+        medtok_code2embeds=medtok_inputs["medtok_code2embeds"],
+        medtok_vocab_dir=Path(medtok_inputs["medtok_vocab_dir"] or out_dir),
         manifest=manifest,
     )
     full_proc = _load_full_vocab(
         name="procedure",
-        medtok_code2embeds=args.medtok_code2embeds,
-        medtok_vocab_dir=Path(args.medtok_vocab_dir),
+        medtok_code2embeds=medtok_inputs["medtok_code2embeds"],
+        medtok_vocab_dir=Path(medtok_inputs["medtok_vocab_dir"] or out_dir),
         manifest=manifest,
     )
     full_med = _load_full_vocab(
         name="medication",
-        medtok_code2embeds=args.medtok_code2embeds,
-        medtok_vocab_dir=Path(args.medtok_vocab_dir),
+        medtok_code2embeds=medtok_inputs["medtok_code2embeds"],
+        medtok_vocab_dir=Path(medtok_inputs["medtok_vocab_dir"] or out_dir),
         manifest=manifest,
     )
 

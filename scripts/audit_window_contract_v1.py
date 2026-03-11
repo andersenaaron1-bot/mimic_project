@@ -44,6 +44,7 @@ from src.ehr_hier.data.window_segmentation import (
 )
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
 from src.ehr_hier.tokenizers.decode_tokens import invert_code2id
+from src.ehr_hier.data.structural_codes import structural_surface_vocab_codes
 
 
 TRANSITION_PREFIXES = {
@@ -314,9 +315,7 @@ def _build_runtime_context(
     if not subject_ids:
         raise ValueError(f"No subject IDs found for split={args.split}")
 
-    struct_codes_union = set()
-    if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+    struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
     struct_id2code = invert_code2id(struct_vocab.code2id)
 
@@ -832,8 +831,10 @@ def main() -> None:
     ap.add_argument("--subject_ids", default=None)
     ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--medtok_code2embeds", default=None)
-    ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
+    ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
+    ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument("--codes_parquet_parent_lookup", default=None)
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")

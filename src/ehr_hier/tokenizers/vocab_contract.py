@@ -14,6 +14,8 @@ from src.ehr_hier.data.structural_codes import (
 
 
 DEFAULT_SPARSE_VOCAB_JSON = "artifacts/token_vocab_sparse_v1.json"
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+REPO_SMOKE_MEDTOK_DIR = (PROJECT_ROOT / "artifacts" / "medtok").resolve()
 DEFAULT_RUNTIME_LANE_ORDER: tuple[str, ...] = (
     "logits_struct",
     "logits_rvq",
@@ -56,6 +58,55 @@ def _load_yaml(path: str | Path) -> Dict[str, Any]:
 
 def _safe_dict(x: Any) -> Dict[str, Any]:
     return x if isinstance(x, dict) else {}
+
+
+def _resolve_optional_path(path: str | Path | None) -> Optional[Path]:
+    if path is None:
+        return None
+    fp = Path(path)
+    if not fp.is_absolute():
+        fp = PROJECT_ROOT / fp
+    return fp.resolve()
+
+
+def validate_medtok_inputs(
+    *,
+    medtok_code2embeds: str | Path | None = None,
+    medtok_vocab_dir: str | Path | None = None,
+    allow_smoke_medtok: bool = False,
+) -> Dict[str, Optional[str]]:
+    code2embeds_fp = _resolve_optional_path(medtok_code2embeds)
+    vocab_dir_fp = _resolve_optional_path(medtok_vocab_dir)
+
+    if code2embeds_fp is not None:
+        if not code2embeds_fp.exists():
+            raise FileNotFoundError(f"MedTok code2embeddings file not found: {code2embeds_fp}")
+        return {
+            "medtok_code2embeds": str(code2embeds_fp),
+            "medtok_vocab_dir": str(vocab_dir_fp) if vocab_dir_fp is not None else None,
+        }
+
+    if vocab_dir_fp is None:
+        raise ValueError(
+            "A production MedTok source is required. Pass either --medtok_code2embeds or --medtok_vocab_dir."
+        )
+    if not vocab_dir_fp.exists():
+        raise FileNotFoundError(f"MedTok vocab dir not found: {vocab_dir_fp}")
+    if vocab_dir_fp == REPO_SMOKE_MEDTOK_DIR and not bool(allow_smoke_medtok):
+        raise ValueError(
+            f"Refusing to use repo smoke MedTok vocab dir for production tokenization: {vocab_dir_fp}. "
+            "Pass a generated MedTok vocab dir or use --allow_smoke_medtok only for test/debug."
+        )
+    required_files = ("diag_vocab.json", "proc_vocab.json", "med_vocab.json")
+    missing = [name for name in required_files if not (vocab_dir_fp / name).exists()]
+    if missing:
+        raise FileNotFoundError(
+            f"MedTok vocab dir is missing required files {missing}: {vocab_dir_fp}"
+        )
+    return {
+        "medtok_code2embeds": None,
+        "medtok_vocab_dir": str(vocab_dir_fp),
+    }
 
 
 def _vocab_size_from_json(vocab_fp: str | Path | None) -> Optional[int]:
@@ -152,10 +203,12 @@ def build_sparse_vocab_contract(
     structural_yaml: str | Path = "configs/data/structural_codes.yaml",
     medtok_vocab_dir: str | Path | None = None,
     medtok_attr_dir: str | Path | None = "artifacts/medtok_attrs",
+    medtok_code2embeds: str | Path | None = None,
     code2id_pt: str | Path | None = None,
     tokenizer_ckpt: str | Path | None = None,
     measurement_code_size: Optional[int] = None,
     rvq_size: Optional[int] = None,
+    allow_smoke_medtok: bool = False,
 ) -> Dict[str, Any]:
     contract = _load_yaml(tokenization_contract)
     legacy_manifest = _load_json(vocab_manifest) if Path(vocab_manifest).exists() else {}
@@ -215,7 +268,12 @@ def build_sparse_vocab_contract(
     obs_code_offset = _offset("observation_code", 2_300_000)
     obs_val_offset = _offset("observation_value", 2_320_000)
 
-    medtok_dir = Path(medtok_vocab_dir) if medtok_vocab_dir is not None else None
+    medtok_inputs = validate_medtok_inputs(
+        medtok_code2embeds=medtok_code2embeds,
+        medtok_vocab_dir=medtok_vocab_dir,
+        allow_smoke_medtok=allow_smoke_medtok,
+    )
+    medtok_dir = Path(medtok_inputs["medtok_vocab_dir"]) if medtok_inputs["medtok_vocab_dir"] is not None else None
     medtok_attr = Path(medtok_attr_dir) if medtok_attr_dir is not None else None
 
     diag_size = _vocab_size_from_json((medtok_dir / "diag_vocab.json") if medtok_dir is not None else None) or 20_000
@@ -392,7 +450,8 @@ def build_sparse_vocab_contract(
             "tokenization_contract": str(tokenization_contract),
             "vocab_manifest": str(vocab_manifest),
             "structural_yaml": str(structural_yaml),
-            "medtok_vocab_dir": str(medtok_vocab_dir) if medtok_vocab_dir is not None else None,
+            "medtok_code2embeds": str(medtok_inputs["medtok_code2embeds"]) if medtok_inputs["medtok_code2embeds"] is not None else None,
+            "medtok_vocab_dir": str(medtok_inputs["medtok_vocab_dir"]) if medtok_inputs["medtok_vocab_dir"] is not None else None,
             "medtok_attr_dir": str(medtok_attr_dir) if medtok_attr_dir is not None else None,
             "code2id_pt": str(code2id_pt) if code2id_pt is not None else None,
             "tokenizer_ckpt": str(tokenizer_ckpt) if tokenizer_ckpt is not None else None,
@@ -433,4 +492,3 @@ def write_sparse_vocab_contract(contract: Mapping[str, Any], output_json: str | 
     out_fp.parent.mkdir(parents=True, exist_ok=True)
     out_fp.write_text(json.dumps(dict(contract), indent=2), encoding="utf-8")
     return out_fp
-

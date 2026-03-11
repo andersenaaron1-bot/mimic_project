@@ -231,6 +231,7 @@ def main() -> None:
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", required=True)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
     ap.add_argument("--codes_parquet_parent_lookup", default=None)
 
     ap.add_argument("--code2id_pt", required=True)
@@ -259,10 +260,12 @@ def main() -> None:
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
         structural_yaml=args.structural_yaml,
+        medtok_code2embeds=args.medtok_code2embeds,
         medtok_vocab_dir=args.medtok_vocab_dir,
         medtok_attr_dir=args.medtok_attr_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
+        allow_smoke_medtok=bool(args.allow_smoke_medtok),
     )
 
     observed_ids_by_block: Dict[str, set[int]] = defaultdict(set)

@@ -37,6 +37,7 @@ from src.ehr_hier.tokenizers.medtok_loader import (
     build_vocab_from_code2embeddings,
     load_medtok_vocab,
 )
+from src.ehr_hier.tokenizers.vocab_contract import validate_medtok_inputs
 
 
 @dataclass
@@ -116,27 +117,33 @@ def _build_artifacts(args: argparse.Namespace) -> Artifacts:
     if args.code2id_pt:
         code2id = torch.load(args.code2id_pt, map_location="cpu")
 
-    if args.medtok_code2embeds:
+    medtok_inputs = validate_medtok_inputs(
+        medtok_code2embeds=getattr(args, "medtok_code2embeds", None),
+        medtok_vocab_dir=getattr(args, "medtok_vocab_dir", None),
+        allow_smoke_medtok=bool(getattr(args, "allow_smoke_medtok", False)),
+    )
+
+    if medtok_inputs["medtok_code2embeds"]:
         diag_vocab = build_vocab_from_code2embeddings(
-            args.medtok_code2embeds,
+            str(medtok_inputs["medtok_code2embeds"]),
             offset=_offset(manifest, "diagnosis", 1_000_000),
             name="diagnosis",
             filter_fn=diagnosis_filter,
         )
         proc_vocab = build_vocab_from_code2embeddings(
-            args.medtok_code2embeds,
+            str(medtok_inputs["medtok_code2embeds"]),
             offset=_offset(manifest, "procedure", 1_200_000),
             name="procedure",
             filter_fn=procedure_filter,
         )
         med_vocab = build_vocab_from_code2embeddings(
-            args.medtok_code2embeds,
+            str(medtok_inputs["medtok_code2embeds"]),
             offset=_offset(manifest, "medication", 1_400_000),
             name="medication",
             filter_fn=medication_filter,
         )
     else:
-        medtok_dir = Path(args.medtok_vocab_dir)
+        medtok_dir = Path(str(medtok_inputs["medtok_vocab_dir"]))
         diag_vocab = load_medtok_vocab(
             str(medtok_dir / "diag_vocab.json"),
             offset=_offset(manifest, "diagnosis", 1_000_000),
@@ -237,7 +244,8 @@ def main() -> None:
     ap.add_argument("--top_k", type=int, default=500)
     ap.add_argument("--min_count", type=int, default=5)
     ap.add_argument("--medtok_code2embeds", default=None)
-    ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
+    ap.add_argument("--medtok_vocab_dir", default=None)
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
     ap.add_argument("--code2id_pt", default=None)
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
     ap.add_argument("--output_csv", required=True)
@@ -429,4 +437,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

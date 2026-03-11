@@ -253,6 +253,47 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
     assert stats["unmapped_tokens"] == 0
 
 
+def test_sparse_vocab_contract_requires_explicit_medtok_source(tmp_path) -> None:
+    from ehr_hier.tokenizers.vocab_contract import build_sparse_vocab_contract
+
+    contract_fp = tmp_path / "tokenization_v1.yaml"
+    contract_fp.write_text(
+        yaml.safe_dump(
+            {
+                "frozen_ranges": {
+                    "special": {"offset": 0, "reserved_max_id": 31},
+                    "diagnosis": {"offset": 1000000},
+                    "procedure": {"offset": 1200000},
+                    "medication": {"offset": 1400000},
+                    "measurement_code": {"offset": 2000000},
+                    "measurement_value": {"offset": 2100000},
+                    "structural": {"offset": 2200000},
+                    "observation_code": {"offset": 2300000},
+                    "observation_value": {"offset": 2320000},
+                },
+                "window_markers": {
+                    "enabled": True,
+                    "type_token_offset": 10,
+                    "num_types": 7,
+                    "end_token_id": 17,
+                    "continue_token_id": 18,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    try:
+        build_sparse_vocab_contract(
+            tokenization_contract=contract_fp,
+            measurement_code_size=128,
+            rvq_size=32,
+        )
+        assert False, "Expected missing MedTok source to raise"
+    except ValueError as exc:
+        assert "MedTok source" in str(exc)
+
+
 def test_collator_reports_overflow_and_remap_stats_and_next_type_fallback() -> None:
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.data.window_segmentation import SegmentedChunk
@@ -346,3 +387,61 @@ def test_collator_reports_overflow_and_remap_stats_and_next_type_fallback() -> N
         next_start_abs=None,
     )
     assert ids[-1] == 12  # type_token_offset(10) + next_type_id(2)
+
+
+def test_runtime_bundle_loader_recovers_top_level_sparse_contract(tmp_path) -> None:
+    from ehr_hier.transformer.vocab_runtime import load_runtime_vocab_bundle
+
+    bundle_fp = tmp_path / "runtime_bundle.json"
+    bundle_fp.write_text(
+        json.dumps(
+            {
+                "sparse_vocab_contract": {
+                    "families": {
+                        "special": {"offset": 0, "source_size": 4},
+                    }
+                },
+                "vocab_config": {
+                    "total_size": 4,
+                    "size_special": 4,
+                    "size_rvq": 0,
+                    "size_meas_labels": 0,
+                    "size_meds": 0,
+                    "routing": {"logits_struct": [{"offset": 0, "size": 4, "name": "special"}]},
+                    "window_markers": {"type_token_offset": 10, "num_types": 1, "end_token_id": 11, "continue_token_id": 12},
+                    "dense_blocks": [
+                        {
+                            "name": "special",
+                            "head": "logits_struct",
+                            "global_offset": 0,
+                            "source_size": 4,
+                            "global_max": 3,
+                            "dense_offset": 0,
+                            "dense_size": 4,
+                            "mode": "identity",
+                            "sparse_global_ids": None,
+                        }
+                    ],
+                },
+                "id_remapper": {
+                    "unk_dense_id": 0,
+                    "blocks": [
+                        {
+                            "name": "special",
+                            "head": "logits_struct",
+                            "global_offset": 0,
+                            "source_size": 4,
+                            "dense_offset": 0,
+                            "dense_size": 4,
+                            "mode": "identity",
+                            "sparse_global_ids": None,
+                        }
+                    ],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    vocab_config, _ = load_runtime_vocab_bundle(bundle_fp)
+    assert vocab_config["sparse_vocab_contract"]["families"]["special"]["offset"] == 0

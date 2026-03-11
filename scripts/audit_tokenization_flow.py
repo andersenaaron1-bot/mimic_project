@@ -63,6 +63,7 @@ from src.ehr_hier.tokenizers.vocab_contract import (
     DEFAULT_SPARSE_VOCAB_JSON,
     build_legacy_manifest_from_sparse_contract,
     load_sparse_vocab_contract,
+    validate_medtok_inputs,
 )
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
@@ -416,8 +417,21 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         else None
     )
 
-    medtok_code2embeds = Path(args.medtok_code2embeds) if args.medtok_code2embeds else None
-    medtok_vocab_dir = Path(args.medtok_vocab_dir)
+    medtok_inputs = validate_medtok_inputs(
+        medtok_code2embeds=getattr(args, "medtok_code2embeds", None),
+        medtok_vocab_dir=getattr(args, "medtok_vocab_dir", None),
+        allow_smoke_medtok=bool(getattr(args, "allow_smoke_medtok", False)),
+    )
+    medtok_code2embeds = (
+        Path(medtok_inputs["medtok_code2embeds"])
+        if medtok_inputs["medtok_code2embeds"] is not None
+        else None
+    )
+    medtok_vocab_dir = (
+        Path(medtok_inputs["medtok_vocab_dir"])
+        if medtok_inputs["medtok_vocab_dir"] is not None
+        else None
+    )
     medtok_attr_dir = Path(args.medtok_attr_dir)
 
     if medtok_code2embeds is not None:
@@ -1393,8 +1407,10 @@ def main() -> None:
     ap.add_argument("--subject_ids", default=None, help="Comma-separated subject ids to inspect.")
     ap.add_argument("--top_k", type=int, default=20)
     ap.add_argument("--medtok_code2embeds", default=None)
-    ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
+    ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
+    ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument(
         "--tokenization_yaml",
         default="configs/data/tokenization_v1.yaml",

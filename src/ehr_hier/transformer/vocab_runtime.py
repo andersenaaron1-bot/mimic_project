@@ -231,24 +231,28 @@ def build_runtime_vocab_and_remapper(
     tokenization_contract: str | Path = "configs/data/tokenization_v1.yaml",
     vocab_manifest: str | Path = "artifacts/vocab_manifest.json",
     structural_yaml: str | Path = "configs/data/structural_codes.yaml",
+    medtok_code2embeds: str | Path | None = None,
     medtok_vocab_dir: str | Path | None = None,
     medtok_attr_dir: str | Path | None = "artifacts/medtok_attrs",
     code2id_pt: str | Path | None = None,
     tokenizer_ckpt: str | Path | None = None,
     measurement_code_size: Optional[int] = None,
     rvq_size: Optional[int] = None,
+    allow_smoke_medtok: bool = False,
 ) -> tuple[Dict[str, Any], DenseIdRemapper]:
     if sparse_vocab_contract is None:
         sparse_contract = build_sparse_vocab_contract(
             tokenization_contract=tokenization_contract,
             vocab_manifest=vocab_manifest,
             structural_yaml=structural_yaml,
+            medtok_code2embeds=medtok_code2embeds,
             medtok_vocab_dir=medtok_vocab_dir,
             medtok_attr_dir=medtok_attr_dir,
             code2id_pt=code2id_pt,
             tokenizer_ckpt=tokenizer_ckpt,
             measurement_code_size=measurement_code_size,
             rvq_size=rvq_size,
+            allow_smoke_medtok=allow_smoke_medtok,
         )
     elif isinstance(sparse_vocab_contract, Mapping):
         sparse_contract = dict(sparse_vocab_contract)
@@ -462,6 +466,8 @@ def load_runtime_vocab_bundle(bundle_json: str | Path) -> tuple[Dict[str, Any], 
     vocab_config = _safe_dict(payload.get("vocab_config", {}))
     if not vocab_config:
         raise ValueError(f"bundle missing non-empty 'vocab_config': {bundle_json}")
+    if "sparse_vocab_contract" not in vocab_config and payload.get("sparse_vocab_contract", None) is not None:
+        vocab_config["sparse_vocab_contract"] = payload["sparse_vocab_contract"]
     remap_payload = _safe_dict(payload.get("id_remapper", {}))
     remapper = DenseIdRemapper.from_serialized(remap_payload)
     return vocab_config, remapper

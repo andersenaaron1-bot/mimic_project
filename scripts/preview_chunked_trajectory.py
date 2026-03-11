@@ -27,6 +27,7 @@ from scripts.audit_tokenization_flow import (  # noqa: E402
     _resolve_residual_policy,
 )
 from src.ehr_hier.data.event_router import classify_code_to_category  # noqa: E402
+from src.ehr_hier.data.structural_codes import structural_surface_code, structural_surface_vocab_codes  # noqa: E402
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline  # noqa: E402
 from src.ehr_hier.data.token_types import EventToken, TokenCategory  # noqa: E402
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders  # noqa: E402
@@ -86,7 +87,9 @@ def _gather_structural_codes(subj) -> set[str]:
     for ev in subj.events:
         code = getattr(ev, "code", None)
         if classify_code_to_category(code) == TokenCategory.STRUCTURAL and code is not None:
-            codes.add(str(code))
+            surface = structural_surface_code(code, routed_category=TokenCategory.STRUCTURAL)
+            if surface:
+                codes.add(str(surface))
     return codes
 
 
@@ -284,8 +287,10 @@ def main() -> None:
     ap.add_argument("--subject_id", type=int, default=None)
     ap.add_argument("--subject_index", type=int, default=0, help="Index within the split if --subject_id is omitted.")
     ap.add_argument("--medtok_code2embeds", default=None)
-    ap.add_argument("--medtok_vocab_dir", default="artifacts/medtok")
+    ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
+    ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument(
         "--tokenization_yaml",
         default="configs/data/tokenization_v1.yaml",
@@ -341,7 +346,7 @@ def main() -> None:
     subj = db[int(subject_id)]
     struct_codes_union = _gather_structural_codes(subj)
     if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+        struct_codes_union.update(structural_surface_vocab_codes(artifacts.structural_codebook))
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
     struct_id2code = invert_code2id(struct_vocab.code2id)
 

@@ -23,8 +23,10 @@ def main() -> None:
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
+    ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--allow_smoke_medtok", action="store_true")
     ap.add_argument("--code2id_pt", default=None)
     ap.add_argument("--tokenizer_ckpt", default=None)
     ap.add_argument("--measurement_code_size", type=int, default=None)
@@ -36,12 +38,14 @@ def main() -> None:
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
         structural_yaml=args.structural_yaml,
+        medtok_code2embeds=args.medtok_code2embeds,
         medtok_vocab_dir=args.medtok_vocab_dir,
         medtok_attr_dir=args.medtok_attr_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
         measurement_code_size=args.measurement_code_size,
         rvq_size=args.rvq_size,
+        allow_smoke_medtok=bool(args.allow_smoke_medtok),
     )
 
     out_fp = Path(args.output_json)
