@@ -29,6 +29,7 @@ from scripts.audit_tokenization_flow import (
     _resolve_residual_policy,
 )
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
+from src.ehr_hier.data.structural_codes import structural_surface_vocab_codes
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
 from src.ehr_hier.transformer.vocab_runtime import (
@@ -97,9 +98,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         tokenization_contract=tokenization_contract,
     )
 
-    struct_codes_union = set()
-    if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+    struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
 
     meas_cfg = _build_measurement_config(worker_args, artifacts=artifacts)
@@ -227,6 +226,7 @@ def main() -> None:
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
+    ap.add_argument("--sparse_vocab_json", default=None)
 
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", required=True)
@@ -255,10 +255,12 @@ def main() -> None:
     random.seed(int(args.sample_seed))
 
     base_vocab_config, base_remapper = build_runtime_vocab_and_remapper(
+        sparse_vocab_contract=args.sparse_vocab_json,
         tokenization_contract=args.tokenization_yaml,
         vocab_manifest=args.vocab_manifest,
         structural_yaml=args.structural_yaml,
         medtok_vocab_dir=args.medtok_vocab_dir,
+        medtok_attr_dir=args.medtok_attr_dir,
         code2id_pt=args.code2id_pt,
         tokenizer_ckpt=args.tokenizer_ckpt,
     )
@@ -371,6 +373,7 @@ def main() -> None:
     out_fp = Path(args.out_json)
     out_fp.parent.mkdir(parents=True, exist_ok=True)
     payload = {
+        "sparse_vocab_contract": dict(base_vocab_config.get("sparse_vocab_contract", {}) or {}),
         "vocab_config": compact_vocab_config,
         "id_remapper": compact_remapper.serialize(),
         "summary": {

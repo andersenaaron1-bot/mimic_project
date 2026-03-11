@@ -6,86 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence
 
 import torch
-import yaml
 
-from src.ehr_hier.data.structural_codes import load_structural_codebook_yaml
-
-
-def _load_json(path: str | Path) -> Dict[str, Any]:
-    fp = Path(path)
-    payload = json.loads(fp.read_text(encoding="utf-8"))
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected JSON object at {fp}, got {type(payload)}")
-    return payload
-
-
-def _load_yaml(path: str | Path) -> Dict[str, Any]:
-    fp = Path(path)
-    payload = yaml.safe_load(fp.read_text(encoding="utf-8"))
-    if payload is None:
-        return {}
-    if not isinstance(payload, dict):
-        raise TypeError(f"Expected YAML object at {fp}, got {type(payload)}")
-    return payload
-
-
-def _safe_dict(x: Any) -> Dict[str, Any]:
-    return x if isinstance(x, dict) else {}
-
-
-def _vocab_size_from_json(vocab_fp: str | Path | None) -> Optional[int]:
-    if vocab_fp is None:
-        return None
-    fp = Path(vocab_fp)
-    if not fp.exists():
-        return None
-    payload = _load_json(fp)
-    vals: List[int] = []
-    for v in payload.values():
-        try:
-            vals.append(int(v))
-        except Exception:
-            continue
-    if not vals:
-        return None
-    return max(vals) + 1
-
-
-def _code2id_size(code2id_pt: str | Path | None) -> Optional[int]:
-    if code2id_pt is None:
-        return None
-    fp = Path(code2id_pt)
-    if not fp.exists():
-        return None
-    payload = torch.load(str(fp), map_location="cpu")
-    if not isinstance(payload, dict):
-        return None
-    vals: List[int] = []
-    for v in payload.values():
-        try:
-            vals.append(int(v))
-        except Exception:
-            continue
-    if not vals:
-        return None
-    return max(vals) + 1
-
-
-def _rvq_size_from_ckpt(tokenizer_ckpt: str | Path | None) -> Optional[int]:
-    if tokenizer_ckpt is None:
-        return None
-    fp = Path(tokenizer_ckpt)
-    if not fp.exists():
-        return None
-    payload = torch.load(str(fp), map_location="cpu")
-    if not isinstance(payload, dict):
-        return None
-    cfg = _safe_dict(payload.get("cfg", {}))
-    num_codebooks = int(cfg.get("num_codebooks", 0))
-    codebook_size = int(cfg.get("codebook_size", 0))
-    if num_codebooks <= 0 or codebook_size <= 0:
-        return None
-    return int(num_codebooks * codebook_size)
+from src.ehr_hier.tokenizers.vocab_contract import (
+    _load_json,
+    build_sparse_vocab_contract,
+    load_sparse_vocab_contract,
+    _safe_dict,
+)
 
 
 @dataclass(frozen=True)
@@ -300,104 +227,85 @@ class DenseIdRemapper:
 
 def build_runtime_vocab_and_remapper(
     *,
+    sparse_vocab_contract: str | Path | Mapping[str, Any] | None = None,
     tokenization_contract: str | Path = "configs/data/tokenization_v1.yaml",
     vocab_manifest: str | Path = "artifacts/vocab_manifest.json",
     structural_yaml: str | Path = "configs/data/structural_codes.yaml",
     medtok_vocab_dir: str | Path | None = None,
+    medtok_attr_dir: str | Path | None = "artifacts/medtok_attrs",
     code2id_pt: str | Path | None = None,
     tokenizer_ckpt: str | Path | None = None,
     measurement_code_size: Optional[int] = None,
     rvq_size: Optional[int] = None,
-    structural_entity_dense_size: int = 65_536,
-    structural_entity_source_size: int = 900_000,
 ) -> tuple[Dict[str, Any], DenseIdRemapper]:
-    contract = _load_yaml(tokenization_contract)
-    manifest = _load_json(vocab_manifest)
-    frozen = _safe_dict(contract.get("frozen_ranges", {}))
-    residual_cfg = _safe_dict(contract.get("residual_fallback", {}))
-    markers_cfg = _safe_dict(contract.get("window_markers", {}))
+    if sparse_vocab_contract is None:
+        sparse_contract = build_sparse_vocab_contract(
+            tokenization_contract=tokenization_contract,
+            vocab_manifest=vocab_manifest,
+            structural_yaml=structural_yaml,
+            medtok_vocab_dir=medtok_vocab_dir,
+            medtok_attr_dir=medtok_attr_dir,
+            code2id_pt=code2id_pt,
+            tokenizer_ckpt=tokenizer_ckpt,
+            measurement_code_size=measurement_code_size,
+            rvq_size=rvq_size,
+        )
+    elif isinstance(sparse_vocab_contract, Mapping):
+        sparse_contract = dict(sparse_vocab_contract)
+    else:
+        sparse_contract = load_sparse_vocab_contract(sparse_vocab_contract)
 
-    def _offset(name: str, default: int) -> int:
-        m = _safe_dict(manifest.get(name, {}))
-        if "offset" in m:
-            return int(m["offset"])
-        fr = _safe_dict(frozen.get(name, {}))
-        if "offset" in fr:
-            return int(fr["offset"])
-        return int(default)
-
-    def _bucket(name: str, default: int) -> int:
-        fr = _safe_dict(frozen.get(name, {}))
-        if "buckets" in fr:
-            return int(fr["buckets"])
-        if "buckets" in residual_cfg:
-            return int(residual_cfg["buckets"])
-        return int(default)
-
-    special_offset = _offset("special", 0)
-    special_reserved_max = int(_safe_dict(frozen.get("special", {})).get("reserved_max_id", 99))
-    marker_type_offset = int(markers_cfg.get("type_token_offset", 10))
-    marker_num_types = int(markers_cfg.get("num_types", 16))
-    marker_end = int(markers_cfg.get("end_token_id", marker_type_offset + marker_num_types))
-    marker_continue = int(markers_cfg.get("continue_token_id", marker_end + 1))
-    special_max_needed = max(special_reserved_max, marker_type_offset + marker_num_types - 1, marker_end, marker_continue)
-    special_size = int(special_max_needed + 1)
-
-    diag_offset = _offset("diagnosis", 1_000_000)
-    diag_res_offset = _offset("diagnosis_residual", 1_160_000)
-    proc_offset = _offset("procedure", 1_200_000)
-    proc_res_offset = _offset("procedure_residual", 1_360_000)
-    med_offset = _offset("medication", 1_400_000)
-    med_res_offset = _offset("medication_residual", 1_800_000)
-    meas_code_offset = _offset("measurement_code", 2_000_000)
-    meas_val_offset = _offset("measurement_value", 2_100_000)
-    structural_offset = _offset("structural", 2_200_000)
-    obs_code_offset = _offset("observation_code", 2_300_000)
-    obs_val_offset = _offset("observation_value", 2_320_000)
-    struct_action_offset = _offset("structural_action", 2_400_000)
-
-    def _size_from_gap(lo: int, hi: int, default: int) -> int:
-        gap = int(hi) - int(lo)
-        if gap > 0:
-            return int(gap)
-        return int(default)
-
-    medtok_dir = Path(medtok_vocab_dir) if medtok_vocab_dir is not None else None
-    diag_size = _vocab_size_from_json((medtok_dir / "diag_vocab.json") if medtok_dir is not None else None) or 20_000
-    proc_size = _vocab_size_from_json((medtok_dir / "proc_vocab.json") if medtok_dir is not None else None) or 10_000
-    med_size = _vocab_size_from_json((medtok_dir / "med_vocab.json") if medtok_dir is not None else None) or 25_000
-
-    meas_code_size_eff = (
-        int(measurement_code_size)
-        if measurement_code_size is not None
-        else (_code2id_size(code2id_pt) or 10_000)
+    families = _safe_dict(sparse_contract.get("families", {}))
+    if not families:
+        raise ValueError("Sparse vocab contract must contain non-empty 'families'")
+    markers_cfg = _safe_dict(sparse_contract.get("window_markers", {}))
+    lane_order = tuple(
+        str(x)
+        for x in sparse_contract.get(
+            "runtime_lane_order",
+            ("logits_struct", "logits_rvq", "logits_meas", "logits_medtok"),
+        )
     )
-    rvq_size_eff = int(rvq_size) if rvq_size is not None else (_rvq_size_from_ckpt(tokenizer_ckpt) or 1_024)
-    obs_code_size = _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
-    obs_val_source_size = _size_from_gap(obs_val_offset, struct_action_offset, 80_000)
-    try:
-        structural_codebook = load_structural_codebook_yaml(str(structural_yaml), default_offset=int(structural_offset))
-        structural_size = max(1, int(len(structural_codebook.label2id())))
-    except Exception:
-        structural_size = _size_from_gap(structural_offset, obs_code_offset, 100_000)
-
-    blocks_spec: List[tuple[str, str, int, int, int, str]] = [
-        # (name, head, global_offset, source_size, dense_size, mode)
-        ("special", "logits_struct", special_offset, special_size, special_size, "identity"),
-        ("structural", "logits_struct", structural_offset, structural_size, structural_size, "identity"),
-        ("measurement_value", "logits_rvq", meas_val_offset, rvq_size_eff, rvq_size_eff, "identity"),
-        ("measurement_code", "logits_meas", meas_code_offset, meas_code_size_eff, meas_code_size_eff, "identity"),
-        ("observation_code", "logits_meas", obs_code_offset, obs_code_size, obs_code_size, "identity"),
-        ("observation_value", "logits_meas", obs_val_offset, obs_val_source_size, obs_val_source_size, "identity"),
-        ("diagnosis", "logits_medtok", diag_offset, diag_size, diag_size, "identity"),
-        ("diagnosis_residual", "logits_medtok", diag_res_offset, _bucket("diagnosis_residual", 39_999), _bucket("diagnosis_residual", 39_999), "identity"),
-        ("procedure", "logits_medtok", proc_offset, proc_size, proc_size, "identity"),
-        ("procedure_residual", "logits_medtok", proc_res_offset, _bucket("procedure_residual", 39_999), _bucket("procedure_residual", 39_999), "identity"),
-        ("medication", "logits_medtok", med_offset, med_size, med_size, "identity"),
-        ("medication_residual", "logits_medtok", med_res_offset, _bucket("medication_residual", 39_999), _bucket("medication_residual", 39_999), "identity"),
+    runtime_block_order = [
+        str(x)
+        for x in sparse_contract.get(
+            "runtime_block_order",
+            (
+                "special",
+                "structural",
+                "measurement_value",
+                "measurement_code",
+                "observation_code",
+                "observation_value",
+                "diagnosis",
+                "diagnosis_residual",
+                "procedure",
+                "procedure_residual",
+                "medication",
+                "medication_residual",
+            ),
+        )
     ]
+    blocks_spec: List[tuple[str, str, int, int, int, str]] = []
+    for name in runtime_block_order:
+        fam = _safe_dict(families.get(name, {}))
+        head = fam.get("runtime_head", None)
+        if head is None:
+            continue
+        source_size = int(fam.get("source_size", 0))
+        if source_size <= 0:
+            raise ValueError(f"Runtime family {name!r} has non-positive source_size={source_size}")
+        blocks_spec.append(
+            (
+                str(name),
+                str(head),
+                int(fam["offset"]),
+                int(source_size),
+                int(source_size),
+                str(fam.get("runtime_mode", "identity")),
+            )
+        )
 
-    lane_order = ("logits_struct", "logits_rvq", "logits_meas", "logits_medtok")
     head_sizes: Dict[str, int] = {k: 0 for k in lane_order}
     blocks: List[DenseIdBlock] = []
     dense_cursor = 0
@@ -445,13 +353,14 @@ def build_runtime_vocab_and_remapper(
         "window_markers": {
             "enabled": bool(markers_cfg.get("enabled", True)),
             "end_mode": str(markers_cfg.get("end_mode", "end_token")),
-            "type_token_offset": int(marker_type_offset),
-            "num_types": int(marker_num_types),
-            "end_token_id": int(marker_end),
-            "continue_token_id": int(marker_continue),
+            "type_token_offset": int(markers_cfg.get("type_token_offset", 10)),
+            "num_types": int(markers_cfg.get("num_types", 0)),
+            "end_token_id": int(markers_cfg.get("end_token_id", 0)),
+            "continue_token_id": int(markers_cfg.get("continue_token_id", 0)),
             "unk_type_id": int(markers_cfg.get("unk_type_id", 0)),
         },
         "dense_blocks": [b.serialize_meta() for b in blocks],
+        "sparse_vocab_contract": dict(sparse_contract),
     }
     return vocab_config, remapper
 
@@ -469,7 +378,13 @@ def build_compact_runtime_vocab_and_remapper(
     Any unobserved token for a compacted block maps to UNK at runtime.
     """
     preserve = {str(x) for x in (preserve_full_blocks or [])}
-    lane_order = ("logits_struct", "logits_rvq", "logits_meas", "logits_medtok")
+    routing_cfg = _safe_dict(base_vocab_config.get("routing", {}))
+    lane_order = tuple(routing_cfg.keys()) or (
+        "logits_struct",
+        "logits_rvq",
+        "logits_meas",
+        "logits_medtok",
+    )
     head_sizes: Dict[str, int] = {k: 0 for k in lane_order}
 
     compact_blocks: List[DenseIdBlock] = []
@@ -537,6 +452,7 @@ def build_compact_runtime_vocab_and_remapper(
         "routing": routing,
         "window_markers": dict(base_vocab_config.get("window_markers", {}) or {}),
         "dense_blocks": [b.serialize_meta() for b in compact_blocks],
+        "sparse_vocab_contract": dict(base_vocab_config.get("sparse_vocab_contract", {}) or {}),
     }
     return vocab_out, remapper
 

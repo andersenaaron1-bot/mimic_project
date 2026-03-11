@@ -31,6 +31,8 @@ from src.ehr_hier.data.event_router import classify_code_to_category
 from src.ehr_hier.data.structural_codes import (
     StructuralCodebook,
     load_structural_codebook_yaml,
+    structural_surface_code,
+    structural_surface_vocab_codes,
 )
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
@@ -56,6 +58,11 @@ from src.ehr_hier.tokenizers.medtok_attr_encoder import (
     EXPLICIT_MEDTOK_RESOLUTION_STAGES,
     MedTokenWithAttrsEncoder,
     load_parent_lookup_from_codes_parquet,
+)
+from src.ehr_hier.tokenizers.vocab_contract import (
+    DEFAULT_SPARSE_VOCAB_JSON,
+    build_legacy_manifest_from_sparse_contract,
+    load_sparse_vocab_contract,
 )
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
@@ -109,7 +116,15 @@ def _as_plain_counter(counter: Counter[Any]) -> Dict[str, int]:
     return {str(k): int(v) for k, v in counter.items()}
 
 
-def _load_manifest() -> Dict[str, Any]:
+def _load_manifest(sparse_vocab_json: Optional[str] = None) -> Dict[str, Any]:
+    sparse_candidates: List[Path] = []
+    if sparse_vocab_json:
+        fp = Path(str(sparse_vocab_json))
+        sparse_candidates.append(fp if fp.is_absolute() else PROJECT_ROOT / fp)
+    sparse_candidates.append(PROJECT_ROOT / DEFAULT_SPARSE_VOCAB_JSON)
+    for fp in sparse_candidates:
+        if fp.exists():
+            return build_legacy_manifest_from_sparse_contract(load_sparse_vocab_contract(fp))
     fp = PROJECT_ROOT / "artifacts" / "vocab_manifest.json"
     if not fp.exists():
         return {}
@@ -391,7 +406,7 @@ def _build_med_numeric_cfg(manifest: Mapping[str, Any]) -> Dict[str, NumericBinC
 
 
 def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
-    manifest = _load_manifest()
+    manifest = _load_manifest(getattr(args, "sparse_vocab_json", None))
     structural_codebook = (
         load_structural_codebook_yaml(
             args.structural_yaml,
@@ -1474,9 +1489,20 @@ def main() -> None:
             progress_every=args.progress_every,
         )
 
-    struct_codes_union = set()
-    if artifacts.structural_codebook is not None:
-        struct_codes_union.update(artifacts.structural_codebook.code2label.keys())
+    struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
+    if structural_raw_codes:
+        struct_codes_union.update(
+            str(surface)
+            for surface in (
+                structural_surface_code(
+                    code,
+                    codebook=artifacts.structural_codebook,
+                    routed_category=TokenCategory.STRUCTURAL,
+                )
+                for code in structural_raw_codes
+            )
+            if surface
+        )
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
     struct_id2code = invert_code2id(struct_vocab.code2id)
 

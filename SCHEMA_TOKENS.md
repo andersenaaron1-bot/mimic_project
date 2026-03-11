@@ -131,7 +131,7 @@ Ordering:
 - `OBS_VALUE` carries `dt_from_prev_hours = 0`
 
 These remain `TokenCategory.MEASUREMENT` but use dedicated global-id ranges from
-`vocab_manifest.json` (`observation_code`, `observation_value`).
+the sparse vocab contract (`observation_code`, `observation_value`).
 The pragmatic v1 routing also sends high-volume chart aliases like `Blood Pressure`
 through this OBS path when they do not map to the numeric cVAE variable map.
 
@@ -171,18 +171,27 @@ To keep timeline length controlled while retaining static context:
 
 ## 4) Vocabulary layout: global ids and head routing
 
-### 4.1 Source of truth: vocab manifest
-`artifacts/vocab_manifest.json` defines offsets for token families. Conceptually:
+### 4.1 Source of truth: sparse vocab contract
+`artifacts/token_vocab_sparse_v1.json` is the sparse/base token contract. It is the
+single source of truth for global token families before dense runtime remapping. Conceptually:
 
     global_id = offset[family] + local_id
 
-This is enough for tokenizers and debug tooling. For training, the transformer additionally
-needs **sizes** and **routing rules** (which ids are predicted by which head).
+The sparse contract contains:
+- family offsets
+- source sizes
+- residual fallback ranges
+- special/window marker ids
+- runtime head routing for model-visible families
 
-For v1 experiments, use `configs/data/tokenization_v1.yaml` as the frozen contract for:
-- residual fallback ranges (`diagnosis_residual`, `procedure_residual`, `medication_residual`)
-- window marker token ids (`WIN_<TYPE>`, `WIN_END`, `WIN_CONTINUE`)
-- default window segmentation fallback policy.
+Legacy note:
+- `artifacts/vocab_manifest.json` remains only as a compatibility fallback for older scripts.
+- New runtime vocab generation should derive from the sparse contract, not from the legacy manifest.
+
+For v1 experiments:
+- `configs/data/tokenization_v1.yaml` remains the human-edited policy/config input
+- `artifacts/token_vocab_sparse_v1.json` is the generated sparse/base contract
+- the dense/runtime vocab bundle is derived only from that sparse contract plus observed-id compaction
 
 ### 4.2 AET head lanes (recommended)
 AET uses multiple output heads to avoid a monolithic softmax:
