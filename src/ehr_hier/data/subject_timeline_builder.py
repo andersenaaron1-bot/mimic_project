@@ -8,7 +8,7 @@ import meds_reader as mr   # pip install meds_reader
 from .token_types import EventToken, TokenCategory
 from .event_router import classify_code_to_category
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
-from src.ehr_hier.data.structural_codes import StructuralCodebook
+from src.ehr_hier.data.structural_codes import StructuralCodebook, structural_surface_code
 from src.ehr_hier.data.demographics import (
     age_years_from_timestamps,
     infer_subject_sex,
@@ -199,16 +199,14 @@ def build_subject_timeline(
 
     # Structural codebook helpers (direct structural token emission)
     struct_label2id: Dict[str, int] = {}
-    struct_offset = 0
     struct_only: Set[str] = set()
     struct_keep_orig: Set[str] = set()
+    struct_enc = encoders.get(TokenCategory.STRUCTURAL)
+    struct_vocab = getattr(struct_enc, "vocab", None)
     if structural_codebook is not None:
         struct_label2id = structural_codebook.label2id()
         struct_only = structural_codebook.structural_only
         struct_keep_orig = structural_codebook.keep_original
-        # derive offset from the provided STRUCTURAL encoder if present
-        struct_enc = encoders.get(TokenCategory.STRUCTURAL)
-        struct_offset = getattr(getattr(struct_enc, "vocab", None), "offset", 0) or structural_codebook.offset
 
     def _transition_attrs_for_event(*, code_str: Optional[str], label: Optional[str]) -> tuple[Dict[str, int], Optional[str]]:
         if structural_codebook is None or code_str is None:
@@ -253,6 +251,72 @@ def build_subject_timeline(
         if code_prefix == "MEDS_DEATH":
             attrs["transition_death_like"] = 1
         return attrs, transition_action
+
+    def _struct_surface_for_event(*, code_str: Optional[str], category: TokenCategory) -> Optional[str]:
+        return structural_surface_code(
+            code_str,
+            codebook=structural_codebook,
+            routed_category=category,
+        )
+
+    def _should_hook_structural_token(
+        *,
+        code_str: Optional[str],
+        label: Optional[str],
+        routed_transition_action: Optional[str],
+    ) -> bool:
+        if not bool(window_hook_label) or code_str is None:
+            return False
+        if structural_codebook is not None and label is not None:
+            return structural_codebook.is_window_boundary(code=code_str, label=label)
+        if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
+            return True
+        if routed_transition_action == "suppress":
+            return False
+        code_prefix = code_str.split("//", 1)[0].upper()
+        legacy_struct_boundary = (
+            code_prefix in LEGACY_STRUCTURAL_BOUNDARY_PREFIXES
+        )
+        return (
+            (structural_event_map is None and legacy_struct_boundary)
+            or (structural_event_map is not None and code_str in structural_codes)
+        )
+
+    def _emit_structural_token(
+        *,
+        surface_code: Optional[str],
+        raw_code: Optional[str],
+        label: Optional[str],
+        t_value: Optional[datetime],
+        dt_value: float,
+        prior_tokens: List[EventToken],
+        routed_transition_action: Optional[str],
+    ) -> Optional[EventToken]:
+        if surface_code is None or struct_vocab is None:
+            return None
+        struct_transition_attrs, _ = _transition_attrs_for_event(code_str=raw_code, label=label)
+        struct_attrs: Dict[str, int] = {}
+        if label is not None:
+            struct_attrs["struct_label_id"] = int(struct_label2id.get(label, 0))
+        struct_attrs.update(struct_transition_attrs)
+        return EventToken(
+            value_id=int(struct_vocab.encode(surface_code)),
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=_t_from_start_hours(t_value) if isinstance(t_value, datetime) else 0.0,
+            dt_from_prev_hours=float(dt_value) if not prior_tokens else 0.0,
+            cat_attrs=struct_attrs,
+            num_attrs={},
+            raw_time=t_value if isinstance(t_value, datetime) else None,
+            window_hook=(
+                window_hook_label
+                if _should_hook_structural_token(
+                    code_str=raw_code,
+                    label=label,
+                    routed_transition_action=routed_transition_action,
+                )
+                else None
+            ),
+        )
 
     def _extract_med_numeric(ev: object) -> Optional[float]:
         """
@@ -685,32 +749,29 @@ def build_subject_timeline(
                 code_str=code_str,
                 label=None,
             )
-        if struct_hit:
-            label = structural_codebook.code2label.get(code_str, "")
-            label_id = struct_label2id.get(label, 0)
-            val_id = struct_offset + label_id
-            struct_transition_attrs, _ = _transition_attrs_for_event(code_str=code_str, label=label)
-            is_boundary = bool(window_hook_label) and structural_codebook.is_window_boundary(code=code_str, label=label)
-            struct_attrs = {"struct_label_id": int(label_id)}
-            struct_attrs.update(struct_transition_attrs)
-            struct_tok = EventToken(
-                value_id=val_id,
-                category_id=int(TokenCategory.STRUCTURAL),
-                t_from_start_hours=_t_from_start_hours(t) if isinstance(t, datetime) else 0.0,
-                dt_from_prev_hours=dt_hours if not emitted_for_event else 0.0,
-                cat_attrs=struct_attrs,
-                num_attrs={},
-                raw_time=t if isinstance(t, datetime) else None,
-                window_hook=window_hook_label if is_boundary else None,
+        struct_label = structural_codebook.code2label.get(code_str) if struct_hit else None
+        struct_surface = _struct_surface_for_event(code_str=code_str, category=category)
+        if struct_hit or category == TokenCategory.STRUCTURAL:
+            struct_tok = _emit_structural_token(
+                surface_code=struct_surface,
+                raw_code=code_str,
+                label=struct_label,
+                t_value=t if isinstance(t, datetime) else None,
+                dt_value=dt_hours,
+                prior_tokens=emitted_for_event,
+                routed_transition_action=routed_transition_action,
             )
-            emitted_for_event.append(struct_tok)
+            if struct_tok is not None:
+                emitted_for_event.append(struct_tok)
 
         # Skip original token if structural-only, or if the routed category is already
-        # STRUCTURAL and the codebook emitted the canonical structural marker.
-        if struct_hit and (
-            category == TokenCategory.STRUCTURAL
-            or (code_str not in struct_keep_orig and code_str in struct_only)
-        ):
+        # STRUCTURAL.
+        if category == TokenCategory.STRUCTURAL and emitted_for_event:
+            tokens.extend(emitted_for_event)
+            if emitted_for_event and isinstance(t, datetime):
+                last_emitted_time = t
+            continue
+        if struct_hit and code_str not in struct_keep_orig and code_str in struct_only:
             # nothing else; record timestamp advance
             tokens.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):

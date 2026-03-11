@@ -109,7 +109,7 @@ def test_structural_codebook_inserts_token_and_splits_dt():
     db = DummyDB({7: DummySubject(events)})
 
     proc_vocab = CategoryVocab(name="proc", offset=20, code2id={"CPT//00100": 1, "<UNK>": 0})
-    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0})
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0, "CPT//00100": 1})
     proc_enc = SimpleCategoricalEncoder(TokenCategory.PROCEDURE, proc_vocab)
     struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
 
@@ -137,7 +137,8 @@ def test_structural_codebook_inserts_token_and_splits_dt():
     assert proc_tok.category_id == int(TokenCategory.PROCEDURE)
     assert struct_tok.dt_from_prev_hours == pytest.approx(0.0)
     assert proc_tok.dt_from_prev_hours == 0.0  # dt consumed by structural token
-    assert struct_tok.value_id == struct_vocab.offset + codebook.label2id()["or_procedure"]
+    assert struct_tok.value_id == struct_vocab.offset + struct_vocab.code2id["CPT//00100"]
+    assert struct_tok.cat_attrs.get("struct_label_id") == codebook.label2id()["or_procedure"]
     assert proc_tok.t_from_start_hours == pytest.approx(0.0)
 
 
@@ -149,7 +150,11 @@ def test_structural_codebook_can_emit_overlay_without_window_hook():
     ]
     db = DummyDB({1: DummySubject(events)})
 
-    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0})
+    struct_vocab = CategoryVocab(
+        name="struct",
+        offset=50,
+        code2id={"<UNK>": 0, "EVT_BOUNDARY": 1, "EVT_OVERLAY": 2},
+    )
     struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
 
     codebook = StructuralCodebook(
@@ -183,6 +188,7 @@ def test_structural_codebook_emits_transition_metadata_for_typed_windows():
     db = DummyDB({1: DummySubject(events)})
 
     struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0})
+    struct_vocab.code2id["ED_REGISTRATION"] = 1
     struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
 
     codebook = StructuralCodebook(
@@ -249,7 +255,7 @@ def test_routed_structural_transition_events_get_metadata_without_structural_map
     struct_vocab = CategoryVocab(
         name="struct_raw",
         offset=50,
-        code2id={"<UNK>": 0, "HOSPITAL_ADMISSION//EW EMER.//EMERGENCY ROOM": 1},
+        code2id={"<UNK>": 0, "HOSPITAL_ADMISSION": 1},
     )
     struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
 
@@ -274,6 +280,7 @@ def test_routed_structural_transition_events_get_metadata_without_structural_map
     assert tok.cat_attrs["transition_window_type_id"] == 3
     assert tok.cat_attrs["window_type_id"] == 3
     assert tok.window_hook == "episode"
+    assert tok.value_id == struct_vocab.offset + struct_vocab.code2id["HOSPITAL_ADMISSION"]
 
 
 def test_routed_transfer_event_uses_prefix_transition_action_and_infers_ed_window_type():
@@ -284,7 +291,7 @@ def test_routed_transfer_event_uses_prefix_transition_action_and_infers_ed_windo
     struct_vocab = CategoryVocab(
         name="struct_raw",
         offset=50,
-        code2id={"<UNK>": 0, "TRANSFER_TO//ED//Emergency Department": 1},
+        code2id={"<UNK>": 0, "TRANSFER_TO": 1},
     )
     struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
 
@@ -309,6 +316,7 @@ def test_routed_transfer_event_uses_prefix_transition_action_and_infers_ed_windo
     assert tok.cat_attrs["transition_window_type_id"] == 2
     assert tok.cat_attrs["window_type_id"] == 2
     assert tok.window_hook == "episode"
+    assert tok.value_id == struct_vocab.offset + struct_vocab.code2id["TRANSFER_TO"]
 
 
 def test_routed_meds_birth_transition_is_suppressed_and_not_marked_as_boundary():

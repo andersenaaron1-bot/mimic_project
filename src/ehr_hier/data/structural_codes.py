@@ -4,6 +4,8 @@ from typing import Dict, Optional, Set
 
 import yaml
 
+from src.ehr_hier.data.token_types import TokenCategory
+
 
 TRANSITION_ACTION_TO_ID: Dict[str, int] = {
     "open_next": 1,
@@ -184,6 +186,70 @@ class StructuralCodebook:
 
     def __contains__(self, code: object) -> bool:
         return code is not None and str(code) in self.code2label
+
+
+def structural_surface_code(
+    code: object,
+    *,
+    codebook: Optional[StructuralCodebook] = None,
+    routed_category: Optional[TokenCategory | int] = None,
+) -> Optional[str]:
+    """
+    Return the structural token surface for an event.
+
+    Rules:
+    - exact codebook-hit raw codes stay exact
+    - otherwise, routed structural events normalize to their raw prefix
+    - everything else returns None
+    """
+    if code is None:
+        return None
+    code_str = str(code).strip()
+    if not code_str:
+        return None
+    if codebook is not None and code_str in codebook.code2label:
+        return code_str
+    if routed_category is None:
+        return None
+    try:
+        cat_value = int(routed_category)
+    except Exception:
+        return None
+    if cat_value != int(TokenCategory.STRUCTURAL):
+        return None
+    return code_str.split("//", 1)[0].upper()
+
+
+def structural_surface_vocab_codes(
+    codebook: Optional[StructuralCodebook],
+) -> Set[str]:
+    """
+    Deterministic seed set for the structural family vocabulary.
+
+    This is intentionally based on actual emitted structural surfaces:
+    - exact raw codes that the codebook maps directly
+    - raw transition/window-type keys that represent routed structural prefixes
+    """
+    out: Set[str] = set()
+    if codebook is None:
+        return out
+
+    out.update(str(k) for k in codebook.code2label.keys())
+    semantic_labels = set(str(x) for x in codebook.label2id().keys())
+
+    for mapping in (codebook.transition_map, codebook.window_type_map):
+        for raw_key in mapping.keys():
+            key = str(raw_key).strip()
+            if not key or key in semantic_labels:
+                continue
+            surface = structural_surface_code(
+                key,
+                codebook=codebook,
+                routed_category=TokenCategory.STRUCTURAL,
+            )
+            if surface:
+                out.add(surface)
+    return out
 
 
 def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> StructuralCodebook:
