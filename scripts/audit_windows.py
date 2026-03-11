@@ -894,6 +894,7 @@ def main() -> None:
     ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_attr_dir", default=str(PROJECT_ROOT / "artifacts" / "medtok_attrs"))
+    ap.add_argument("--medtok_crosswalk_json", default=None)
     ap.add_argument("--allow_smoke_medtok", action="store_true")
     ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument(
@@ -1015,6 +1016,7 @@ def main() -> None:
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
+        medtok_crosswalks=artifacts.medtok_crosswalks,
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),

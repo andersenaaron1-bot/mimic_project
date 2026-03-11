@@ -87,11 +87,12 @@ def canonicalize_diagnosis_code(code: Optional[str]) -> List[str]:
 _ICD10PCS_RE = re.compile(r"\b([0-9A-HJ-NP-Z]{7})\b")  # 7 chars, excludes I/O
 _CPT_RE = re.compile(r"\b(\d{4,5}[A-Z]?)\b")          # 4-5 digits plus optional letter
 _ICD9PROC_RE = re.compile(r"\b(\d{2}\.\d{1,2}|\d{3,4})\b")
+_SNOMED_RE = re.compile(r"SNOMED\W*([0-9]{3,18})", re.IGNORECASE)
 
 
 def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
     """
-    Emit likely MedTok procedure codes (ICD10PCS, CPT, ICD9PROC).
+    Emit likely MedTok procedure codes (ICD10PCS, CPT, ICD9PROC, explicit SNOMED).
     """
     if code is None:
         return []
@@ -108,6 +109,15 @@ def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
     if s.startswith("PROCEDURE//CPT//"):
         cpt = s.split("//")[-1]
         return [f"CPT//{cpt}", cpt]
+    if s.startswith("PROCEDURE//SNOMED//"):
+        snomed = s.split("//")[-1]
+        return [snomed, f"SNOMED//{snomed}", f"SNOMED/{snomed}"]
+    if s.startswith("SNOMED//"):
+        snomed = s.split("//")[-1]
+        return [snomed, f"SNOMED//{snomed}", f"SNOMED/{snomed}"]
+    if s.startswith("SNOMED/"):
+        snomed = s.split("/")[-1]
+        return [snomed, f"SNOMED//{snomed}", f"SNOMED/{snomed}"]
 
     cands: List[str] = []
     # Drop leading PROCEDURE// if present to allow regex matches
@@ -126,6 +136,10 @@ def canonicalize_procedure_code(code: Optional[str]) -> List[str]:
         icd9 = m.group(1)
         no_dot = icd9.replace(".", "")
         cands.extend([f"ICD9PROC//{icd9}", f"ICD9PROC//{no_dot}", icd9, no_dot])
+    m = _SNOMED_RE.search(s)
+    if m:
+        snomed = m.group(1)
+        cands.extend([snomed, f"SNOMED//{snomed}", f"SNOMED/{snomed}"])
     return list(dict.fromkeys(cands))  # dedupe, preserve order
 
 
@@ -296,7 +310,7 @@ def diagnosis_filter(code: str) -> bool:
 
 def procedure_filter(code: str) -> bool:
     c = code.upper()
-    if c.startswith(("PROCEDURE//", "ICD10PCS", "ICD9PROC", "CPT", "HCPCS")):
+    if c.startswith(("PROCEDURE//", "ICD10PCS", "ICD9PROC", "CPT", "HCPCS", "SNOMED//", "SNOMED/")):
         return True
     if any(prefix in c for prefix in ("MEDICATION//", "INFUSION", "DRG//")):
         return False

@@ -29,6 +29,10 @@ from src.ehr_hier.tokenizers.medtok_canonicalize import (
 )
 from src.ehr_hier.tokenizers.medtok_attr_encoder import MedTokenWithAttrsEncoder
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
+from src.ehr_hier.tokenizers.medtok_crosswalk import (
+    build_medtok_crosswalk_artifact,
+    load_resolved_crosswalk_lookup,
+)
 
 
 class FakeEvent:
@@ -178,6 +182,8 @@ def test_canonicalizers_basic():
 
     proc_cands = canonicalize_procedure_code("Procedure CPT 00100")
     assert "CPT//00100" in proc_cands
+    proc_snomed_cands = canonicalize_procedure_code("SNOMED/77477000")
+    assert "77477000" in proc_snomed_cands
 
     med_cands = canonicalize_medication_code("rxnorm 12345")
     assert "RXNORM//12345" in med_cands
@@ -241,6 +247,82 @@ def test_medtok_resolution_parent_lookup_and_lexical_bridge():
     lexical = med_encoder.resolve_event(SimpleNamespace(code="Acetaminophen Tablet"))
     assert lexical.stage == "lexical_bridge"
     assert lexical.matched_code == "MEDICATION//ACETAMINOPHEN TABLET//ADMINISTERED"
+
+
+def test_medication_crosswalk_lookup_stage(tmp_path):
+    concept_dir = tmp_path / "concept_map"
+    concept_dir.mkdir(parents=True, exist_ok=True)
+    (concept_dir / "inputevents_to_rxnorm.csv").write_text(
+        "\n".join(
+            [
+                "itemid (omop_source_code),label,ordercategorydescription,amountuom,omop_concept_id,omop_concept_name,omop_domain_id,omop_vocabulary_id,omop_concept_class_id,omop_standard_concept,omop_concept_code",
+                "221833,Hydromorphone (Dilaudid),Drug Push,mg,35603598,hydromorphone Injection [Dilaudid],Drug,RxNorm,Branded Drug Form,S,1724273",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    artifact = build_medtok_crosswalk_artifact(concept_map_dir=concept_dir)
+    artifact_fp = tmp_path / "crosswalk.json"
+    artifact_fp.write_text(json.dumps(artifact), encoding="utf-8")
+
+    med_vocab = CategoryVocab(
+        name="med",
+        offset=1_400_000,
+        code2id={"<UNK>": 0, "RXNORM//1724273": 1},
+    )
+    lookup = load_resolved_crosswalk_lookup(
+        artifact_fp,
+        "medication",
+        available_codes=med_vocab.code2id.keys(),
+    )
+    med_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.MEDICATION,
+        med_vocab,
+        canonicalize_fn=canonicalize_medication_code,
+        crosswalk_lookup=lookup,
+    )
+    resolution = med_encoder.resolve_event(
+        SimpleNamespace(code="MEDICATION//Hydromorphone (Dilaudid)//Administered")
+    )
+    assert resolution.stage == "crosswalk_lookup"
+    assert resolution.matched_code == "RXNORM//1724273"
+
+
+def test_procedure_crosswalk_lookup_stage(tmp_path):
+    concept_dir = tmp_path / "concept_map"
+    concept_dir.mkdir(parents=True, exist_ok=True)
+    (concept_dir / "proc_itemid.csv").write_text(
+        "\n".join(
+            [
+                "itemid (omop_source_code),label,omop_concept_id,omop_concept_name,omop_domain_id,omop_vocabulary_id,omop_concept_class_id,omop_standard_concept,omop_concept_code",
+                "221214,CT scan,4300757,Computerized axial tomography,Procedure,SNOMED,Procedure,S,77477000",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    artifact = build_medtok_crosswalk_artifact(concept_map_dir=concept_dir)
+    artifact_fp = tmp_path / "crosswalk.json"
+    artifact_fp.write_text(json.dumps(artifact), encoding="utf-8")
+
+    proc_vocab = CategoryVocab(
+        name="proc",
+        offset=1_200_000,
+        code2id={"<UNK>": 0, "77477000": 1},
+    )
+    lookup = load_resolved_crosswalk_lookup(
+        artifact_fp,
+        "procedure",
+        available_codes=proc_vocab.code2id.keys(),
+    )
+    proc_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.PROCEDURE,
+        proc_vocab,
+        canonicalize_fn=canonicalize_procedure_code,
+        crosswalk_lookup=lookup,
+    )
+    resolution = proc_encoder.resolve_event(SimpleNamespace(code="PROCEDURE//CT scan"))
+    assert resolution.stage == "crosswalk_lookup"
+    assert resolution.matched_code == "77477000"
 
 
 def test_drop_unknown_diagnosis(monkeypatch, tiny_vocabs):

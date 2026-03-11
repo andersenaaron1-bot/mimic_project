@@ -16,9 +16,10 @@ The active MedTok resolution order is:
 1. `exact`
 2. `canonicalized`
 3. `parent_lookup`
-4. `lexical_bridge`
-5. `residual`
-6. `unk`
+4. `crosswalk_lookup`
+5. `lexical_bridge`
+6. `residual`
+7. `unk`
 
 `drop` is only possible when an encoder is explicitly configured with `drop_unknowns=True`.
 
@@ -44,12 +45,13 @@ Current MedTok-supported systems in local artifacts:
 | Procedure | `PROCEDURE//ICD//9//<code>` | ICD-9-Proc | `ICD9PROC//<code>` | supported | Direct canonicalization path. |
 | Procedure | `PROCEDURE//CPT//<code>` | CPT | `CPT//<code>` | supported | Direct canonicalization path. |
 | Procedure | raw `procedures_icd.icd_code` + `icd_version` | ICD-10-PCS / ICD-9-Proc | `ICD10PCS//<code>` or `ICD9PROC//<code>` | supported | Version must be retained or reconstructed upstream. |
-| Procedure | HCPCS surfaces | HCPCS | none in v1 | out-of-scope | Current canonicalizer does not emit `HCPCS//...`; do not silently claim support. |
-| Procedure | ED SNOMED procedure surfaces | SNOMED | none in v1 | out-of-scope | MIMIC FHIR exposes SNOMED ED procedures; v1 does not yet map them into MedTok semantic tokens. |
+| Procedure | HCPCS surfaces | HCPCS | none in v1 | out-of-scope | Current local MedTok summary does not advertise HCPCS as an active system; do not silently claim support. |
+| Procedure | ED / ICU local procedure labels with MIMIC concept-map SNOMED parents | SNOMED | bare concept code preferred, `SNOMED//<code>` accepted | supported with crosswalk | Uses `proc_itemid.csv`, `proc_datetimeevents.csv`, or parent-coded metadata to map local labels into SNOMED procedure concepts. |
 | Medication | explicit `RXNORM//<code>` | RxNorm | `RXNORM//<code>` | supported | Exact or canonicalized path. |
 | Medication | explicit `NDC//<code>` | NDC | `NDC//<code>` | supported | Exact or canonicalized path. |
 | Medication | `MEDICATION//...` or `INFUSION...` surfaces with embedded RxNorm/NDC | RxNorm / NDC | `RXNORM//<code>` or `NDC//<code>` | supported | Extracted from the MEDS surface string. |
 | Medication | event or metadata `parent_codes` that carry RxNorm/NDC | RxNorm / NDC | `RXNORM//<code>` or `NDC//<code>` | supported | Uses `parent_lookup` stage. |
+| Medication | ICU medication item labels / local medication names with MIMIC concept-map RxNorm parents | RxNorm | bare concept code preferred, `RXNORM//<code>` accepted | supported with crosswalk | Uses `inputevents_to_rxnorm.csv` and optional `codes.parquet` parent metadata. |
 | Medication | formulary / GSN / local medication names without RxNorm/NDC | local / formulary | none yet | crosswalk-required | Needs an explicit crosswalk artifact before claiming MedTok support. |
 | Medication | lexical medication names that uniquely alias a MedTok medication token | lexical alias | vocab-specific | supported with caution | Uses `lexical_bridge`; only one-to-one aliases survive. |
 

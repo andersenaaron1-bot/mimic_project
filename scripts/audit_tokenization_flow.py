@@ -59,6 +59,10 @@ from src.ehr_hier.tokenizers.medtok_attr_encoder import (
     MedTokenWithAttrsEncoder,
     load_parent_lookup_from_codes_parquet,
 )
+from src.ehr_hier.tokenizers.medtok_crosswalk import (
+    load_crosswalk_candidate_map,
+    load_resolved_crosswalk_lookup,
+)
 from src.ehr_hier.tokenizers.vocab_contract import (
     DEFAULT_SPARSE_VOCAB_JSON,
     build_legacy_manifest_from_sparse_contract,
@@ -91,6 +95,7 @@ class AuditArtifacts:
     med_attr_vocabs: Dict[str, CategoryVocab]
     med_numeric_attrs: Dict[str, NumericBinConfig]
     medtok_parent_lookup: Dict[str, List[str]]
+    medtok_crosswalks: Dict[str, Dict[str, str]]
 
 
 class _EventWithDemographics:
@@ -335,6 +340,7 @@ def _build_semantic_resolution_encoders(
             artifacts.diag_vocab,
             canonicalize_fn=canonicalize_diagnosis_code,
             parent_lookup=artifacts.medtok_parent_lookup,
+            crosswalk_lookup=artifacts.medtok_crosswalks.get("diagnosis"),
             residual_fallback_offset=diag_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -343,6 +349,7 @@ def _build_semantic_resolution_encoders(
             artifacts.proc_vocab,
             canonicalize_fn=canonicalize_procedure_code,
             parent_lookup=artifacts.medtok_parent_lookup,
+            crosswalk_lookup=artifacts.medtok_crosswalks.get("procedure"),
             residual_fallback_offset=proc_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -351,6 +358,7 @@ def _build_semantic_resolution_encoders(
             artifacts.med_vocab,
             canonicalize_fn=canonicalize_medication_code,
             parent_lookup=artifacts.medtok_parent_lookup,
+            crosswalk_lookup=artifacts.medtok_crosswalks.get("medication"),
             residual_fallback_offset=med_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -433,6 +441,7 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         else None
     )
     medtok_attr_dir = Path(args.medtok_attr_dir)
+    medtok_crosswalk_json = getattr(args, "medtok_crosswalk_json", None)
 
     if medtok_code2embeds is not None:
         diag_vocab = build_vocab_from_code2embeddings(
@@ -469,6 +478,43 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
             offset=_offset(manifest, "medication", 1_400_000),
             name="medication",
         )
+
+    medtok_crosswalk_candidate_maps = {
+        "diagnosis": load_crosswalk_candidate_map(medtok_crosswalk_json, "diagnosis"),
+        "procedure": load_crosswalk_candidate_map(medtok_crosswalk_json, "procedure"),
+        "medication": load_crosswalk_candidate_map(medtok_crosswalk_json, "medication"),
+    }
+    if medtok_code2embeds is not None:
+        for vocab, family in (
+            (diag_vocab, "diagnosis"),
+            (proc_vocab, "procedure"),
+            (med_vocab, "medication"),
+        ):
+            next_id = max(vocab.code2id.values()) + 1 if vocab.code2id else 0
+            for target_candidates in medtok_crosswalk_candidate_maps.get(family, {}).values():
+                for target_code in target_candidates:
+                    if str(target_code) in vocab.code2id:
+                        break
+                    vocab.code2id[str(target_code)] = int(next_id)
+                    next_id += 1
+                    break
+    medtok_crosswalks = {
+        "diagnosis": load_resolved_crosswalk_lookup(
+            medtok_crosswalk_json,
+            "diagnosis",
+            available_codes=diag_vocab.code2id.keys(),
+        ),
+        "procedure": load_resolved_crosswalk_lookup(
+            medtok_crosswalk_json,
+            "procedure",
+            available_codes=proc_vocab.code2id.keys(),
+        ),
+        "medication": load_resolved_crosswalk_lookup(
+            medtok_crosswalk_json,
+            "medication",
+            available_codes=med_vocab.code2id.keys(),
+        ),
+    }
 
     med_attr_vocabs: Dict[str, CategoryVocab] = {}
     for name, filename, default_offset in (
@@ -515,6 +561,7 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         med_attr_vocabs=med_attr_vocabs,
         med_numeric_attrs=_build_med_numeric_cfg(manifest),
         medtok_parent_lookup=medtok_parent_lookup,
+        medtok_crosswalks=medtok_crosswalks,
     )
 
 
@@ -1290,8 +1337,9 @@ def _summarize_tokenization_and_collation(
         exact = int(outcomes.get("exact", 0))
         canonicalized = int(outcomes.get("canonicalized", 0))
         parent_lookup = int(outcomes.get("parent_lookup", 0))
+        crosswalk_lookup = int(outcomes.get("crosswalk_lookup", 0))
         lexical_bridge = int(outcomes.get("lexical_bridge", 0))
-        medtok_base = exact + canonicalized + parent_lookup + lexical_bridge
+        medtok_base = exact + canonicalized + parent_lookup + crosswalk_lookup + lexical_bridge
         residual_base = int(outcomes.get("residual", 0))
         unknown_base = int(outcomes.get("unk", 0))
         drop = int(outcomes.get("drop", 0))
@@ -1305,6 +1353,7 @@ def _summarize_tokenization_and_collation(
             "exact": exact,
             "canonicalized": canonicalized,
             "parent_lookup": parent_lookup,
+            "crosswalk_lookup": crosswalk_lookup,
             "lexical_bridge": lexical_bridge,
             "explicit_medtok_base": medtok_base,
             "residual": residual_base,
@@ -1409,6 +1458,7 @@ def main() -> None:
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default=None)
     ap.add_argument("--medtok_attr_dir", default="artifacts/medtok_attrs")
+    ap.add_argument("--medtok_crosswalk_json", default=None)
     ap.add_argument("--allow_smoke_medtok", action="store_true")
     ap.add_argument("--sparse_vocab_json", default=None)
     ap.add_argument(
@@ -1538,6 +1588,7 @@ def main() -> None:
         med_attr_vocabs=artifacts.med_attr_vocabs,
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
+        medtok_crosswalks=artifacts.medtok_crosswalks,
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),
@@ -1572,6 +1623,10 @@ def main() -> None:
             "measurement_codebook_size": artifacts.measurement_codebook_size,
             "measurement_stride": artifacts.measurement_stride,
             "medtok_parent_lookup_entries": len(artifacts.medtok_parent_lookup),
+            "medtok_crosswalk_entries": {
+                k: int(len(v)) for k, v in artifacts.medtok_crosswalks.items()
+            },
+            "medtok_crosswalk_json": getattr(args, "medtok_crosswalk_json", None),
             "tokenization_yaml": args.tokenization_yaml,
             "residual_fallback_enabled": bool(residual_enabled),
             "residual_fallback_buckets": int(residual_buckets),

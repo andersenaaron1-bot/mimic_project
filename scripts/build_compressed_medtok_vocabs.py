@@ -30,6 +30,10 @@ from src.ehr_hier.tokenizers.medtok_loader import (  # noqa: E402
     build_vocab_from_code2embeddings,
     load_medtok_vocab,
 )
+from src.ehr_hier.tokenizers.medtok_crosswalk import (  # noqa: E402
+    load_crosswalk_candidate_map,
+    resolve_crosswalk_target,
+)
 from src.ehr_hier.tokenizers.vocab_contract import validate_medtok_inputs
 
 
@@ -141,6 +145,7 @@ def _build_family_vocab(
     routed_category: str,
     canonicalize_fn: Callable[[object], object],
     full_vocab: CategoryVocab,
+    crosswalk_candidates: Dict[str, List[str]] | None,
     max_explicit: int,
     target_coverage: float,
     keywords_upper: List[str],
@@ -190,6 +195,15 @@ def _build_family_vocab(
             if cand_str in full_vocab.code2id and int(full_vocab.code2id[cand_str]) != int(full_vocab.unk_id):
                 primary = cand_str
                 break
+
+        if primary is None:
+            primary, _ = resolve_crosswalk_target(
+                family=str(routed_category).lower(),
+                candidate_map=crosswalk_candidates or {},
+                available_codes=full_vocab.code2id.keys(),
+                allow_unvalidated_fallback=True,
+                values=[raw_code],
+            )
 
         if primary is None:
             unmappable_events += float(events_total)
@@ -300,6 +314,7 @@ def main() -> None:
     ap.add_argument("--out_dir", required=True)
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default=None)
+    ap.add_argument("--medtok_crosswalk_json", default=None)
     ap.add_argument("--allow_smoke_medtok", action="store_true")
 
     ap.add_argument("--diag_max_explicit", type=int, default=20_000)
@@ -368,6 +383,9 @@ def main() -> None:
         medtok_vocab_dir=Path(medtok_inputs["medtok_vocab_dir"] or out_dir),
         manifest=manifest,
     )
+    diag_crosswalk = load_crosswalk_candidate_map(args.medtok_crosswalk_json, "diagnosis")
+    proc_crosswalk = load_crosswalk_candidate_map(args.medtok_crosswalk_json, "procedure")
+    med_crosswalk = load_crosswalk_candidate_map(args.medtok_crosswalk_json, "medication")
 
     keywords_upper = [k.strip().upper() for k in str(args.rare_critical_keywords).split(",") if k.strip()]
 
@@ -376,6 +394,7 @@ def main() -> None:
         routed_category="DIAGNOSIS",
         canonicalize_fn=canonicalize_diagnosis_code,
         full_vocab=full_diag,
+        crosswalk_candidates=diag_crosswalk,
         max_explicit=int(args.diag_max_explicit),
         target_coverage=float(args.diag_target_coverage),
         keywords_upper=keywords_upper,
@@ -386,6 +405,7 @@ def main() -> None:
         routed_category="PROCEDURE",
         canonicalize_fn=canonicalize_procedure_code,
         full_vocab=full_proc,
+        crosswalk_candidates=proc_crosswalk,
         max_explicit=int(args.proc_max_explicit),
         target_coverage=float(args.proc_target_coverage),
         keywords_upper=keywords_upper,
@@ -396,6 +416,7 @@ def main() -> None:
         routed_category="MEDICATION",
         canonicalize_fn=canonicalize_medication_code,
         full_vocab=full_med,
+        crosswalk_candidates=med_crosswalk,
         max_explicit=int(args.med_max_explicit),
         target_coverage=float(args.med_target_coverage),
         keywords_upper=keywords_upper,
@@ -414,6 +435,7 @@ def main() -> None:
         "decision_csv": str(decision_fp),
         "out_dir": str(out_dir),
         "policy": {
+            "medtok_crosswalk_json": str(args.medtok_crosswalk_json) if args.medtok_crosswalk_json else None,
             "diag_max_explicit": int(args.diag_max_explicit),
             "proc_max_explicit": int(args.proc_max_explicit),
             "med_max_explicit": int(args.med_max_explicit),

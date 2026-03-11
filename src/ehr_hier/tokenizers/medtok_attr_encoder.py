@@ -9,6 +9,9 @@ from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
 from src.ehr_hier.tokenizers.medtok_canonicalize import ensure_list
+from src.ehr_hier.tokenizers.medtok_crosswalk import (
+    crosswalk_candidate_keys,
+)
 
 _LEX_NORM_RE = re.compile(r"[^A-Z0-9]+")
 _MED_ACTION_SUFFIXES = {
@@ -31,6 +34,7 @@ EXPLICIT_MEDTOK_RESOLUTION_STAGES = (
     "exact",
     "canonicalized",
     "parent_lookup",
+    "crosswalk_lookup",
     "lexical_bridge",
 )
 
@@ -153,6 +157,7 @@ class MedTokenWithAttrsEncoder:
         numeric_attrs: Dict[str, NumericBinConfig] | None = None,
         canonicalize_fn: Optional[Callable[[Any], Iterable[str]]] = None,
         parent_lookup: Optional[Dict[str, List[str]]] = None,
+        crosswalk_lookup: Optional[Dict[str, str]] = None,
         drop_unknowns: bool = False,
         fallback_to_raw: bool = True,
         residual_fallback_offset: Optional[int] = None,
@@ -167,6 +172,11 @@ class MedTokenWithAttrsEncoder:
             str(k).upper(): list(v)
             for k, v in (parent_lookup or {}).items()
             if v
+        }
+        self.crosswalk_lookup = {
+            str(k).strip().upper(): str(v)
+            for k, v in (crosswalk_lookup or {}).items()
+            if str(k).strip() and str(v).strip()
         }
         self.drop_unknowns = drop_unknowns
         self.fallback_to_raw = fallback_to_raw
@@ -428,6 +438,37 @@ class MedTokenWithAttrsEncoder:
             )
         return None
 
+    def _resolve_crosswalk(
+        self,
+        *,
+        base_code: Optional[str],
+        raw_code: Optional[str],
+        parent_codes: Optional[Iterable[str]] = None,
+        seen_candidates: Optional[set[str]] = None,
+    ) -> Optional[MedTokResolution]:
+        if not self.crosswalk_lookup:
+            return None
+        values: List[object] = []
+        values.extend(self._dedupe_strs([base_code, raw_code]))
+        if parent_codes:
+            values.extend(self._dedupe_strs(parent_codes))
+        for key in crosswalk_candidate_keys(self.category, *values):
+            target = self.crosswalk_lookup.get(key)
+            if not target:
+                continue
+            if seen_candidates is not None and target in seen_candidates:
+                continue
+            gid = self.base_vocab.maybe_encode(target)
+            if gid is None:
+                continue
+            return MedTokResolution(
+                base_gid=gid,
+                stage="crosswalk_lookup",
+                matched_code=target,
+                source_code=key,
+            )
+        return None
+
     def resolve_code(
         self,
         base_code: Optional[str],
@@ -483,6 +524,16 @@ class MedTokenWithAttrsEncoder:
         if parent is not None:
             self._cache[cache_key] = parent
             return parent
+
+        crosswalk = self._resolve_crosswalk(
+            base_code=base_code,
+            raw_code=raw_code,
+            parent_codes=parent_codes,
+            seen_candidates=seen_candidates,
+        )
+        if crosswalk is not None:
+            self._cache[cache_key] = crosswalk
+            return crosswalk
 
         bridge_inputs = self._dedupe_strs(
             [
