@@ -1,4 +1,5 @@
 import math
+from typing import Dict
 
 import torch
 import torch.nn as nn
@@ -13,6 +14,11 @@ class AETLossModule(nn.Module):
     3-level `(B,W,C,L)` shape where:
       - `W` is the semantic-window chain
       - `C` is the bounded local chunk axis within each semantic window
+
+    Preferred v1 behavior:
+      - use a unified dense token head (`logits_token`)
+      - train with shifted autoregressive next-token targets inside each local chunk
+      - keep transition/window heads as auxiliary supervision
     """
 
     def __init__(
@@ -21,11 +27,18 @@ class AETLossModule(nn.Module):
         vocab_config: dict,
         weights: dict | None = None,
         strict_routing: bool = True,
+        prefer_unified_token_loss: bool = True,
+        ignore_nonmarker_special_targets: bool = True,
+        special_type_id: int = 0,
     ) -> None:
         super().__init__()
         self.vocab_config = dict(vocab_config)
         self.strict_routing = bool(strict_routing)
+        self.prefer_unified_token_loss = bool(prefer_unified_token_loss)
+        self.ignore_nonmarker_special_targets = bool(ignore_nonmarker_special_targets)
+        self.special_type_id = int(special_type_id)
         self.weights = weights or {
+            "token": 1.0,
             "struct": 5.0,
             "rvq": 1.0,
             "meas": 1.0,
@@ -156,6 +169,54 @@ class AETLossModule(nn.Module):
         continue_mask = target_ids == continue_id
         return type_mask, end_mask, continue_mask
 
+    def _autoregressive_targets(
+        self,
+        *,
+        target_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, int]]:
+        if target_ids.ndim not in {3, 4}:
+            raise ValueError(
+                f"target_ids must be 3D or 4D for autoregressive loss, got shape {tuple(target_ids.shape)}"
+            )
+        if target_ids.shape[-1] < 2:
+            empty_shape = target_ids.shape[:-1] + (0,)
+            empty_mask = torch.zeros(empty_shape, device=target_ids.device, dtype=torch.bool)
+            empty_targets = torch.zeros(empty_shape, device=target_ids.device, dtype=torch.long)
+            return empty_targets, empty_mask, empty_mask, {
+                "candidate_targets": 0,
+                "ignored_nonmarker_special_targets": 0,
+            }
+
+        ar_targets = target_ids[..., 1:].to(dtype=torch.long)
+        ar_valid = (
+            attention_mask[..., 1:].to(dtype=torch.bool)
+            if attention_mask is not None
+            else torch.ones_like(ar_targets, dtype=torch.bool)
+        )
+        type_mask, end_mask, continue_mask = self._marker_masks(ar_targets)
+        marker_mask = type_mask | end_mask | continue_mask
+
+        ignored_special = torch.zeros_like(ar_valid)
+        if (
+            token_type_ids is not None
+            and self.ignore_nonmarker_special_targets
+        ):
+            target_token_types = token_type_ids[..., 1:]
+            ignored_special = (
+                (target_token_types == int(self.special_type_id))
+                & ~marker_mask
+                & ar_valid
+            )
+            ar_valid = ar_valid & ~ignored_special
+
+        stats = {
+            "candidate_targets": int((attention_mask[..., 1:].to(dtype=torch.bool).sum().item()) if attention_mask is not None else ar_targets.numel()),
+            "ignored_nonmarker_special_targets": int(ignored_special.sum().item()),
+        }
+        return ar_targets, ar_valid, marker_mask, stats
+
     @classmethod
     def _window_targets(
         cls,
@@ -261,9 +322,49 @@ class AETLossModule(nn.Module):
         target_ids = targets_dict["input_ids"]
         attention_mask = targets_dict.get("attention_mask", None)
         valid = attention_mask.to(dtype=torch.bool) if attention_mask is not None else torch.ones_like(target_ids, dtype=torch.bool)
+        token_type_ids = targets_dict.get("token_type_ids", None)
 
         total_loss = target_ids.new_zeros((), dtype=torch.float32)
         logs = {}
+
+        logits_token = head_outputs.get("logits_token", None)
+        using_unified_token_loss = (
+            logits_token is not None and bool(self.prefer_unified_token_loss)
+        )
+
+        marker_type_mask_all, marker_end_mask_all, marker_continue_mask_all = self._marker_masks(target_ids)
+        marker_any_mask_all = marker_type_mask_all | marker_end_mask_all | marker_continue_mask_all
+
+        if using_unified_token_loss:
+            logits_token = torch.nan_to_num(logits_token, nan=0.0, posinf=0.0, neginf=0.0)
+            if logits_token.shape[:-1] != target_ids.shape:
+                raise ValueError(
+                    "logits_token must align with input_ids on all non-vocab dims; "
+                    f"got {tuple(logits_token.shape)} vs {tuple(target_ids.shape)}"
+                )
+            ar_targets, ar_valid, _, ar_stats = self._autoregressive_targets(
+                target_ids=target_ids,
+                attention_mask=attention_mask,
+                token_type_ids=token_type_ids,
+            )
+            ar_logits = logits_token[..., :-1, :]
+            if ar_logits.shape[:-1] != ar_targets.shape:
+                raise ValueError(
+                    "autoregressive logits/targets mismatch after shift; "
+                    f"got {tuple(ar_logits.shape[:-1])} vs {tuple(ar_targets.shape)}"
+                )
+            if ar_valid.any():
+                loss_token = self.ce_loss(ar_logits[ar_valid], ar_targets[ar_valid]).mean()
+                total_loss = total_loss + float(self.weights.get("token", 1.0)) * loss_token
+                logs["loss_token"] = float(loss_token.item())
+                pred_next = ar_logits.argmax(dim=-1)
+                acc_token = (pred_next[ar_valid] == ar_targets[ar_valid]).to(dtype=torch.float32).mean()
+                logs["acc_token"] = float(acc_token.item())
+                logs["n_token_supervised"] = int(ar_valid.sum().item())
+            else:
+                logs["n_token_supervised"] = 0
+            logs["ignored_nonmarker_special_targets"] = int(ar_stats["ignored_nonmarker_special_targets"])
+            logs["frac_unrouted"] = 0.0
 
         head_to_weight = {
             "logits_struct": "struct",
@@ -283,73 +384,72 @@ class AETLossModule(nn.Module):
             ("logits_transition_boundary" in head_outputs)
             or ("logits_boundary_next_window_type" in head_outputs)
         )
-        marker_type_mask_all, marker_end_mask_all, marker_continue_mask_all = self._marker_masks(target_ids)
-        marker_any_mask_all = marker_type_mask_all | marker_end_mask_all | marker_continue_mask_all
-        for head_key, blocks in self.routing.items():
-            if head_key not in head_outputs:
-                continue
-            logits = torch.nan_to_num(
-                head_outputs[head_key],
-                nan=0.0,
-                posinf=0.0,
-                neginf=0.0,
-            )
-            if logits.shape[:-1] != target_ids.shape:
-                raise ValueError(
-                    f"{head_key} logits shape {tuple(logits.shape)} incompatible with target_ids {tuple(target_ids.shape)}"
-                )
-
-            local_targets = torch.full_like(target_ids, fill_value=-1, dtype=torch.long)
-            mask_head = torch.zeros_like(valid, dtype=torch.bool)
-            head_vocab_size = 0
-
-            if not isinstance(blocks, list):
-                raise TypeError(f"routing[{head_key}] must be a list of blocks")
-
-            for b in blocks:
-                if not isinstance(b, dict):
-                    raise TypeError(f"routing[{head_key}] blocks must be dicts, got {type(b)}")
-                offset = int(b.get("offset"))
-                size = int(b.get("size"))
-                if size <= 0:
+        if not using_unified_token_loss:
+            for head_key, blocks in self.routing.items():
+                if head_key not in head_outputs:
                     continue
-                m = valid & (target_ids >= offset) & (target_ids < offset + size)
-                if m.any():
-                    local_targets[m] = (target_ids[m] - offset + head_vocab_size).to(torch.long)
-                mask_head |= m
-                head_vocab_size += size
-
-            if head_vocab_size <= 0:
-                continue
-            if logits.shape[-1] != head_vocab_size:
-                raise ValueError(
-                    f"{head_key} expects vocab_size={head_vocab_size} from routing blocks, "
-                    f"but logits last dim is {int(logits.shape[-1])}"
+                logits = torch.nan_to_num(
+                    head_outputs[head_key],
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
                 )
+                if logits.shape[:-1] != target_ids.shape:
+                    raise ValueError(
+                        f"{head_key} logits shape {tuple(logits.shape)} incompatible with target_ids {tuple(target_ids.shape)}"
+                    )
 
-            if head_key == "logits_struct" and has_transition_supervision:
-                mask_head = mask_head & ~marker_any_mask_all
+                local_targets = torch.full_like(target_ids, fill_value=-1, dtype=torch.long)
+                mask_head = torch.zeros_like(valid, dtype=torch.bool)
+                head_vocab_size = 0
 
-            if mask_head.any():
-                loss = self.ce_loss(logits[mask_head], local_targets[mask_head])
-                w = float(self.weights.get(head_to_weight.get(head_key, head_key), 1.0))
-                total_loss = total_loss + (w * loss.mean())
-                logs[head_to_log.get(head_key, f"loss_{head_key}")] = float(loss.mean().item())
+                if not isinstance(blocks, list):
+                    raise TypeError(f"routing[{head_key}] must be a list of blocks")
 
-            routed |= mask_head
+                for b in blocks:
+                    if not isinstance(b, dict):
+                        raise TypeError(f"routing[{head_key}] blocks must be dicts, got {type(b)}")
+                    offset = int(b.get("offset"))
+                    size = int(b.get("size"))
+                    if size <= 0:
+                        continue
+                    m = valid & (target_ids >= offset) & (target_ids < offset + size)
+                    if m.any():
+                        local_targets[m] = (target_ids[m] - offset + head_vocab_size).to(torch.long)
+                    mask_head |= m
+                    head_vocab_size += size
 
-        if has_transition_supervision:
-            routed = routed | (valid & marker_any_mask_all)
+                if head_vocab_size <= 0:
+                    continue
+                if logits.shape[-1] != head_vocab_size:
+                    raise ValueError(
+                        f"{head_key} expects vocab_size={head_vocab_size} from routing blocks, "
+                        f"but logits last dim is {int(logits.shape[-1])}"
+                    )
 
-        unrouted = valid & ~routed
-        valid_count = int(valid.sum().item()) if valid.numel() else 0
-        logs["frac_unrouted"] = float(unrouted.sum().float().item() / float(valid_count)) if valid_count > 0 else 0.0
-        if self.strict_routing and unrouted.any():
-            sample = target_ids[unrouted].detach().flatten()[:8].tolist()
-            raise ValueError(
-                f"Unrouted token ids encountered (n={int(unrouted.sum())}); sample={sample}. "
-                "Update vocab_config['routing'] (or offsets/sizes) to cover all tokens."
-            )
+                if head_key == "logits_struct" and has_transition_supervision:
+                    mask_head = mask_head & ~marker_any_mask_all
+
+                if mask_head.any():
+                    loss = self.ce_loss(logits[mask_head], local_targets[mask_head])
+                    w = float(self.weights.get(head_to_weight.get(head_key, head_key), 1.0))
+                    total_loss = total_loss + (w * loss.mean())
+                    logs[head_to_log.get(head_key, f"loss_{head_key}")] = float(loss.mean().item())
+
+                routed |= mask_head
+
+            if has_transition_supervision:
+                routed = routed | (valid & marker_any_mask_all)
+
+            unrouted = valid & ~routed
+            valid_count = int(valid.sum().item()) if valid.numel() else 0
+            logs["frac_unrouted"] = float(unrouted.sum().float().item() / float(valid_count)) if valid_count > 0 else 0.0
+            if self.strict_routing and unrouted.any():
+                sample = target_ids[unrouted].detach().flatten()[:8].tolist()
+                raise ValueError(
+                    f"Unrouted token ids encountered (n={int(unrouted.sum())}); sample={sample}. "
+                    "Update vocab_config['routing'] (or offsets/sizes) to cover all tokens."
+                )
 
         attention_mask_local = targets_dict.get("attention_mask", None)
         if attention_mask_local is not None:
@@ -430,12 +530,31 @@ class AETLossModule(nn.Module):
         numeric_mask = targets_dict.get("numeric_mask", None)
         if pred_val is not None and target_vals is not None:
             pred_val = torch.nan_to_num(pred_val, nan=0.0, posinf=0.0, neginf=0.0)
-            if numeric_mask is not None:
-                mask_val = numeric_mask.to(dtype=torch.bool) & valid
+            if using_unified_token_loss:
+                pred_val_shift = pred_val[..., :-1, :].squeeze(-1)
+                target_vals_shift = target_vals[..., 1:, :].squeeze(-1)
+                if numeric_mask is not None:
+                    mask_val = numeric_mask[..., 1:].to(dtype=torch.bool)
+                else:
+                    mask_val = target_vals_shift != 0
+                if attention_mask is not None:
+                    mask_val = mask_val & attention_mask[..., 1:].to(dtype=torch.bool)
+                if token_type_ids is not None and self.ignore_nonmarker_special_targets:
+                    target_type_ids = token_type_ids[..., 1:]
+                    target_marker_mask = marker_any_mask_all[..., 1:]
+                    mask_val = mask_val & ~(
+                        (target_type_ids == int(self.special_type_id)) & ~target_marker_mask
+                    )
+                target_vals_used = target_vals_shift
             else:
-                mask_val = (target_vals != 0).squeeze(-1) & valid
+                pred_val_shift = pred_val.squeeze(-1)
+                target_vals_used = target_vals.squeeze(-1)
+                if numeric_mask is not None:
+                    mask_val = numeric_mask.to(dtype=torch.bool) & valid
+                else:
+                    mask_val = (target_vals != 0).squeeze(-1) & valid
             if mask_val.any():
-                loss = self.mse_loss(pred_val.squeeze(-1)[mask_val], target_vals.squeeze(-1)[mask_val])
+                loss = self.mse_loss(pred_val_shift[mask_val], target_vals_used[mask_val])
                 total_loss = total_loss + float(self.weights.get("val", 1.0)) * loss.mean()
                 logs["loss_val"] = float(loss.mean().item())
 

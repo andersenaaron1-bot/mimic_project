@@ -58,6 +58,8 @@ class SmokeModelConfig:
     enable_time_embedding: bool = False
     global_fusion_mode: str = "add"
     exclude_special_from_global_fusion: bool = True
+    use_unified_token_head: bool = True
+    emit_switched_heads: bool = False
 
 
 def _reset_encoders(encoders: Dict[TokenCategory, Any]) -> None:
@@ -269,7 +271,21 @@ def main() -> None:
         dropout=float(args.dropout),
     )
     model = AdaptiveEpisodicTransformer(cfg, vocab_config).to(device)
-    criterion = AETLossModule(vocab_config=vocab_config, strict_routing=True).to(device)
+    criterion = AETLossModule(
+        vocab_config=vocab_config,
+        strict_routing=True,
+        weights={
+            "token": 1.0,
+            "val": 0.0,
+            "transition": 1.0,
+            "win_boundary": 1.0,
+            "win": 0.5,
+            "len": 0.0,
+            "chunk": 0.0,
+            "time": 0.0,
+            "dt": 0.0,
+        },
+    ).to(device)
     optim = torch.optim.AdamW(model.parameters(), lr=float(args.lr))
 
     model.train()

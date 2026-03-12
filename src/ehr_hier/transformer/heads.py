@@ -4,12 +4,15 @@ import torch.nn as nn
 
 class AETOutputHeads(nn.Module):
     """
-    The Switched Output Layer.
-    Contains separate projections for different vocabulary subspaces to
-    avoid the computational bottleneck of a monolithic Softmax(400k).
+    Output projections for token and side-channel prediction.
+
+    In the current compact-runtime regime, a unified dense token head is
+    feasible and is the preferred path for autoregressive next-token
+    training. Switched subspace heads remain available as a legacy/ablation
+    option.
     """
 
-    def __init__(self, d_model, vocab_config):
+    def __init__(self, d_model, vocab_config, *, use_unified_token_head: bool = True, emit_switched_heads: bool = True):
         """
         Args:
             d_model: Transformer hidden dimension (e.g., 768).
@@ -23,22 +26,35 @@ class AETOutputHeads(nn.Module):
         """
         super().__init__()
 
-        # 1. Structural Head (Window Delimiters, Special Tokens)
-        # Target Range: 0 - 999 (SPECIAL)
-        self.struct_head = nn.Linear(d_model, vocab_config['size_special'])
+        self.use_unified_token_head = bool(use_unified_token_head)
+        self.emit_switched_heads = bool(emit_switched_heads)
 
-        # 2. RVQ Head (Physiological Signals)
-        # Target Range: 1,000 - 4,999 (RVQ)
-        self.rvq_head = nn.Linear(d_model, vocab_config['size_rvq'])
+        self.token_head = (
+            nn.Linear(d_model, int(vocab_config["total_size"]))
+            if self.use_unified_token_head
+            else None
+        )
 
-        # 3. Measurement Label Head (e.g., "Heart Rate Identity")
-        # Target Range: 10,000 - 29,999 (MEAS)
-        self.meas_head = nn.Linear(d_model, vocab_config['size_meas_labels'])
-
-        # 4. Clinical Semantic Head (The Big One)
-        # Target Range: 30,000 - End (MED, DIAG, PROC)
-        # We group these because they share the same "Ontological" latent space
-        self.medtok_head = nn.Linear(d_model, vocab_config['size_meds'])
+        self.struct_head = (
+            nn.Linear(d_model, vocab_config['size_special'])
+            if self.emit_switched_heads
+            else None
+        )
+        self.rvq_head = (
+            nn.Linear(d_model, vocab_config['size_rvq'])
+            if self.emit_switched_heads
+            else None
+        )
+        self.meas_head = (
+            nn.Linear(d_model, vocab_config['size_meas_labels'])
+            if self.emit_switched_heads
+            else None
+        )
+        self.medtok_head = (
+            nn.Linear(d_model, vocab_config['size_meds'])
+            if self.emit_switched_heads
+            else None
+        )
 
         # 5. Attribute Regression Head (Side-Channel)
         # Predicts log1p(dosage) or log1p(duration)
@@ -58,10 +74,17 @@ class AETOutputHeads(nn.Module):
             A dictionary of logits. We compute ALL of them for every token.
             The Loss function will select the correct one using masking.
         """
-        return {
-            "logits_struct": self.struct_head(hidden_states),
-            "logits_rvq": self.rvq_head(hidden_states),
-            "logits_meas": self.meas_head(hidden_states),
-            "logits_medtok": self.medtok_head(hidden_states),
+        out = {
             "pred_values": self.value_head(hidden_states)
         }
+        if self.token_head is not None:
+            out["logits_token"] = self.token_head(hidden_states)
+        if self.struct_head is not None:
+            out["logits_struct"] = self.struct_head(hidden_states)
+        if self.rvq_head is not None:
+            out["logits_rvq"] = self.rvq_head(hidden_states)
+        if self.meas_head is not None:
+            out["logits_meas"] = self.meas_head(hidden_states)
+        if self.medtok_head is not None:
+            out["logits_medtok"] = self.medtok_head(hidden_states)
+        return out

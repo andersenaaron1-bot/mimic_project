@@ -62,7 +62,14 @@ class AdaptiveEpisodicTransformer(nn.Module):
         self.local_encoder = AETLocalEncoder(config, self.rope)
         self.chunk_aggregator = AETIntraWindowAggregator(config, self.rope)
         self.global_aggregator = AETGlobalAggregator(config, self.rope)
-        self.heads = AETOutputHeads(config.d_model, vocab_config)
+        self.use_unified_token_head = bool(getattr(config, "use_unified_token_head", True))
+        self.emit_switched_heads = bool(getattr(config, "emit_switched_heads", True))
+        self.heads = AETOutputHeads(
+            config.d_model,
+            vocab_config,
+            use_unified_token_head=self.use_unified_token_head,
+            emit_switched_heads=self.emit_switched_heads,
+        )
 
         self.next_window_type_head = (
             nn.Linear(config.d_model, self.num_window_types) if self.num_window_types > 0 else None
@@ -475,6 +482,7 @@ class AdaptiveEpisodicTransformer(nn.Module):
 
         if squeeze_chunk_axis:
             for key in (
+                "logits_token",
                 "logits_struct",
                 "logits_rvq",
                 "logits_meas",

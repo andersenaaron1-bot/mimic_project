@@ -47,6 +47,7 @@ def test_model_emits_next_window_type_logits() -> None:
         window_mask=window_mask,
     )
 
+    assert logits["logits_token"].shape == (B, W, L, vocab_config["total_size"])
     assert logits["logits_next_window_type"].shape == (B, W, _Cfg.num_window_types)
     assert final_state.shape == (B, _Cfg.d_model)
 
@@ -106,6 +107,7 @@ def test_model_accepts_chunked_semantic_windows() -> None:
         window_type_ids=window_type_ids,
     )
 
+    assert logits["logits_token"].shape == (B, W, C, L, vocab_config["total_size"])
     assert logits["logits_struct"].shape[:4] == (B, W, C, L)
     assert logits["logits_next_window_type"].shape == (B, W, _Cfg.num_window_types)
     assert final_state.shape == (B, _Cfg.d_model)
