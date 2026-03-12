@@ -219,6 +219,54 @@ def _window_preview(
     }
 
 
+def _bundle_context_preview(
+    event_tokens: List[EventToken],
+    *,
+    start_idx: int,
+    end_idx: int,
+    context_items: int,
+    artifacts: AuditArtifacts,
+    struct_id2label: Mapping[int, str],
+    struct_id2code: Mapping[int, str],
+    type_id2name: Mapping[int, str],
+) -> Dict[str, Any]:
+    pre_tokens = event_tokens[max(0, start_idx - context_items) : start_idx]
+    bundle_tokens = event_tokens[start_idx : end_idx + 1]
+    post_tokens = event_tokens[end_idx + 1 : end_idx + 1 + context_items]
+    return {
+        "pre_context": [
+            _token_preview(
+                tok,
+                artifacts=artifacts,
+                struct_id2label=struct_id2label,
+                struct_id2code=struct_id2code,
+                type_id2name=type_id2name,
+            )
+            for tok in pre_tokens
+        ],
+        "bundle_tokens": [
+            _token_preview(
+                tok,
+                artifacts=artifacts,
+                struct_id2label=struct_id2label,
+                struct_id2code=struct_id2code,
+                type_id2name=type_id2name,
+            )
+            for tok in bundle_tokens
+        ],
+        "post_context": [
+            _token_preview(
+                tok,
+                artifacts=artifacts,
+                struct_id2label=struct_id2label,
+                struct_id2code=struct_id2code,
+                type_id2name=type_id2name,
+            )
+            for tok in post_tokens
+        ],
+    }
+
+
 def _maybe_add_example(store: List[Dict[str, Any]], item: Dict[str, Any], *, limit: int) -> None:
     if len(store) < int(limit):
         store.append(item)
@@ -320,6 +368,8 @@ def _audit_window_contract(
         "leading_candidate_backfill_type_counts": Counter(),
         "micro_windows": 0,
         "micro_windows_by_type": Counter(),
+        "unknown_windows_by_opening_action": Counter(),
+        "unknown_windows_by_closing_action": Counter(),
         "subjects_with_post_discharge_window": 0,
         "post_discharge_windows": 0,
         "post_discharge_windows_with_clinical_tokens": 0,
@@ -331,6 +381,8 @@ def _audit_window_contract(
         "cooccurring_transfer_bundles": [],
         "leading_pretransition_subjects": [],
         "micro_windows": [],
+        "unknown_windows": [],
+        "boundary_contexts": [],
         "post_discharge_windows": [],
     }
 
@@ -361,13 +413,44 @@ def _audit_window_contract(
         if bundles:
             summary["subjects_with_any_transition_bundle"] += 1
 
-        for window in windows:
+        for w_idx, window in enumerate(windows):
             summary["total_windows"] += 1
             w_type_id = int(window.window_type_id)
             w_type_name = type_id2name.get(w_type_id, str(w_type_id))
             summary["window_type_counts"][w_type_name] += 1
             if w_type_id == int(segmentation_cfg.unk_window_type_id):
                 summary["window_type_unknown"] += 1
+                summary["unknown_windows_by_opening_action"][str(window.opening_action or "<none>")] += 1
+                summary["unknown_windows_by_closing_action"][str(window.closing_action or "<none>")] += 1
+                prev_type_name = None
+                next_type_name = None
+                if w_idx > 0:
+                    prev_type_name = type_id2name.get(
+                        int(windows[w_idx - 1].window_type_id),
+                        str(int(windows[w_idx - 1].window_type_id)),
+                    )
+                if w_idx + 1 < len(windows):
+                    next_type_name = type_id2name.get(
+                        int(windows[w_idx + 1].window_type_id),
+                        str(int(windows[w_idx + 1].window_type_id)),
+                    )
+                _maybe_add_example(
+                    examples["unknown_windows"],
+                    {
+                        "subject_id": int(sid),
+                        "window_index": int(w_idx),
+                        "prev_window_type": prev_type_name,
+                        "next_window_type": next_type_name,
+                        "window": _window_preview(
+                            window,
+                            artifacts=artifacts,
+                            struct_id2label=struct_id2label,
+                            struct_id2code=struct_id2code,
+                            type_id2name=type_id2name,
+                        ),
+                    },
+                    limit=max_examples,
+                )
 
             if window.tokens:
                 last_tok = window.tokens[-1]
@@ -473,6 +556,25 @@ def _audit_window_contract(
                 continue
 
             prefixes = sorted(set(transition_prefixes))
+            _maybe_add_example(
+                examples["boundary_contexts"],
+                {
+                    "subject_id": int(sid),
+                    "bundle_action": bundle_action,
+                    "bundle_prefixes": prefixes,
+                    **_bundle_context_preview(
+                        event_tokens,
+                        start_idx=start_idx,
+                        end_idx=end_idx,
+                        context_items=5,
+                        artifacts=artifacts,
+                        struct_id2label=struct_id2label,
+                        struct_id2code=struct_id2code,
+                        type_id2name=type_id2name,
+                    ),
+                },
+                limit=max_examples,
+            )
             has_transfer = "TRANSFER_TO" in prefixes
             primary_prefix = prefixes[0]
             summary["transition_bundle_counts"]["total"] += 1
@@ -657,6 +759,15 @@ def _audit_window_contract(
                 "frac": float(summary["micro_windows"]) / float(total_windows) if total_windows > 0 else 0.0,
                 "by_type": {str(k): int(v) for k, v in summary["micro_windows_by_type"].most_common()},
             },
+            "unknown_windows": {
+                "count": int(summary["window_type_unknown"]),
+                "by_opening_action": {
+                    str(k): int(v) for k, v in summary["unknown_windows_by_opening_action"].most_common()
+                },
+                "by_closing_action": {
+                    str(k): int(v) for k, v in summary["unknown_windows_by_closing_action"].most_common()
+                },
+            },
             "post_discharge": {
                 "subject_count": int(summary["subjects_with_post_discharge_window"]),
                 "window_count": int(summary["post_discharge_windows"]),
@@ -689,6 +800,7 @@ def _print_summary(payload: Mapping[str, Any]) -> None:
     print("Transition bundles:", summary["transition_bundles"])
     print("Leading pretransition:", summary["leading_pretransition"])
     print("Micro windows:", summary["micro_windows"])
+    print("Unknown windows:", summary["unknown_windows"])
     print("Post-discharge:", summary["post_discharge"])
 
 
