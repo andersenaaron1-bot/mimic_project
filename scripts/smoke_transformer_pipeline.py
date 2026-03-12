@@ -131,9 +131,6 @@ def main() -> None:
     ap.add_argument("--tokenizer_ckpt", required=True)
 
     ap.add_argument("--runtime_vocab_json", default=None)
-    ap.add_argument("--structural_entity_dense_size", type=int, default=65536)
-    ap.add_argument("--structural_entity_source_size", type=int, default=900000)
-
     ap.add_argument("--max_windows", type=int, default=32)
     ap.add_argument("--max_chunks_per_window", type=int, default=8)
     ap.add_argument("--max_len_per_window", type=int, default=128)
@@ -233,8 +230,6 @@ def main() -> None:
             "structural_codebook": artifacts.structural_codebook,
             "window_hook_label": "window_boundary",
             "attach_med_numeric": True,
-            "emit_process_struct_tokens": False,
-            "drop_original_process_marker_tokens": False,
             "emit_global_demographic_tokens": True,
             "special_token_offset": 0,
         }

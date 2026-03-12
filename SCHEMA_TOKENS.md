@@ -134,6 +134,10 @@ These remain `TokenCategory.MEASUREMENT` but use dedicated global-id ranges from
 the sparse vocab contract (`observation_code`, `observation_value`).
 The pragmatic v1 routing also sends high-volume chart aliases like `Blood Pressure`
 through this OBS path when they do not map to the numeric cVAE variable map.
+For v1 this remains a two-token bundle rather than a fused event-value token:
+the split keeps event identity and value identity factorized while keeping the
+vocabulary modest. Exact OBS vocabularies can be added later without changing
+the bundle shape.
 
 ### 3.2 Medications / Diagnoses / Procedures: MedTok-backed codes
 Medications, diagnoses, and procedures are mapped to MedTok vocab ids (from ontology-graph

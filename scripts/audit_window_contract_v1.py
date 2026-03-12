@@ -122,13 +122,6 @@ def _structural_label(
 ) -> str:
     value_id = int(tok.value_id)
     structural_offset = _offset(artifacts.manifest, "structural", 2_200_000)
-    structural_action_offset = _offset(artifacts.manifest, "structural_action", 2_400_000)
-    structural_entity_offset = _offset(artifacts.manifest, "structural_entity", 2_420_000)
-
-    if structural_action_offset <= value_id < structural_entity_offset:
-        return f"STRUCT_ACT::{value_id - structural_action_offset}"
-    if value_id >= structural_entity_offset:
-        return f"STRUCT_ENT::{value_id - structural_entity_offset}"
     if tok.cat_attrs and "struct_label_id" in tok.cat_attrs:
         label_id = int(tok.cat_attrs["struct_label_id"])
         return struct_id2label.get(label_id, f"STRUCT_LABEL::{label_id}")

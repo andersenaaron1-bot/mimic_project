@@ -795,8 +795,6 @@ def _family_name_for_token(tok: EventToken, *, artifacts: AuditArtifacts) -> str
     struct_offset = _offset(manifest, "structural", 2_200_000)
     obs_code_offset = _offset(manifest, "observation_code", 2_300_000)
     obs_value_offset = _offset(manifest, "observation_value", 2_320_000)
-    struct_action_offset = _offset(manifest, "structural_action", 2_400_000)
-    struct_entity_offset = _offset(manifest, "structural_entity", 2_420_000)
 
     if meas_value_offset <= value_id < struct_offset:
         return "measurement_value"
@@ -808,17 +806,54 @@ def _family_name_for_token(tok: EventToken, *, artifacts: AuditArtifacts) -> str
         return "procedure"
     if diag_offset <= value_id < proc_offset:
         return "diagnosis"
-    if obs_value_offset <= value_id < struct_action_offset:
+    if value_id >= obs_value_offset:
         return "observation_value"
     if obs_code_offset <= value_id < obs_value_offset:
         return "observation_code"
-    if struct_entity_offset <= value_id:
-        return "structural_entity"
-    if struct_action_offset <= value_id < struct_entity_offset:
-        return "structural_action"
-    if value_id >= struct_offset:
+    if struct_offset <= value_id < obs_code_offset:
         return "structural"
     return "special_or_window"
+
+
+def _record_window_marker_usage(
+    *,
+    ids: List[int],
+    specials_count: int,
+    collator: AETHierarchicalCollator,
+    window_type_id: int,
+    next_type_id: int | None,
+    chunk_is_last: bool,
+    totals: Counter[str],
+    prefix_type_counts: Counter[int],
+    prefix_raw_id_counts: Counter[int],
+    suffix_mode_counts: Counter[str],
+    suffix_next_type_counts: Counter[int],
+    suffix_raw_id_counts: Counter[int],
+) -> None:
+    if not collator.window_markers.enabled or not ids:
+        return
+    prefix_index = int(specials_count)
+    if prefix_index >= len(ids):
+        return
+
+    prefix_id = int(ids[prefix_index])
+    suffix_id = int(ids[-1])
+    totals["chunks_with_markers"] += 1
+    totals["marker_tokens_total"] += 2
+    prefix_type_counts[int(window_type_id)] += 1
+    prefix_raw_id_counts[prefix_id] += 1
+    suffix_raw_id_counts[suffix_id] += 1
+
+    if not chunk_is_last:
+        suffix_mode_counts["continue"] += 1
+        return
+
+    end_mode = str(getattr(collator.window_markers, "end_mode", "end_token"))
+    if end_mode == "next_type" and next_type_id is not None:
+        suffix_mode_counts["next_type"] += 1
+        suffix_next_type_counts[int(next_type_id)] += 1
+    else:
+        suffix_mode_counts["end"] += 1
 
 
 def _audit_subject_tokenization(
@@ -1050,6 +1085,12 @@ def _summarize_tokenization_and_collation(
     chunk_mask_ones = 0
     window_type_zero = 0
     window_type_total = 0
+    window_marker_totals = Counter()
+    window_marker_prefix_types = Counter()
+    window_marker_prefix_raw_ids = Counter()
+    window_marker_suffix_modes = Counter()
+    window_marker_suffix_next_types = Counter()
+    window_marker_suffix_raw_ids = Counter()
     window_type_raw_counts = Counter()
     window_type_clamped_counts = Counter()
     unknown_window_opening_actions = Counter()
@@ -1173,8 +1214,6 @@ def _summarize_tokenization_and_collation(
                                 observation_code_offset=_offset(artifacts.manifest, "observation_code", 2_300_000),
                                 observation_value_offset=_offset(artifacts.manifest, "observation_value", 2_320_000),
                                 structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
-                                structural_action_offset=_offset(artifacts.manifest, "structural_action", 2_400_000),
-                                structural_entity_offset=_offset(artifacts.manifest, "structural_entity", 2_420_000),
                                 structural_id2label=struct_id2label,
                                 structural_id2code=struct_id2code,
                                 special_id2name=SPECIAL_ID2NAME,
@@ -1246,6 +1285,20 @@ def _summarize_tokenization_and_collation(
                 )
                 if len(ids) > collator.max_len:
                     truncation_counts["chunks_overflow_internal_budget"] += 1
+                _record_window_marker_usage(
+                    ids=ids,
+                    specials_count=len(specials),
+                    collator=collator,
+                    window_type_id=int(win_types[wi]),
+                    next_type_id=(int(next_type) if next_type is not None else None),
+                    chunk_is_last=bool(chunk.is_last_chunk),
+                    totals=window_marker_totals,
+                    prefix_type_counts=window_marker_prefix_types,
+                    prefix_raw_id_counts=window_marker_prefix_raw_ids,
+                    suffix_mode_counts=window_marker_suffix_modes,
+                    suffix_next_type_counts=window_marker_suffix_next_types,
+                    suffix_raw_id_counts=window_marker_suffix_raw_ids,
+                )
 
         if len(example_rows) < example_subjects:
             example_rows.append(
@@ -1267,8 +1320,6 @@ def _summarize_tokenization_and_collation(
                         observation_code_offset=_offset(artifacts.manifest, "observation_code", 2_300_000),
                         observation_value_offset=_offset(artifacts.manifest, "observation_value", 2_320_000),
                         structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
-                        structural_action_offset=_offset(artifacts.manifest, "structural_action", 2_400_000),
-                        structural_entity_offset=_offset(artifacts.manifest, "structural_entity", 2_420_000),
                         structural_id2label=struct_id2label,
                         structural_id2code=struct_id2code,
                         special_id2name=SPECIAL_ID2NAME,
@@ -1427,6 +1478,17 @@ def _summarize_tokenization_and_collation(
         ),
         "window_type_raw_counts": _as_plain_counter(window_type_raw_counts),
         "window_type_clamped_counts": _as_plain_counter(window_type_clamped_counts),
+        "window_marker_usage": {
+            "chunks_with_markers": int(window_marker_totals.get("chunks_with_markers", 0)),
+            "marker_tokens_total": int(window_marker_totals.get("marker_tokens_total", 0)),
+            "prefix_type_counts": _as_plain_counter(window_marker_prefix_types),
+            "prefix_raw_id_counts": _as_plain_counter(window_marker_prefix_raw_ids),
+            "suffix_mode_counts": _as_plain_counter(window_marker_suffix_modes),
+            "suffix_next_type_counts": _as_plain_counter(window_marker_suffix_next_types),
+            "suffix_raw_id_counts": _as_plain_counter(window_marker_suffix_raw_ids),
+            "end_token_id": int(collator._window_end_token_id()),
+            "continue_token_id": int(collator._window_continue_token_id()),
+        },
         "unknown_window_diagnostics": {
             "total_unknown_windows": int(unknown_window_total),
             "by_opening_action": _as_plain_counter(unknown_window_opening_actions),
@@ -1473,6 +1535,7 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Collation truncation:", coll["truncation"])
     print("Collation numeric_mask_density_vs_attended:", f"{coll['numeric_mask_density_vs_attended']:.4f}")
     print("Collation window_type_unk_frac:", f"{coll['window_type_unk_frac']:.4f}")
+    print("Collation window markers:", coll.get("window_marker_usage", {}))
     unknown_diag = coll.get("unknown_window_diagnostics", {})
     if unknown_diag:
         print("Unknown windows by opening action:", unknown_diag.get("by_opening_action", {}))

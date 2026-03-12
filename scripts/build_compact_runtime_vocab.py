@@ -127,8 +127,6 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         "structural_codebook": artifacts.structural_codebook,
         "window_hook_label": "window_boundary",
         "attach_med_numeric": True,
-        "emit_process_struct_tokens": False,
-        "drop_original_process_marker_tokens": False,
         "emit_global_demographic_tokens": True,
         "special_token_offset": 0,
     }
