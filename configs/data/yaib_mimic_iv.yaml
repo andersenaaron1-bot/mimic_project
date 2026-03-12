@@ -1,5 +1,0 @@
-name: yaib_mimic_iv #Only stub, for YAIB benchmarking later on
-cohort: ICU
-tasks: [mortality_24h]
-split: official
-streaming: true

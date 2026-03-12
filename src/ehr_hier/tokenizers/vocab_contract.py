@@ -9,6 +9,7 @@ import yaml
 
 from src.ehr_hier.data.structural_codes import (
     load_structural_codebook_yaml,
+    serialize_structural_codebook,
     structural_surface_vocab_codes,
 )
 from src.ehr_hier.tokenizers.medtok_loader import resolve_residual_fallback_vocab_path
@@ -240,7 +241,6 @@ def build_sparse_vocab_contract(
     allow_smoke_medtok: bool = False,
 ) -> Dict[str, Any]:
     contract = _load_yaml(tokenization_contract)
-    legacy_manifest = _load_json(vocab_manifest) if Path(vocab_manifest).exists() else {}
     frozen = _safe_dict(contract.get("frozen_ranges", {}))
     residual_cfg = _safe_dict(contract.get("residual_fallback", {}))
     markers_cfg = _safe_dict(contract.get("window_markers", {}))
@@ -250,9 +250,6 @@ def build_sparse_vocab_contract(
         fr = _safe_dict(frozen.get(name, {}))
         if "offset" in fr:
             return int(fr["offset"])
-        legacy = _safe_dict(legacy_manifest.get(name, {}))
-        if "offset" in legacy:
-            return int(legacy["offset"])
         return int(default)
 
     def _bucket(name: str, default: int) -> int:
@@ -319,7 +316,7 @@ def build_sparse_vocab_contract(
     )
     rvq_size_eff = int(rvq_size) if rvq_size is not None else (_rvq_size_from_ckpt(tokenizer_ckpt) or 1_024)
     obs_code_size = _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
-    obs_val_size = _size_from_gap(obs_val_offset, _offset("structural_action", 2_400_000), 80_000)
+    obs_val_size = int(_safe_dict(frozen.get("observation_value", {})).get("size", 80_000))
     diag_res_meta = _residual_vocab_meta(
         medtok_vocab_dir=medtok_dir,
         family="diagnosis",
@@ -338,11 +335,27 @@ def build_sparse_vocab_contract(
         offset=med_res_offset,
         default_buckets=_bucket("medication_residual", 39_999),
     )
+    structural_contract: Dict[str, Any] = {}
     try:
         structural_codebook = load_structural_codebook_yaml(str(structural_yaml), default_offset=int(structural_offset))
         structural_size = max(1, int(len(structural_surface_vocab_codes(structural_codebook))))
+        structural_contract = serialize_structural_codebook(structural_codebook)
+        structural_contract["builder_policy"] = {
+            "transition_map_is_authoritative_when_codebook_present": True,
+            "legacy_boundary_fallback_requires_missing_codebook": True,
+            "emit_process_struct_tokens_default": False,
+        }
     except Exception:
         structural_size = _size_from_gap(structural_offset, obs_code_offset, 100_000)
+        structural_contract = {
+            "offset": int(structural_offset),
+            "surface_vocab_codes": [],
+            "builder_policy": {
+                "transition_map_is_authoritative_when_codebook_present": True,
+                "legacy_boundary_fallback_requires_missing_codebook": True,
+                "emit_process_struct_tokens_default": False,
+            },
+        }
 
     families: Dict[str, Any] = {
         "special": _family_entry(
@@ -489,6 +502,7 @@ def build_sparse_vocab_contract(
             "unk_type_id": int(markers_cfg.get("unk_type_id", 0)),
         },
         "window_segmentation": dict(segmentation_cfg),
+        "structural_contract": structural_contract,
         "residual_fallback": {
             "enabled": bool(residual_cfg.get("enabled", True)),
             "buckets": int(residual_cfg.get("buckets", 39_999)),
@@ -498,7 +512,7 @@ def build_sparse_vocab_contract(
         "runtime_block_order": list(DEFAULT_RUNTIME_BLOCK_ORDER),
         "legacy_sources": {
             "tokenization_contract": str(tokenization_contract),
-            "vocab_manifest": str(vocab_manifest),
+            "vocab_manifest": None,
             "structural_yaml": str(structural_yaml),
             "medtok_code2embeds": str(medtok_inputs["medtok_code2embeds"]) if medtok_inputs["medtok_code2embeds"] is not None else None,
             "medtok_vocab_dir": str(medtok_inputs["medtok_vocab_dir"]) if medtok_inputs["medtok_vocab_dir"] is not None else None,

@@ -55,6 +55,18 @@ It is intentionally concrete and path-specific. Update it whenever the active LR
   can OOM during pyxis import on LRZ before the user command starts. This is a container import-memory issue, not a Python or code bug.
 - If a command fails during `Creating squashfs filesystem...` with `error code 137`, treat it as pyxis/enroot OOM.
 
+## LRZ tokenization wrapper
+- For the pinned tokenization-freeze stage, prefer:
+  - `source scripts/lrz_tokenization_env.sh`
+  - `scripts/lrz_tokenization_eval.sh paths`
+  - `scripts/lrz_tokenization_eval.sh <subcommand>`
+- This wrapper keeps a stable CPU `srun` configuration and writes tokenization eval outputs
+  under the DSS project tree (`$DSS_HOST/etl/tokenization_v1_eval`, visible in-container as
+  `/dss/etl/tokenization_v1_eval`) so LRZ high-I/O work stays on the DSS filesystem.
+- The wrapper prefers a project-local MedTok embeddings file at
+  `$DSS_HOST/artifacts/medtok/code2embeddings.json` when present, and falls back to mounting
+  `/dss/artifacts` at `/dss-artifacts` otherwise for full-universe MedTok audits.
+
 ## Storage/quota notes
 - Current retained DSS usage after cleanup is about `22G`.
 - Practical quota assumption during this phase is about `40G`.

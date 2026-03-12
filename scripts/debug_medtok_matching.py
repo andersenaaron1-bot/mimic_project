@@ -1,19 +1,19 @@
 """
-Diagnose MedTok matching coverage against a meds_reader DB.
+Diagnose MedTok-universe coverage against a meds_reader DB.
 
 This walks events, routes them via event_router.classify_code_to_category,
-canonicalizes codes, and checks whether a MedTok vocab contains any candidate.
-It highlights router mismatches (e.g., raw ICD codes routed to OTHER) and
-vocab misses (no candidate landed in the vocab).
+then applies the live MedTok resolution cascade:
+  exact -> canonicalized -> parent_lookup -> crosswalk_lookup -> lexical_bridge
 
-Usage (PowerShell):
-    $env:PYTHONPATH="."; `
-    $env:MEDS_READER_DB="C:\\path\\to\\meds_reader.db"; `
-    python scripts/debug_medtok_matching.py --max-events 200000
+The goal is to answer two different questions cleanly:
+  1. What fraction of routed semantic events are recoverable by the full MedTok
+     embedding universe under the current resolution logic?
+  2. What fraction of the MedTok embedding universe is actually touched by the
+     routed corpus under that same logic?
 
-You can point to MedTok artifacts via:
-  - MEDTOK_CODE2EMBEDS or --code2embeds (full code2embeddings.json)
-  - MEDTOK_VOCAB_DIR or --vocab-dir (expects diag_vocab.json / proc_vocab.json / med_vocab.json)
+It still highlights router mismatches and diagnosis-format recoverability, but it
+is now aligned with the current tokenization path rather than an older
+canonicalization-only approximation.
 """
 
 from __future__ import annotations
@@ -42,11 +42,12 @@ from src.ehr_hier.tokenizers.medtok_canonicalize import (
     procedure_filter,
     medication_filter,
 )
-from src.ehr_hier.tokenizers.medtok_loader import (
-    CategoryVocab,
-    build_vocab_from_code2embeddings,
-    load_medtok_vocab,
+from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab, build_vocab_from_code2embeddings, load_medtok_vocab
+from src.ehr_hier.tokenizers.medtok_attr_encoder import (
+    EXPLICIT_MEDTOK_RESOLUTION_STAGES,
+    MedTokenWithAttrsEncoder,
 )
+from src.ehr_hier.tokenizers.medtok_crosswalk import load_resolved_crosswalk_lookup
 
 
 def _is_expected_process_reroute(code_upper: str, category: TokenCategory) -> bool:
@@ -111,11 +112,13 @@ class CatStats:
     expected_process_reroute_misses: int = 0
     true_medtok_gap_misses: int = 0
     matched_vocab_ids: set[int] = field(default_factory=set)
+    matched_codes: set[str] = field(default_factory=set)
     hits: int = 0
     misses: int = 0
     no_candidate: int = 0            # canonicalizer produced zero candidates (raw included)
     not_in_vocab: int = 0            # had candidates but none hit vocab
     format_recoverable_misses: int = 0  # diagnosis-only: miss recoverable by extra ICD dot probing
+    stage_counts: Counter = field(default_factory=Counter)
     router_mismatch: Counter = field(default_factory=Counter)   # filter hit but router chose other
     miss_samples: Counter = field(default_factory=Counter)      # routed here but missed vocab
     format_recoverable_samples: Counter = field(default_factory=Counter)
@@ -294,10 +297,46 @@ def _build_resources(manifest: Dict, args: argparse.Namespace):
         filter_fn=medication_filter,
     )
 
+    crosswalk_json = args.crosswalk_json
+    diag_crosswalk = load_resolved_crosswalk_lookup(
+        crosswalk_json,
+        "diagnosis",
+        available_codes=diag_vocab.code2id.keys(),
+    )
+    proc_crosswalk = load_resolved_crosswalk_lookup(
+        crosswalk_json,
+        "procedure",
+        available_codes=proc_vocab.code2id.keys(),
+    )
+    med_crosswalk = load_resolved_crosswalk_lookup(
+        crosswalk_json,
+        "medication",
+        available_codes=med_vocab.code2id.keys(),
+    )
+
+    diag_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.DIAGNOSIS,
+        diag_vocab,
+        canonicalize_fn=canonicalize_diagnosis_code,
+        crosswalk_lookup=diag_crosswalk,
+    )
+    proc_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.PROCEDURE,
+        proc_vocab,
+        canonicalize_fn=canonicalize_procedure_code,
+        crosswalk_lookup=proc_crosswalk,
+    )
+    med_encoder = MedTokenWithAttrsEncoder(
+        TokenCategory.MEDICATION,
+        med_vocab,
+        canonicalize_fn=canonicalize_medication_code,
+        crosswalk_lookup=med_crosswalk,
+    )
+
     cat_resources = {
-        TokenCategory.DIAGNOSIS: (diag_vocab, canonicalize_diagnosis_code, diagnosis_filter),
-        TokenCategory.PROCEDURE: (proc_vocab, canonicalize_procedure_code, procedure_filter),
-        TokenCategory.MEDICATION: (med_vocab, canonicalize_medication_code, medication_filter),
+        TokenCategory.DIAGNOSIS: (diag_vocab, diag_encoder, diagnosis_filter),
+        TokenCategory.PROCEDURE: (proc_vocab, proc_encoder, procedure_filter),
+        TokenCategory.MEDICATION: (med_vocab, med_encoder, medication_filter),
     }
     return cat_resources
 
@@ -323,6 +362,8 @@ def _summarize(cat: TokenCategory, stats: CatStats, top_k: int) -> None:
         f"  hits={stats.hits:,} | misses={stats.misses:,} "
         f"| hit_rate={_pct(stats.hits, stats.routed_total):.1f}%"
     )
+    if stats.stage_counts:
+        print(f"  resolution_stages={dict(stats.stage_counts)}")
     if stats.parent_recovered_hits:
         print(
             f"  parent_recovered_hits={stats.parent_recovered_hits:,} "
@@ -424,75 +465,50 @@ def run(args: argparse.Namespace) -> None:
                     stats[cat].router_mismatch[code_upper] += 1
                 continue
 
-            vocab, canon_fn, _ = cat_resources[category]
-            stats[category].routed_total += 1
-            if category in filter_hits:
-                stats[category].filtered_routed += 1
-            event_parent_codes = _extract_parent_codes_from_event(ev)
-            if event_parent_codes:
-                stats[category].parent_meta_present += 1
-            lookup_parent_codes = parent_lookup.get(code_upper, [])
-            if lookup_parent_codes:
-                stats[category].parent_lookup_present += 1
+        vocab, encoder, _ = cat_resources[category]
+        stats[category].routed_total += 1
+        if category in filter_hits:
+            stats[category].filtered_routed += 1
+        event_parent_codes = _extract_parent_codes_from_event(ev)
+        if event_parent_codes:
+            stats[category].parent_meta_present += 1
+        lookup_parent_codes = parent_lookup.get(code_upper, [])
+        if lookup_parent_codes:
+            stats[category].parent_lookup_present += 1
 
-            try:
-                base_cands = ensure_list(canon_fn(code)) + [code_upper]
-            except Exception:
-                base_cands = [code_upper]
-            base_cands = _dedupe_preserve(base_cands)
+            merged_parent_codes = _dedupe_preserve(list(event_parent_codes) + list(lookup_parent_codes))
+            ev_proxy = type(
+                "_CoverageEvent",
+                (),
+                {
+                    "code": code_upper,
+                    "parent_codes": merged_parent_codes,
+                },
+            )()
+            resolution = encoder.resolve_event(ev_proxy)
+            stats[category].stage_counts[str(resolution.stage)] += 1
 
-            parent_cands: list[str] = []
-            for pc in _dedupe_preserve(list(event_parent_codes) + list(lookup_parent_codes)):
-                try:
-                    parent_cands.extend(ensure_list(canon_fn(pc)))
-                except Exception:
-                    pass
-                parent_cands.append(str(pc).upper())
-            parent_cands = _dedupe_preserve(parent_cands)
-
-            cands = _dedupe_preserve(parent_cands + base_cands)
-            if not cands:
-                stats[category].misses += 1
-                stats[category].no_candidate += 1
-                stats[category].miss_samples[code_upper] += 1
-                continue
-
-            base_gid = None
-            for cand in base_cands:
-                gid = vocab.maybe_encode(cand)
-                if gid is not None:
-                    base_gid = int(gid)
-                    break
-            if base_gid is not None:
+            if resolution.stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES and resolution.base_gid is not None:
                 stats[category].hits += 1
-                stats[category].matched_vocab_ids.add(int(base_gid))
-                continue
-
-            hit_gid = None
-            for cand in cands:
-                gid = vocab.maybe_encode(cand)
-                if gid is not None:
-                    hit_gid = int(gid)
-                    break
-
-            if hit_gid is not None:
-                stats[category].hits += 1
-                stats[category].matched_vocab_ids.add(int(hit_gid))
-                if parent_cands:
+                stats[category].matched_vocab_ids.add(int(resolution.base_gid))
+                if resolution.matched_code is not None:
+                    stats[category].matched_codes.add(str(resolution.matched_code))
+                if resolution.stage == "parent_lookup":
                     stats[category].parent_recovered_hits += 1
+                continue
+
+            stats[category].misses += 1
+            stats[category].not_in_vocab += 1
+            if _is_expected_process_reroute(code_upper, category):
+                stats[category].expected_process_reroute_misses += 1
             else:
-                stats[category].misses += 1
-                stats[category].not_in_vocab += 1
-                if _is_expected_process_reroute(code_upper, category):
-                    stats[category].expected_process_reroute_misses += 1
-                else:
-                    stats[category].true_medtok_gap_misses += 1
-                stats[category].miss_samples[code_upper] += 1
-                if category == TokenCategory.DIAGNOSIS:
-                    probe_cands = _diagnosis_format_probe_candidates(code_upper)
-                    if probe_cands and any(vocab.maybe_encode(c) is not None for c in probe_cands):
-                        stats[category].format_recoverable_misses += 1
-                        stats[category].format_recoverable_samples[code_upper] += 1
+                stats[category].true_medtok_gap_misses += 1
+            stats[category].miss_samples[code_upper] += 1
+            if category == TokenCategory.DIAGNOSIS:
+                probe_cands = _diagnosis_format_probe_candidates(code_upper)
+                if probe_cands and any(vocab.maybe_encode(c) is not None for c in probe_cands):
+                    stats[category].format_recoverable_misses += 1
+                    stats[category].format_recoverable_samples[code_upper] += 1
 
         if args.max_events and total_events > args.max_events:
             break
@@ -535,10 +551,12 @@ def run(args: argparse.Namespace) -> None:
                 "hits": int(s.hits),
                 "misses": int(s.misses),
                 "matched_vocab_ids": int(len(s.matched_vocab_ids)),
+                "matched_codes": int(len(s.matched_codes)),
                 "vocab_size_ex_unk": int(vocab_size_ex_unk.get(cat, 0)),
                 "no_candidate": int(s.no_candidate),
                 "not_in_vocab": int(s.not_in_vocab),
                 "format_recoverable_misses": int(s.format_recoverable_misses),
+                "stage_counts": {str(k): int(v) for k, v in s.stage_counts.items()},
                 "top_router_mismatch": s.router_mismatch.most_common(args.top_k),
                 "top_miss_samples": s.miss_samples.most_common(args.top_k),
                 "top_format_recoverable": s.format_recoverable_samples.most_common(args.top_k),
@@ -583,6 +601,12 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Optional MEDS metadata/codes.parquet to supply code->parent_codes lookup.",
+    )
+    parser.add_argument(
+        "--crosswalk-json",
+        type=str,
+        default=None,
+        help="Optional MedTok crosswalk artifact JSON to include crosswalk recovery in coverage.",
     )
     return parser.parse_args()
 

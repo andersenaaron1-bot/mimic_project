@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
-from typing import Dict, Optional, Set
+from typing import Any, Dict, Mapping, Optional, Set
 
 import yaml
 
@@ -250,6 +250,89 @@ def structural_surface_vocab_codes(
             if surface:
                 out.add(surface)
     return out
+
+
+def serialize_structural_codebook(
+    codebook: Optional[StructuralCodebook],
+) -> Dict[str, Any]:
+    """
+    Serialize the live structural codebook into a builder/runtime-friendly payload.
+
+    This is used by the generated sparse vocab contract so the tokenization-v1
+    artifact can show the exact structural surfaces, transitions, and window
+    type mappings that are active in the current code path.
+    """
+    if codebook is None:
+        return {}
+    return {
+        "offset": int(codebook.offset),
+        "code2label": {str(k): str(v) for k, v in codebook.code2label.items()},
+        "label2id": {str(k): int(v) for k, v in codebook.label2id().items()},
+        "structural_only": sorted(str(x) for x in codebook.structural_only),
+        "keep_original": sorted(str(x) for x in codebook.keep_original),
+        "boundary_labels": (
+            sorted(str(x) for x in codebook.boundary_labels)
+            if codebook.boundary_labels is not None
+            else None
+        ),
+        "boundary_codes": (
+            sorted(str(x) for x in codebook.boundary_codes)
+            if codebook.boundary_codes is not None
+            else None
+        ),
+        "transition_map": {str(k): str(v) for k, v in codebook.transition_map.items()},
+        "window_types": {str(k): int(v) for k, v in codebook.window_type2id().items()},
+        "window_type_map": {str(k): str(v) for k, v in codebook.window_type_map.items()},
+        "surface_vocab_codes": sorted(structural_surface_vocab_codes(codebook)),
+        "active_transition_actions": sorted(str(x) for x in TRANSITION_ACTION_TO_ID.keys()),
+    }
+
+
+def structural_codebook_from_payload(
+    payload: Mapping[str, Any] | None,
+    *,
+    default_offset: int = 0,
+) -> Optional[StructuralCodebook]:
+    """
+    Reconstruct a StructuralCodebook from a serialized payload.
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    code2label_raw = payload.get("code2label", None)
+    if not isinstance(code2label_raw, Mapping) or not code2label_raw:
+        return None
+    return StructuralCodebook(
+        code2label={str(k): str(v) for k, v in code2label_raw.items()},
+        label2id_map={
+            str(k): int(v)
+            for k, v in (payload.get("label2id", {}) or {}).items()
+        },
+        offset=int(payload.get("offset", default_offset)),
+        structural_only={str(x) for x in (payload.get("structural_only", []) or [])},
+        keep_original={str(x) for x in (payload.get("keep_original", []) or [])},
+        boundary_labels=(
+            {str(x) for x in payload.get("boundary_labels", [])}
+            if payload.get("boundary_labels", None) is not None
+            else None
+        ),
+        boundary_codes=(
+            {str(x) for x in payload.get("boundary_codes", [])}
+            if payload.get("boundary_codes", None) is not None
+            else None
+        ),
+        transition_map={
+            str(k): str(v)
+            for k, v in (payload.get("transition_map", {}) or {}).items()
+        },
+        window_type2id_map={
+            str(k): int(v)
+            for k, v in (payload.get("window_types", {}) or {}).items()
+        },
+        window_type_map={
+            str(k): str(v)
+            for k, v in (payload.get("window_type_map", {}) or {}).items()
+        },
+    )
 
 
 def load_structural_codebook_yaml(yaml_fp: str, *, default_offset: int = 0) -> StructuralCodebook:

@@ -97,6 +97,7 @@ def build_subject_timeline(
     structural_codebook: Optional[StructuralCodebook] = None,
     qual_obs_code_offset: int = 2_300_000,
     qual_obs_value_offset: int = 2_320_000,
+    qual_obs_value_vocab_size: int = 80_000,
     struct_action_offset: int = 2_400_000,
     struct_entity_offset: int = 2_420_000,
     emit_process_struct_tokens: bool = False,
@@ -267,11 +268,13 @@ def build_subject_timeline(
     ) -> bool:
         if not bool(window_hook_label) or code_str is None:
             return False
-        if structural_codebook is not None and label is not None:
-            return structural_codebook.is_window_boundary(code=code_str, label=label)
-        if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
-            return True
-        if routed_transition_action == "suppress":
+        if structural_codebook is not None:
+            if label is not None:
+                return structural_codebook.is_window_boundary(code=code_str, label=label)
+            if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
+                return True
+            if routed_transition_action == "suppress":
+                return False
             return False
         code_prefix = code_str.split("//", 1)[0].upper()
         legacy_struct_boundary = (
@@ -412,7 +415,7 @@ def build_subject_timeline(
             return []
 
         obs_code_lane = max(16, int(qual_obs_value_offset) - int(qual_obs_code_offset) - 1)
-        obs_value_lane = max(16, int(struct_action_offset) - int(qual_obs_value_offset) - 1)
+        obs_value_lane = max(16, int(qual_obs_value_vocab_size))
 
         item_or_code = parts[1] if len(parts) >= 2 else code_value
         local_code_id = _stable_local_id(f"{prefix}::{item_or_code}", modulo=obs_code_lane)
@@ -801,10 +804,13 @@ def build_subject_timeline(
             )
         should_hook = False
         if bool(window_hook_label) and code_str is not None and not (structural_codebook is not None and struct_hit):
-            if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
-                should_hook = True
-            elif routed_transition_action == "suppress":
-                should_hook = False
+            if structural_codebook is not None:
+                if routed_transition_action in ACTIVE_TRANSITION_ACTIONS:
+                    should_hook = True
+                elif routed_transition_action == "suppress":
+                    should_hook = False
+                else:
+                    should_hook = False
             else:
                 code_prefix = code_str.split("//", 1)[0].upper()
                 legacy_struct_boundary = (

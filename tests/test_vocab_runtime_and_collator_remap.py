@@ -79,6 +79,7 @@ def test_runtime_vocab_builder_and_dense_remapper(tmp_path) -> None:
                     "ADMISSION": "START_ADM",
                     "DISCHARGE": "END_ADM",
                 },
+                "transition_map": {"ADMISSION": "open_next"},
                 "window_types": {"UNK": 0, "INPATIENT": 1},
                 "window_type_map": {"ADMISSION": "INPATIENT"},
             }
@@ -211,6 +212,7 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
                     "ADMISSION": "START_ADM",
                     "DISCHARGE": "END_ADM",
                 },
+                "transition_map": {"ADMISSION": "open_next"},
                 "window_types": {"UNK": 0, "INPATIENT": 1},
                 "window_type_map": {"ADMISSION": "INPATIENT"},
             }
@@ -242,6 +244,13 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
     assert sparse_contract["families"]["medication_residual"]["family_type"] == "residual_exact"
     assert sparse_contract["residual_fallback"]["families"]["medication"]["mode"] == "exact_vocab"
     assert sparse_contract["residual_fallback"]["families"]["medication"]["tail_policy"] == "drop"
+    assert sparse_contract["legacy_sources"]["vocab_manifest"] is None
+    assert sparse_contract["structural_contract"]["transition_map"]["ADMISSION"] == "open_next"
+    assert "ADMISSION" in sparse_contract["structural_contract"]["surface_vocab_codes"]
+    assert (
+        sparse_contract["structural_contract"]["builder_policy"]["transition_map_is_authoritative_when_codebook_present"]
+        is True
+    )
 
     legacy_manifest = build_legacy_manifest_from_sparse_contract(sparse_contract)
     assert legacy_manifest["diagnosis"]["offset"] == 1000000

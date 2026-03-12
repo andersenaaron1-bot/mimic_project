@@ -44,10 +44,6 @@ frozen_ranges:
     offset: 2300000
   observation_value:
     offset: 2320000
-  structural_action:
-    offset: 2400000
-  structural_entity:
-    offset: 2420000
 
 residual_fallback:
   enabled: true
@@ -77,7 +73,5 @@ window_segmentation:
   rebalance_min_tokens: 32
   rebalance_tail_tokens: 16
   default_first_window_type: PROLOGUE
-  propagate_prev_type_for_unknown_windows: true
-  enable_inter_admission_windows: true
-  inter_admission_window_type: INTER_ADMISSION
-  inter_admission_max_gap_hours: 24.0
+  post_discharge_window_type: POST_DISCHARGE
+  propagate_prev_type_for_unknown_windows: false

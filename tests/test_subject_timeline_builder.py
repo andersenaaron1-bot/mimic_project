@@ -354,6 +354,39 @@ def test_routed_meds_birth_transition_is_suppressed_and_not_marked_as_boundary()
     assert tok.window_hook is None
 
 
+def test_routed_structural_event_does_not_use_legacy_boundary_prefix_when_codebook_present():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="HOSPITAL_ADMISSION//GENERIC", time=t0)]
+    db = DummyDB({1: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(
+        name="struct_raw",
+        offset=50,
+        code2id={"<UNK>": 0, "HOSPITAL_ADMISSION": 1},
+    )
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    codebook = StructuralCodebook(
+        code2label={},
+        transition_map={},
+        window_type2id_map={"UNK": 0, "INPATIENT": 3},
+        window_type_map={},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=1,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        structural_codebook=codebook,
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 1
+    tok = tokens[0]
+    assert tok.window_hook is None
+    assert "transition_action_id" not in tok.cat_attrs
+
+
 def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifiers(tmp_path):
     yaml_fp = tmp_path / "structural_codes.yaml"
     yaml_fp.write_text(

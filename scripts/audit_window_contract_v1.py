@@ -7,7 +7,7 @@ import sys
 import time
 from collections import Counter
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Sequence
+from typing import Any, Dict, List, Mapping
 
 import meds_reader as mr
 
@@ -65,24 +65,6 @@ TRANSITION_PREFIXES = {
     "STRUCT_START_OR",
     "STRUCT_END_OR",
 }
-ADMISSION_LIKE_PREFIXES = {
-    "TRANSFER_TO",
-    "HOSPITAL_ADMISSION",
-    "ADMISSION",
-    "ICU_ADMISSION",
-    "ED_REGISTRATION",
-    "STRUCT_START_ADM",
-    "STRUCT_CAREUNIT_CHANGE",
-    "STRUCT_START_OR",
-}
-DISCHARGE_LIKE_PREFIXES = {
-    "HOSPITAL_DISCHARGE",
-    "DISCHARGE",
-    "ICU_DISCHARGE",
-    "ED_OUT",
-    "STRUCT_END_ADM",
-    "STRUCT_END_OR",
-}
 PRIMARY_CLINICAL_CATEGORIES = {
     int(TokenCategory.MEASUREMENT),
     int(TokenCategory.DIAGNOSIS),
@@ -93,18 +75,6 @@ PRIMARY_CLINICAL_CATEGORIES = {
 
 def _round_hours(value: float) -> float:
     return round(float(value), 3)
-
-
-def _parse_thresholds(arg: str | None) -> List[float]:
-    if arg is None or not str(arg).strip():
-        return [4.0, 12.0, 24.0, 48.0]
-    out: List[float] = []
-    for part in str(arg).split(","):
-        piece = part.strip()
-        if not piece:
-            continue
-        out.append(float(piece))
-    return sorted({float(x) for x in out})
 
 
 def _type_id2name(codebook: Any) -> Dict[int, str]:
@@ -254,29 +224,6 @@ def _maybe_add_example(store: List[Dict[str, Any]], item: Dict[str, Any], *, lim
         store.append(item)
 
 
-def _summarize_numeric(values: Sequence[float]) -> Dict[str, float]:
-    if not values:
-        return {"count": 0.0, "p50": 0.0, "p90": 0.0, "p99": 0.0, "max": 0.0}
-    vals = sorted(float(v) for v in values)
-
-    def _pct(p: float) -> float:
-        idx = max(0, min(len(vals) - 1, int(round(p * (len(vals) - 1)))))
-        return float(vals[idx])
-
-    return {
-        "count": float(len(vals)),
-        "p50": _pct(0.50),
-        "p90": _pct(0.90),
-        "p99": _pct(0.99),
-        "max": float(max(vals)),
-    }
-
-
-def _count_thresholds(values: Iterable[float], thresholds: Sequence[float]) -> Dict[str, int]:
-    cached = [float(v) for v in values]
-    return {str(th): int(sum(1 for v in cached if v <= float(th))) for th in thresholds}
-
-
 def _build_runtime_context(
     args: argparse.Namespace,
 ) -> tuple[mr.SubjectDatabase, List[int], AuditArtifacts, Dict[int, str], Dict[TokenCategory, Any], WindowSegmentationConfig]:
@@ -345,7 +292,6 @@ def _audit_window_contract(
     artifacts: AuditArtifacts,
     struct_id2code: Mapping[int, str],
     segmentation_cfg: WindowSegmentationConfig,
-    gap_thresholds: Sequence[float],
     micro_window_max_tokens: int,
     micro_window_max_duration_hours: float,
     max_examples: int,
@@ -374,21 +320,18 @@ def _audit_window_contract(
         "leading_candidate_backfill_type_counts": Counter(),
         "micro_windows": 0,
         "micro_windows_by_type": Counter(),
-        "inter_admission_candidates": 0,
-        "inter_admission_opening_type_counts": Counter(),
-        "inter_admission_gap_hours": [],
-        "inter_admission_windows": 0,
-        "inter_admission_realized_gap_hours": [],
-        "inter_admission_prev_type_counts": Counter(),
-        "inter_admission_next_type_counts": Counter(),
+        "subjects_with_post_discharge_window": 0,
+        "post_discharge_windows": 0,
+        "post_discharge_windows_with_clinical_tokens": 0,
+        "post_discharge_prev_closer_prefix_counts": Counter(),
+        "post_discharge_next_type_counts": Counter(),
     }
     examples: Dict[str, List[Dict[str, Any]]] = {
         "missing_transfer_bundles": [],
         "cooccurring_transfer_bundles": [],
         "leading_pretransition_subjects": [],
         "micro_windows": [],
-        "inter_admission_candidates": [],
-        "inter_admission_windows": [],
+        "post_discharge_windows": [],
     }
 
     for idx, sid in enumerate(subject_ids, start=1):
@@ -432,13 +375,8 @@ def _audit_window_contract(
             else:
                 duration = 0.0
             clinical_count = sum(1 for tok in window.tokens if int(tok.category_id) in PRIMARY_CLINICAL_CATEGORIES)
-            is_inter_window = (
-                segmentation_cfg.inter_admission_window_type_id is not None
-                and int(w_type_id) == int(segmentation_cfg.inter_admission_window_type_id)
-            )
             if (
-                not is_inter_window
-                and len(window.tokens) <= int(micro_window_max_tokens)
+                len(window.tokens) <= int(micro_window_max_tokens)
                 and duration <= float(micro_window_max_duration_hours)
                 and clinical_count == 0
             ):
@@ -459,50 +397,45 @@ def _audit_window_contract(
                     limit=max_examples,
                 )
 
-        inter_type_id = segmentation_cfg.inter_admission_window_type_id
-        if inter_type_id is not None:
+        post_discharge_type_id = segmentation_cfg.post_discharge_window_type_id
+        saw_post_discharge = False
+        if post_discharge_type_id is not None:
             for w_idx, window in enumerate(windows):
-                if int(window.window_type_id) != int(inter_type_id):
+                if int(window.window_type_id) != int(post_discharge_type_id):
                     continue
-                summary["inter_admission_windows"] += 1
-                prev_type_name = None
+                saw_post_discharge = True
+                summary["post_discharge_windows"] += 1
+                clinical_count = sum(
+                    1 for tok in window.tokens if int(tok.category_id) in PRIMARY_CLINICAL_CATEGORIES
+                )
+                if clinical_count > 0:
+                    summary["post_discharge_windows_with_clinical_tokens"] += 1
+
+                prev_closer_prefix = None
                 next_type_name = None
-                if w_idx > 0:
-                    prev_type_name = type_id2name.get(
-                        int(windows[w_idx - 1].window_type_id),
-                        str(int(windows[w_idx - 1].window_type_id)),
+                if w_idx > 0 and windows[w_idx - 1].tokens:
+                    prev_last = windows[w_idx - 1].tokens[-1]
+                    prev_closer_prefix = _label_prefix(
+                        _token_label(
+                            prev_last,
+                            artifacts=artifacts,
+                            struct_id2label=struct_id2label,
+                            struct_id2code=struct_id2code,
+                        )
                     )
-                    summary["inter_admission_prev_type_counts"][str(prev_type_name)] += 1
+                    summary["post_discharge_prev_closer_prefix_counts"][str(prev_closer_prefix)] += 1
                 if w_idx + 1 < len(windows):
                     next_type_name = type_id2name.get(
                         int(windows[w_idx + 1].window_type_id),
                         str(int(windows[w_idx + 1].window_type_id)),
                     )
-                    summary["inter_admission_next_type_counts"][str(next_type_name)] += 1
-
-                gap_hours_realized = None
-                if window.tokens:
-                    raw_gap = window.tokens[0].num_attrs.get("numeric_value") if window.tokens[0].num_attrs else None
-                    try:
-                        if raw_gap is not None:
-                            gap_hours_realized = float(raw_gap)
-                    except (TypeError, ValueError):
-                        gap_hours_realized = None
-                if gap_hours_realized is None and w_idx > 0 and w_idx + 1 < len(windows):
-                    gap_hours_realized = max(
-                        0.0,
-                        float(windows[w_idx + 1].start_time_hours)
-                        - float(windows[w_idx - 1].tokens[-1].t_from_start_hours),
-                    )
-                if gap_hours_realized is not None:
-                    summary["inter_admission_realized_gap_hours"].append(float(gap_hours_realized))
+                    summary["post_discharge_next_type_counts"][str(next_type_name)] += 1
 
                 _maybe_add_example(
-                    examples["inter_admission_windows"],
+                    examples["post_discharge_windows"],
                     {
                         "subject_id": int(sid),
-                        "gap_hours": _round_hours(float(gap_hours_realized or 0.0)),
-                        "prev_window_type": prev_type_name,
+                        "prev_closer_prefix": prev_closer_prefix,
                         "next_window_type": next_type_name,
                         "window": _window_preview(
                             window,
@@ -514,6 +447,8 @@ def _audit_window_contract(
                     },
                     limit=max_examples,
                 )
+        if saw_post_discharge:
+            summary["subjects_with_post_discharge_window"] += 1
 
         for bundle in bundles:
             start_idx = int(bundle["start_idx"])
@@ -604,7 +539,6 @@ def _audit_window_contract(
             candidate_opening = list(opening_items) if opening_items else list(first_bundle_tokens)
             candidate_type_id = _resolve_opening_window_type(
                 candidate_opening,
-                previous_type_id=int(segmentation_cfg.unk_window_type_id),
                 config=segmentation_cfg,
             )
             candidate_type_name = type_id2name.get(int(candidate_type_id), str(int(candidate_type_id)))
@@ -660,62 +594,6 @@ def _audit_window_contract(
                 limit=max_examples,
             )
 
-        for left, right in zip(windows, windows[1:]):
-            if not left.tokens or not right.tokens:
-                continue
-            left_last = left.tokens[-1]
-            right_first = right.tokens[0]
-            gap_hours = max(0.0, float(right.start_time_hours) - float(left_last.t_from_start_hours))
-            if gap_hours <= 0.0:
-                continue
-
-            left_label = _token_label(
-                left_last,
-                artifacts=artifacts,
-                struct_id2label=struct_id2label,
-                struct_id2code=struct_id2code,
-            )
-            right_label = _token_label(
-                right_first,
-                artifacts=artifacts,
-                struct_id2label=struct_id2label,
-                struct_id2code=struct_id2code,
-            )
-            left_prefix = _label_prefix(left_label)
-            right_prefix = _label_prefix(right_label)
-            if left_prefix not in DISCHARGE_LIKE_PREFIXES:
-                continue
-            if right_prefix not in ADMISSION_LIKE_PREFIXES:
-                continue
-
-            summary["inter_admission_candidates"] += 1
-            summary["inter_admission_opening_type_counts"][
-                type_id2name.get(int(right.window_type_id), str(int(right.window_type_id)))
-            ] += 1
-            summary["inter_admission_gap_hours"].append(float(gap_hours))
-            _maybe_add_example(
-                examples["inter_admission_candidates"],
-                {
-                    "subject_id": int(sid),
-                    "gap_hours": _round_hours(gap_hours),
-                    "left_window": _window_preview(
-                        left,
-                        artifacts=artifacts,
-                        struct_id2label=struct_id2label,
-                        struct_id2code=struct_id2code,
-                        type_id2name=type_id2name,
-                    ),
-                    "right_window": _window_preview(
-                        right,
-                        artifacts=artifacts,
-                        struct_id2label=struct_id2label,
-                        struct_id2code=struct_id2code,
-                        type_id2name=type_id2name,
-                    ),
-                },
-                limit=max_examples,
-            )
-
         _maybe_print_progress(
             "window_contract",
             idx=idx,
@@ -726,8 +604,6 @@ def _audit_window_contract(
 
     total_windows = int(summary["total_windows"])
     transition_total = int(summary["transition_bundle_counts"].get("total", 0))
-    gap_values = list(summary["inter_admission_gap_hours"])
-    realized_gap_values = list(summary["inter_admission_realized_gap_hours"])
     return {
         "summary": {
             "subjects_scanned": int(summary["subjects_scanned"]),
@@ -781,21 +657,23 @@ def _audit_window_contract(
                 "frac": float(summary["micro_windows"]) / float(total_windows) if total_windows > 0 else 0.0,
                 "by_type": {str(k): int(v) for k, v in summary["micro_windows_by_type"].most_common()},
             },
-            "inter_admission": {
-                "candidate_pairs": int(summary["inter_admission_candidates"]),
-                "realized_windows": int(summary["inter_admission_windows"]),
-                "opening_type_counts": {
-                    str(k): int(v) for k, v in summary["inter_admission_opening_type_counts"].most_common()
+            "post_discharge": {
+                "subject_count": int(summary["subjects_with_post_discharge_window"]),
+                "window_count": int(summary["post_discharge_windows"]),
+                "with_clinical_tokens": int(summary["post_discharge_windows_with_clinical_tokens"]),
+                "with_clinical_tokens_frac": (
+                    float(summary["post_discharge_windows_with_clinical_tokens"])
+                    / float(summary["post_discharge_windows"])
+                    if int(summary["post_discharge_windows"]) > 0
+                    else 0.0
+                ),
+                "prev_closer_prefix_counts": {
+                    str(k): int(v)
+                    for k, v in summary["post_discharge_prev_closer_prefix_counts"].most_common()
                 },
-                "prev_type_counts": {
-                    str(k): int(v) for k, v in summary["inter_admission_prev_type_counts"].most_common()
+                "next_window_type_counts": {
+                    str(k): int(v) for k, v in summary["post_discharge_next_type_counts"].most_common()
                 },
-                "next_type_counts": {
-                    str(k): int(v) for k, v in summary["inter_admission_next_type_counts"].most_common()
-                },
-                "candidate_gap_hours": _summarize_numeric(gap_values),
-                "realized_gap_hours": _summarize_numeric(realized_gap_values),
-                "count_at_or_below_hours": _count_thresholds(realized_gap_values or gap_values, gap_thresholds),
             },
         },
         "examples": examples,
@@ -811,12 +689,12 @@ def _print_summary(payload: Mapping[str, Any]) -> None:
     print("Transition bundles:", summary["transition_bundles"])
     print("Leading pretransition:", summary["leading_pretransition"])
     print("Micro windows:", summary["micro_windows"])
-    print("Inter-admission:", summary["inter_admission"])
+    print("Post-discharge:", summary["post_discharge"])
 
 
 def main() -> None:
     ap = argparse.ArgumentParser(
-        description="Audit a window v1 contract on real EventToken segmentation, focusing on TRANSFER_TO bundles, leading pre-transition events, and discharge/readmission gaps."
+        description="Audit a causal window v1 contract on real EventToken segmentation, focusing on TRANSFER_TO bundles, leading pre-transition events, and post-discharge follow-up windows."
     )
     ap.add_argument("--meds_reader_db", required=True)
     ap.add_argument("--splits_parquet", required=True)
@@ -843,7 +721,6 @@ def main() -> None:
     ap.add_argument("--diag_residual_offset", type=int, default=None)
     ap.add_argument("--proc_residual_offset", type=int, default=None)
     ap.add_argument("--med_residual_offset", type=int, default=None)
-    ap.add_argument("--inter_admission_thresholds", default="4,12,24,48")
     ap.add_argument("--micro_window_max_tokens", type=int, default=4)
     ap.add_argument("--micro_window_max_duration_hours", type=float, default=1.0)
     ap.add_argument("--max_examples", type=int, default=20)
@@ -852,7 +729,6 @@ def main() -> None:
     args = ap.parse_args()
 
     db, subject_ids, artifacts, struct_id2code, encoders, segmentation_cfg = _build_runtime_context(args)
-    gap_thresholds = _parse_thresholds(args.inter_admission_thresholds)
     results = _audit_window_contract(
         db,
         subject_ids,
@@ -860,7 +736,6 @@ def main() -> None:
         artifacts=artifacts,
         struct_id2code=struct_id2code,
         segmentation_cfg=segmentation_cfg,
-        gap_thresholds=gap_thresholds,
         micro_window_max_tokens=int(args.micro_window_max_tokens),
         micro_window_max_duration_hours=float(args.micro_window_max_duration_hours),
         max_examples=int(args.max_examples),
@@ -874,7 +749,6 @@ def main() -> None:
             "sample_seed": args.sample_seed,
             "tokenization_yaml": str(args.tokenization_yaml),
             "structural_yaml": str(args.structural_yaml),
-            "inter_admission_thresholds": list(gap_thresholds),
             "micro_window_max_tokens": int(args.micro_window_max_tokens),
             "micro_window_max_duration_hours": float(args.micro_window_max_duration_hours),
             "bundle_gap_hours": float(segmentation_cfg.bundle_gap_hours),
@@ -882,10 +756,8 @@ def main() -> None:
             "chain_gap_hours": float(segmentation_cfg.chain_gap_hours),
             "chain_max_intervening_tokens": int(segmentation_cfg.chain_max_intervening_tokens),
             "default_first_window_type_id": segmentation_cfg.default_first_window_type_id,
+            "post_discharge_window_type_id": segmentation_cfg.post_discharge_window_type_id,
             "propagate_prev_type_for_unknown_windows": bool(segmentation_cfg.propagate_prev_type_for_unknown_windows),
-            "enable_inter_admission_windows": bool(segmentation_cfg.enable_inter_admission_windows),
-            "inter_admission_window_type_id": segmentation_cfg.inter_admission_window_type_id,
-            "inter_admission_max_gap_hours": float(segmentation_cfg.inter_admission_max_gap_hours),
         },
         "results": results,
     }

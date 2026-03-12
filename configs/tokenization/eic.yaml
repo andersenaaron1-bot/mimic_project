@@ -1,5 +1,0 @@
-tokenizer:
-  family: eic
-  d_code: 256
-  use_time_tokens: true        # expects Δt binned into tokens via MEDS-Transforms
-  use_value_bins: true         # expects numeric values binned via MEDS-Transforms

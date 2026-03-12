@@ -32,14 +32,14 @@ class WindowSegmentationConfig:
     rebalance_min_tokens: int = 32
     rebalance_tail_tokens: int = 16
     unk_window_type_id: int = 0
-    # Optional fallback type for leading windows before the first typed transition.
+    # Optional fallback type for the leading window before the first causal opener.
     default_first_window_type_id: int | None = None
-    # Carry forward the most recent known type for untyped windows.
-    propagate_prev_type_for_unknown_windows: bool = True
-    # Optionally synthesize a short discharge-to-readmission gap window.
-    enable_inter_admission_windows: bool = False
-    inter_admission_window_type_id: int | None = None
-    inter_admission_max_gap_hours: float = 24.0
+    # Optional causal type for tokens observed after a discharge-like closer and
+    # before the next care-setting opener.
+    post_discharge_window_type_id: int | None = None
+    # Legacy compatibility knob; the v1 causal windowing path does not propagate
+    # previous types into later untyped windows.
+    propagate_prev_type_for_unknown_windows: bool = False
 
 
 @dataclass
@@ -132,24 +132,32 @@ def _infer_window_type_from_tokens(window_tokens: List[EventToken], *, unk_type_
 def _resolve_opening_window_type(
     opening_tokens: List[EventToken],
     *,
-    previous_type_id: int,
     config: WindowSegmentationConfig,
 ) -> int:
+    if not opening_tokens:
+        return int(config.unk_window_type_id)
+
+    preferred_tokens = [
+        tok for tok in opening_tokens
+        if _token_has_flag(tok, "transition_transfer_like")
+    ]
+    if preferred_tokens:
+        source_tokens = [preferred_tokens[0]]
+    else:
+        source_tokens = [opening_tokens[0]]
+
     explicit_ids = [
         int(type_id)
-        for tok in opening_tokens
+        for tok in source_tokens
         for type_id in [_token_transition_type_id(tok)]
         if type_id is not None
     ]
     if explicit_ids:
-        # Later items in a transition chain tend to be more specific than the opener.
-        return int(explicit_ids[-1])
+        return int(explicit_ids[0])
 
-    inferred = _infer_window_type_from_tokens(opening_tokens, unk_type_id=config.unk_window_type_id)
+    inferred = _infer_window_type_from_tokens(source_tokens, unk_type_id=config.unk_window_type_id)
     if inferred != int(config.unk_window_type_id):
         return int(inferred)
-    if previous_type_id != int(config.unk_window_type_id):
-        return int(previous_type_id)
     return int(config.unk_window_type_id)
 
 
@@ -167,19 +175,12 @@ def _apply_window_type_fallbacks(
         if config.default_first_window_type_id is not None
         else None
     )
-    carry_prev = bool(config.propagate_prev_type_for_unknown_windows)
 
     out: List[SegmentedWindow] = []
-    prev_known: int | None = None
     for idx, window in enumerate(windows):
         w_type = int(window.window_type_id)
-        if w_type == unk:
-            if idx == 0 and first_default is not None:
-                w_type = int(first_default)
-            elif carry_prev and prev_known is not None:
-                w_type = int(prev_known)
-        if w_type != unk:
-            prev_known = int(w_type)
+        if w_type == unk and idx == 0 and first_default is not None:
+            w_type = int(first_default)
 
         out.append(
             SegmentedWindow(
@@ -203,80 +204,6 @@ def _token_has_flag(tok: EventToken, key: str) -> bool:
     return val is not None and int(val) != 0
 
 
-def _window_has_flag(window: SegmentedWindow, key: str) -> bool:
-    return any(_token_has_flag(tok, key) for tok in window.tokens)
-
-
-def _window_end_time_hours(window: SegmentedWindow) -> float:
-    if window.tokens:
-        return float(window.tokens[-1].t_from_start_hours)
-    return float(window.start_time_hours)
-
-
-def _build_inter_admission_window(
-    *,
-    left_window: SegmentedWindow,
-    gap_hours: float,
-    config: WindowSegmentationConfig,
-) -> SegmentedWindow | None:
-    inter_type_id = config.inter_admission_window_type_id
-    if inter_type_id is None:
-        return None
-
-    left_end = _window_end_time_hours(left_window)
-    return SegmentedWindow(
-        tokens=[],
-        window_type_id=int(inter_type_id),
-        start_time_hours=float(left_end),
-        opening_action=None,
-        closing_action=None,
-    )
-
-
-def _inject_inter_admission_windows(
-    windows: List[SegmentedWindow],
-    *,
-    config: WindowSegmentationConfig,
-) -> List[SegmentedWindow]:
-    if (
-        not config.enable_inter_admission_windows
-        or config.inter_admission_window_type_id is None
-        or config.inter_admission_max_gap_hours <= 0.0
-        or len(windows) < 2
-    ):
-        return list(windows)
-
-    inter_type_id = int(config.inter_admission_window_type_id)
-    out: List[SegmentedWindow] = []
-    for idx, window in enumerate(windows[:-1]):
-        out.append(window)
-        next_window = windows[idx + 1]
-
-        if int(window.window_type_id) == inter_type_id or int(next_window.window_type_id) == inter_type_id:
-            continue
-        if not _window_has_flag(window, "transition_discharge_like"):
-            continue
-        if _window_has_flag(window, "transition_death_like"):
-            continue
-        if not _window_has_flag(next_window, "transition_admission_like"):
-            continue
-
-        gap_hours = max(0.0, float(next_window.start_time_hours) - _window_end_time_hours(window))
-        if gap_hours <= 0.0 or gap_hours > float(config.inter_admission_max_gap_hours):
-            continue
-
-        inter_window = _build_inter_admission_window(
-            left_window=window,
-            gap_hours=float(gap_hours),
-            config=config,
-        )
-        if inter_window is not None:
-            out.append(inter_window)
-
-    out.append(windows[-1])
-    return out
-
-
 def _should_merge_transition_chain(
     left_bundle: Dict[str, object],
     right_bundle: Dict[str, object],
@@ -290,6 +217,11 @@ def _should_merge_transition_chain(
     left_tokens = events[int(left_bundle["start_idx"]) : int(left_bundle["end_idx"]) + 1]
     right_tokens = events[int(right_bundle["start_idx"]) : int(right_bundle["end_idx"]) + 1]
     if not (_has_explicit_transition(left_tokens) and _has_explicit_transition(right_tokens)):
+        return False
+    if any(
+        _token_has_flag(tok, "transition_discharge_like") or _token_has_flag(tok, "transition_death_like")
+        for tok in right_tokens
+    ):
         return False
     if (
         any(_token_has_flag(tok, "transition_discharge_like") for tok in left_tokens)
@@ -381,6 +313,11 @@ def _resolve_bundle_action(
     bundle_start_idx: int,
 ) -> tuple[str, List[EventToken], List[EventToken]]:
     candidate_positions = [int(idx) - int(bundle_start_idx) for idx in bundle_candidate_indices]
+    transfer_like_positions = [
+        pos
+        for pos in candidate_positions
+        if 0 <= pos < len(bundle_tokens) and _token_has_flag(bundle_tokens[pos], "transition_transfer_like")
+    ]
     candidate_actions = [
         _token_transition_action(bundle_tokens[pos])
         for pos in candidate_positions
@@ -397,7 +334,9 @@ def _resolve_bundle_action(
         if action in {"close_current", "close_open"}
     ]
 
-    if "close_open" in candidate_actions or (open_like_positions and close_like_positions):
+    if transfer_like_positions:
+        bundle_action = "close_open"
+    elif "close_open" in candidate_actions or (open_like_positions and close_like_positions):
         bundle_action = "close_open"
     elif open_like_positions:
         bundle_action = "open_next"
@@ -411,12 +350,32 @@ def _resolve_bundle_action(
     if bundle_action == "close_current":
         return bundle_action, list(bundle_tokens), []
 
-    pivot = min(open_like_positions) if open_like_positions else max(0, len(bundle_tokens) - 1)
+    if transfer_like_positions:
+        pivot = min(transfer_like_positions)
+    else:
+        pivot = min(open_like_positions) if open_like_positions else max(0, len(bundle_tokens) - 1)
     closing = list(bundle_tokens[:pivot])
     opening = list(bundle_tokens[pivot:])
     if not opening and closing:
         opening.append(closing.pop())
     return bundle_action, closing, opening
+
+
+def _next_window_type_after_close(
+    closing_items: List[EventToken],
+    *,
+    config: WindowSegmentationConfig,
+) -> int:
+    if not closing_items:
+        return int(config.unk_window_type_id)
+    if any(_token_has_flag(tok, "transition_death_like") for tok in closing_items):
+        return int(config.unk_window_type_id)
+    if (
+        config.post_discharge_window_type_id is not None
+        and any(_token_has_flag(tok, "transition_discharge_like") for tok in closing_items)
+    ):
+        return int(config.post_discharge_window_type_id)
+    return int(config.unk_window_type_id)
 
 
 def segment_event_tokens(
@@ -479,7 +438,10 @@ def segment_event_tokens(
                     )
                 )
             current_tokens = []
-            current_type_id = int(config.unk_window_type_id)
+            current_type_id = _next_window_type_after_close(
+                closing_items,
+                config=config,
+            )
             current_opening_action = None
         elif bundle_action == "open_next":
             if current_tokens:
@@ -499,7 +461,6 @@ def segment_event_tokens(
             current_tokens = list(opening_items)
             current_type_id = _resolve_opening_window_type(
                 opening_items,
-                previous_type_id=current_type_id,
                 config=config,
             )
             current_opening_action = bundle_action
@@ -522,7 +483,6 @@ def segment_event_tokens(
             current_tokens = list(opening_items)
             current_type_id = _resolve_opening_window_type(
                 opening_items,
-                previous_type_id=current_type_id,
                 config=config,
             )
             current_opening_action = bundle_action
@@ -549,8 +509,7 @@ def segment_event_tokens(
             )
         )
 
-    windows = _apply_window_type_fallbacks(windows, config=config)
-    return _inject_inter_admission_windows(windows, config=config)
+    return _apply_window_type_fallbacks(windows, config=config)
 
 
 def rebalance_segmented_windows(

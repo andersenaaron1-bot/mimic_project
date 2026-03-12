@@ -1,7 +1,0 @@
-name: meds_mimic_iv
-reader_backend: reader          # reader -> streaming, non-optimized, pyd -> pre-tensorized for performance
-meds_root: ${oc.env:MEDS_ROOT, /workspace/data/meds_mimiciv_prepped}
-pyd_root:  ${oc.env:PYD_ROOT,  /workspace/data/pyd_mimiciv}
-split: train
-batch_size: 8
-num_workers: 4

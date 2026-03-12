@@ -21,7 +21,11 @@ def main() -> None:
         )
     )
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
-    ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
+    ap.add_argument(
+        "--vocab_manifest",
+        default="artifacts/vocab_manifest.json",
+        help="Deprecated compatibility input; ignored by the live tokenization-v1 sparse contract builder.",
+    )
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
     ap.add_argument("--medtok_code2embeds", default=None)
     ap.add_argument("--medtok_vocab_dir", default=None)

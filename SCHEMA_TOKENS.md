@@ -34,6 +34,7 @@ Notes:
 ### 2.1 Data-driven boundary seeds (structural codebook)
 Boundary seeds and overlay signifiers are defined in `configs/data/structural_codes.yaml`
 and loaded via `src/ehr_hier/data/structural_codes.py`.
+The cleanup rationale and source comparison live in `STRUCTURAL_CONTRACT_V1.md`.
 
 Concepts:
 - **Structural tokens**: tokens that represent care setting changes (admission, ICU transfer,
@@ -98,9 +99,16 @@ Configuration: `WindowMarkerConfig` (and `vocab_config["window_markers"]` for th
 
 Window type id inference:
 - If segmentation already assigned a typed regime window, use that type id.
-- Else if the first token in a window carries `cat_attrs["window_type_id"]`, use it.
-- Else if an early token in the window carries `cat_attrs["transition_window_type_id"]`, use it.
+- Else if the first causal opener in the window carries `cat_attrs["window_type_id"]`, use it.
+- Else if that opener carries `cat_attrs["transition_window_type_id"]`, use it.
 - Else fall back to `unk_type_id`.
+
+Current v1 policy:
+- `TRANSFER_TO` is authoritative when present in an opening bundle.
+- Only the leading pre-transition segment may default to `PROLOGUE`.
+- If tokens appear after a discharge-like closer and before the next causal opener,
+  they belong to a causal `POST_DISCHARGE` window.
+- No synthetic `INTER_ADMISSION` or terminal window type is used in the live v1 path.
 
 ## 3) Token families (what we model)
 
@@ -196,6 +204,8 @@ The sparse contract contains:
 
 Legacy note:
 - `artifacts/vocab_manifest.json` remains only as a compatibility fallback for older scripts.
+- The generated sparse contract now embeds `structural_contract`, a serialized summary of
+  the live structural codebook and builder policy.
 - New runtime vocab generation should derive from the sparse contract, not from the legacy manifest.
 
 For v1 experiments:

@@ -198,11 +198,11 @@ def _build_segmentation_config(
         if first_type_name is not None and structural_codebook is not None:
             first_type_id = structural_codebook.window_type2id().get(str(first_type_name))
 
-    inter_type_id = cfg.get("inter_admission_window_type_id", None)
-    if inter_type_id is None:
-        inter_type_name = cfg.get("inter_admission_window_type", None)
-        if inter_type_name is not None and structural_codebook is not None:
-            inter_type_id = structural_codebook.window_type2id().get(str(inter_type_name))
+    post_discharge_type_id = cfg.get("post_discharge_window_type_id", None)
+    if post_discharge_type_id is None:
+        post_discharge_type_name = cfg.get("post_discharge_window_type", None)
+        if post_discharge_type_name is not None and structural_codebook is not None:
+            post_discharge_type_id = structural_codebook.window_type2id().get(str(post_discharge_type_name))
 
     return WindowSegmentationConfig(
         bundle_gap_hours=float(cfg.get("bundle_gap_hours", 0.5)),
@@ -218,14 +218,12 @@ def _build_segmentation_config(
         default_first_window_type_id=(
             int(first_type_id) if first_type_id is not None else None
         ),
+        post_discharge_window_type_id=(
+            int(post_discharge_type_id) if post_discharge_type_id is not None else None
+        ),
         propagate_prev_type_for_unknown_windows=bool(
-            cfg.get("propagate_prev_type_for_unknown_windows", True)
+            cfg.get("propagate_prev_type_for_unknown_windows", False)
         ),
-        enable_inter_admission_windows=bool(cfg.get("enable_inter_admission_windows", False)),
-        inter_admission_window_type_id=(
-            int(inter_type_id) if inter_type_id is not None else None
-        ),
-        inter_admission_max_gap_hours=float(cfg.get("inter_admission_max_gap_hours", 24.0)),
     )
 
 
@@ -1769,16 +1767,14 @@ def main() -> None:
                     if segmentation_cfg.default_first_window_type_id is not None
                     else None
                 ),
+                "post_discharge_window_type_id": (
+                    int(segmentation_cfg.post_discharge_window_type_id)
+                    if segmentation_cfg.post_discharge_window_type_id is not None
+                    else None
+                ),
                 "propagate_prev_type_for_unknown_windows": bool(
                     segmentation_cfg.propagate_prev_type_for_unknown_windows
                 ),
-                "enable_inter_admission_windows": bool(segmentation_cfg.enable_inter_admission_windows),
-                "inter_admission_window_type_id": (
-                    int(segmentation_cfg.inter_admission_window_type_id)
-                    if segmentation_cfg.inter_admission_window_type_id is not None
-                    else None
-                ),
-                "inter_admission_max_gap_hours": float(segmentation_cfg.inter_admission_max_gap_hours),
             },
         },
         "raw": raw_summary,
