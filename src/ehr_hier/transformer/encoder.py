@@ -469,10 +469,11 @@ class AETLocalEncoder(nn.Module):
                 pool_mask[~has_any] = mask_bool[~has_any]
 
             if self.summary_num_queries <= 1:
-                window_summaries_flat[is_real_window] = self.summary_pooler(
+                pooled = self.summary_pooler(
                     x_flat[is_real_window],
                     pool_mask[is_real_window],
                 )
+                window_summaries_flat[is_real_window] = pooled.to(dtype=window_summaries_flat.dtype)
             else:
                 query_mask = None
                 if types_flat is not None and self.summary_query_use_category_masks:
@@ -500,9 +501,10 @@ class AETLocalEncoder(nn.Module):
                     pool_mask[is_real_window],
                     query_mask=query_mask,
                 )  # (n_real, Q, D)
-                window_summaries_flat[is_real_window] = self.summary_combine(
+                combined = self.summary_combine(
                     summaries_multi.reshape(summaries_multi.shape[0], self.summary_num_queries * D)
                 )
+                window_summaries_flat[is_real_window] = combined.to(dtype=window_summaries_flat.dtype)
 
         if self.summary_fuse_terminal and self.summary_terminal_fuser is not None and is_real_window.any():
             lengths = mask_bool.to(dtype=torch.long).sum(dim=-1).clamp(min=1)
