@@ -129,6 +129,9 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         "attach_med_numeric": True,
         "emit_global_demographic_tokens": True,
         "special_token_offset": 0,
+        "qual_obs_code_vocab": artifacts.obs_code_vocab,
+        "qual_obs_value_vocab": artifacts.obs_value_vocab,
+        "qual_obs_tail_policy": artifacts.obs_tail_policy,
     }
     timeline_kwargs = {k: v for k, v in timeline_kwargs.items() if k in sig.parameters}
     db = mr.SubjectDatabase(str(worker_args.meds_reader_db))

@@ -19,6 +19,7 @@ from tqdm import tqdm
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
+from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.data.structural_codes import StructuralCodebook
 
 
@@ -32,6 +33,9 @@ def _process_subject(
     num_output_shards: int = 100,
     window_hook_label: str = "window_boundary",
     attach_med_numeric: bool = True,
+    qual_obs_code_vocab: Optional[CategoryVocab] = None,
+    qual_obs_value_vocab: Optional[CategoryVocab] = None,
+    qual_obs_tail_policy: str = "drop",
 ) -> bool:
     """
     Worker-safe timeline build + save for a single subject.
@@ -44,6 +48,9 @@ def _process_subject(
         structural_codebook=codebook,
         window_hook_label=window_hook_label,
         attach_med_numeric=attach_med_numeric,
+        qual_obs_code_vocab=qual_obs_code_vocab,
+        qual_obs_value_vocab=qual_obs_value_vocab,
+        qual_obs_tail_policy=qual_obs_tail_policy,
     )
 
     shard_idx = int(subject_id) % int(num_output_shards)
@@ -60,6 +67,9 @@ def compile_dataset(
     encoders: Dict[TokenCategory, EventTokenEncoder],
     output_dir: str,
     structural_codebook: Optional[StructuralCodebook] = None,
+    qual_obs_code_vocab: Optional[CategoryVocab] = None,
+    qual_obs_value_vocab: Optional[CategoryVocab] = None,
+    qual_obs_tail_policy: str = "drop",
     num_workers: Optional[int] = None,
     subject_ids: Optional[Iterable[int]] = None,
     num_output_shards: int = 100,
@@ -86,6 +96,9 @@ def compile_dataset(
         codebook=structural_codebook,
         output_dir=output_dir,
         num_output_shards=num_output_shards,
+        qual_obs_code_vocab=qual_obs_code_vocab,
+        qual_obs_value_vocab=qual_obs_value_vocab,
+        qual_obs_tail_policy=qual_obs_tail_policy,
     )
 
     os.makedirs(output_dir, exist_ok=True)

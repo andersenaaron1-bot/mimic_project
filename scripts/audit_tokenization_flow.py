@@ -34,7 +34,10 @@ from src.ehr_hier.data.structural_codes import (
     structural_surface_code,
     structural_surface_vocab_codes,
 )
-from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
+from src.ehr_hier.data.subject_timeline_builder import (
+    GLOBAL_DEMOGRAPHIC_TOKEN_IDS,
+    build_subject_timeline,
+)
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
@@ -53,8 +56,10 @@ from src.ehr_hier.tokenizers.medtok_loader import (
     CategoryVocab,
     load_attr_vocab,
     load_medtok_vocab,
+    load_observation_vocab,
     load_residual_fallback_vocab,
 )
+from src.ehr_hier.data.observation_vocab import observation_surfaces
 from src.ehr_hier.tokenizers.medtok_attr_encoder import (
     EXPLICIT_MEDTOK_RESOLUTION_STAGES,
     MedTokenWithAttrsEncoder,
@@ -79,6 +84,7 @@ SPECIAL_ID2NAME = {
     1: "PT_CLS",
     2: "SEP",
     3: "MASK",
+    **{int(v): str(k) for k, v in GLOBAL_DEMOGRAPHIC_TOKEN_IDS.items()},
 }
 
 
@@ -98,6 +104,9 @@ class AuditArtifacts:
     medtok_parent_lookup: Dict[str, List[str]]
     medtok_crosswalks: Dict[str, Dict[str, str]]
     residual_fallback_vocabs: Dict[str, CategoryVocab]
+    obs_code_vocab: Optional[CategoryVocab]
+    obs_value_vocab: Optional[CategoryVocab]
+    obs_tail_policy: str
 
 
 class _EventWithDemographics:
@@ -539,6 +548,16 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         ]
         if vocab is not None
     }
+    obs_code_vocab = load_observation_vocab(
+        medtok_vocab_dir,
+        kind="code",
+        offset=_offset(manifest, "observation_code", 2_300_000),
+    )
+    obs_value_vocab = load_observation_vocab(
+        medtok_vocab_dir,
+        kind="value",
+        offset=_offset(manifest, "observation_value", 2_320_000),
+    )
 
     med_attr_vocabs: Dict[str, CategoryVocab] = {}
     for name, filename, default_offset in (
@@ -587,6 +606,9 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         medtok_parent_lookup=medtok_parent_lookup,
         medtok_crosswalks=medtok_crosswalks,
         residual_fallback_vocabs=residual_fallback_vocabs,
+        obs_code_vocab=obs_code_vocab,
+        obs_value_vocab=obs_value_vocab,
+        obs_tail_policy="drop" if (obs_code_vocab is not None or obs_value_vocab is not None) else "hash",
     )
 
 
@@ -879,6 +901,7 @@ def _audit_subject_tokenization(
     process_reroute_events_by_category = Counter()
     bundle_sizes_by_category: Dict[str, Counter[int]] = defaultdict(Counter)
     semantic_base_outcomes_by_category: Dict[str, Counter[str]] = defaultdict(Counter)
+    observation_base_outcomes = Counter()
     family_counts = Counter()
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
     family_min_id: Dict[str, int] = {}
@@ -890,6 +913,9 @@ def _audit_subject_tokenization(
         subject_id=int(subject_id),
         encoders=encoders,
         structural_codebook=codebook,
+        qual_obs_code_vocab=artifacts.obs_code_vocab,
+        qual_obs_value_vocab=artifacts.obs_value_vocab,
+        qual_obs_tail_policy=artifacts.obs_tail_policy,
     )
 
     struct_only = codebook.structural_only if codebook is not None else set()
@@ -1000,6 +1026,43 @@ def _audit_subject_tokenization(
                     else:
                         semantic_base_outcomes_by_category[category.name]["structural_only"] += 1
             else:
+                if category == TokenCategory.MEASUREMENT:
+                    obs = observation_surfaces(ev_view, code_value=code_str)
+                    if obs is not None:
+                        code_exact = (
+                            artifacts.obs_code_vocab is not None
+                            and artifacts.obs_code_vocab.maybe_encode(obs.code_surface) is not None
+                        )
+                        value_exact = (
+                            artifacts.obs_value_vocab is not None
+                            and artifacts.obs_value_vocab.maybe_encode(obs.value_surface) is not None
+                        )
+                        if (
+                            artifacts.obs_code_vocab is not None
+                            and not code_exact
+                            and artifacts.obs_tail_policy == "drop"
+                        ) or (
+                            artifacts.obs_value_vocab is not None
+                            and not value_exact
+                            and artifacts.obs_tail_policy == "drop"
+                        ):
+                            dropped_events_by_category[category.name] += 1
+                            observation_base_outcomes["drop"] += 1
+                        else:
+                            emitted_for_event = 2
+                            emitted_events_by_category[category.name] += 1
+                            emitted_tokens_by_category[category.name] += emitted_for_event
+                            bundle_sizes_by_category[category.name][emitted_for_event] += 1
+                            if code_exact and value_exact:
+                                observation_base_outcomes["exact"] += 1
+                            elif code_exact or value_exact:
+                                observation_base_outcomes["mixed"] += 1
+                            else:
+                                observation_base_outcomes["hash"] += 1
+                            if t is not None:
+                                last_emitted_time = t
+                        continue
+
                 dropped_events_by_category[category.name] += 1
                 if category in {TokenCategory.DIAGNOSIS, TokenCategory.PROCEDURE, TokenCategory.MEDICATION}:
                     if is_process_reroute:
@@ -1025,6 +1088,7 @@ def _audit_subject_tokenization(
         "unknown_base_tokens_by_category": unknown_base_tokens_by_category,
         "process_reroute_events_by_category": process_reroute_events_by_category,
         "semantic_base_outcomes_by_category": semantic_base_outcomes_by_category,
+        "observation_base_outcomes": observation_base_outcomes,
         "bundle_sizes_by_category": bundle_sizes_by_category,
         "family_counts": family_counts,
         "family_unique_ids": family_unique_ids,
@@ -1068,6 +1132,7 @@ def _summarize_tokenization_and_collation(
     unknown_base_tokens_by_category = Counter()
     process_reroute_events_by_category = Counter()
     semantic_base_outcomes_by_category: Dict[str, Counter[str]] = defaultdict(Counter)
+    observation_base_outcomes = Counter()
     bundle_sizes_by_category: Dict[str, Counter[int]] = defaultdict(Counter)
     family_counts = Counter()
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
@@ -1126,6 +1191,7 @@ def _summarize_tokenization_and_collation(
         process_reroute_events_by_category.update(audited["process_reroute_events_by_category"])
         for cat_name, outcome_counter in audited["semantic_base_outcomes_by_category"].items():
             semantic_base_outcomes_by_category[cat_name].update(outcome_counter)
+        observation_base_outcomes.update(audited.get("observation_base_outcomes", {}))
         family_counts.update(audited["family_counts"])
         for family, ids in audited["family_unique_ids"].items():
             family_unique_ids[family].update(ids)
@@ -1366,6 +1432,7 @@ def _summarize_tokenization_and_collation(
         "semantic_base_outcomes_by_category": {
             k: _as_plain_counter(v) for k, v in semantic_base_outcomes_by_category.items()
         },
+        "observation_base_outcomes": _as_plain_counter(observation_base_outcomes),
         "semantic_effective_capture_by_category": {},
         "bundle_sizes_by_category": {
             k: _as_plain_counter(v) for k, v in bundle_sizes_by_category.items()
@@ -1398,6 +1465,10 @@ def _summarize_tokenization_and_collation(
         "raw_measurement_events": int(raw_meas_events),
         "cvae_events": int(cvae_meas_events),
         "obs_events": int(obs_meas_events),
+        "obs_exact_events": int(observation_base_outcomes.get("exact", 0)),
+        "obs_mixed_events": int(observation_base_outcomes.get("mixed", 0)),
+        "obs_hash_events": int(observation_base_outcomes.get("hash", 0)),
+        "obs_drop_events": int(observation_base_outcomes.get("drop", 0)),
         "kept_events": int(kept_meas_events),
         "dropped_events": int(max(0, raw_meas_events - kept_meas_events)),
         "kept_rate": (
@@ -1526,6 +1597,8 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Timeline emitted tokens by category:", timeline["emitted_tokens_by_category"])
     print("Timeline dropped events by category:", timeline["dropped_events_by_category"])
     print("Measurement effective capture:", timeline.get("measurement_effective_capture_by_path", {}))
+    if timeline.get("observation_base_outcomes"):
+        print("Observation base outcomes:", timeline.get("observation_base_outcomes", {}))
     print("Average tokens per emitted event:", timeline["avg_tokens_per_emitted_event_by_category"])
     print("Semantic effective capture by category:", timeline.get("semantic_effective_capture_by_category", {}))
     print("Collation windows:", coll["windows"])
@@ -1727,6 +1800,15 @@ def main() -> None:
                 k: int(max(0, len(v.code2id) - 1))
                 for k, v in artifacts.residual_fallback_vocabs.items()
             },
+            "observation_vocab_entries": {
+                "code": int(max(0, len(artifacts.obs_code_vocab.code2id) - 1))
+                if artifacts.obs_code_vocab is not None
+                else 0,
+                "value": int(max(0, len(artifacts.obs_value_vocab.code2id) - 1))
+                if artifacts.obs_value_vocab is not None
+                else 0,
+            },
+            "observation_tail_policy": str(artifacts.obs_tail_policy),
             "medtok_crosswalk_json": getattr(args, "medtok_crosswalk_json", None),
             "tokenization_yaml": args.tokenization_yaml,
             "residual_fallback_enabled": bool(residual_enabled),

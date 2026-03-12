@@ -131,8 +131,8 @@ This gives the model:
 ### 3.1b Qualitative Measurement Surface (`OBS_QUAL`)
 Non-numeric measurement/charted events (for example `LAB//<itemid>//UNK|N/A`) are not
 sent through cVAE/RVQ. They are emitted as a 2-token categorical bundle:
-- `OBS_CODE(itemid_or_code_hash)`
-- `OBS_VALUE(value_text_or_code_tail_hash)`
+- `OBS_CODE(itemid_or_code)`
+- `OBS_VALUE(value_text)`
 
 Ordering:
 - `OBS_CODE` carries `dt_from_prev_hours = dt_event`
@@ -144,8 +144,9 @@ The pragmatic v1 routing also sends high-volume chart aliases like `Blood Pressu
 through this OBS path when they do not map to the numeric cVAE variable map.
 For v1 this remains a two-token bundle rather than a fused event-value token:
 the split keeps event identity and value identity factorized while keeping the
-vocabulary modest. Exact OBS vocabularies can be added later without changing
-the bundle shape.
+vocabulary modest. When `obs_code_vocab.json` / `obs_value_vocab.json` are present,
+the builder uses exact observation vocab lookup for the critical mass and drops the
+far tail instead of hashing it. The bundle shape does not change.
 
 ### 3.2 Medications / Diagnoses / Procedures: MedTok-backed codes
 Medications, diagnoses, and procedures are mapped to MedTok vocab ids (from ontology-graph
@@ -182,7 +183,13 @@ Measurements typically do *not* rely on this side-channel (values are discretize
 ### 3.4 Global demographic specials + rare-critical OTHER
 To keep timeline length controlled while retaining static context:
 - repeated anthropometric admin events (BMI/weight/height aliases) are handled via
-  **global demographic SPECIAL tokens** (sex, age bucket, BMI bucket) emitted once per subject;
+  **global demographic SPECIAL tokens** emitted once per subject;
+- current v1 global demographics are:
+  `sex`, `age bucket`, `BMI bucket`, plus admission-anchored numeric `height` and `weight`
+  carried as `SPECIAL` tokens with `num_attrs["numeric_value"]`;
+- height is standardized to centimeters and weight to kilograms before emission;
+- race/ethnicity are intentionally not in v1 because the current MEDS/MIMIC path in this repo
+  does not expose a stable, source-agnostic extraction contract for them;
 - collator behavior prefixes SPECIAL tokens to each window/chunk, making them globally attendable;
 - a lightweight clinically informed rare-critical keyword list is routed from `OTHER`
   into `STRUCTURAL` to avoid dropping high-acuity events.

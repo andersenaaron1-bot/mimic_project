@@ -478,6 +478,31 @@ def test_subject_timeline_emits_global_demographic_special_tokens():
     assert 40 in ids
 
 
+def test_subject_timeline_emits_height_and_weight_numeric_specials():
+    t_birth = datetime(1980, 1, 1, 0, 0, 0)
+    t_adm = datetime(2020, 1, 1, 0, 0, 0)
+    events = [
+        SimpleNamespace(code="MEDS_BIRTH", time=t_birth),
+        SimpleNamespace(code="HOSPITAL_ADMISSION", time=t_adm),
+        SimpleNamespace(code="HEIGHT (INCHES)", time=t_adm, numeric_value=70.0),
+        SimpleNamespace(code="WEIGHT (LBS)", time=t_adm, numeric_value=154.0),
+    ]
+    db = DummyDB({12: DummySubject(events)})
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=12,
+        encoders={},
+    )
+    special_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.SPECIAL)]
+    by_id = {int(tok.value_id): tok for tok in special_tokens}
+
+    assert 43 in by_id
+    assert 44 in by_id
+    assert by_id[43].num_attrs["numeric_value"] == pytest.approx(177.8, rel=1e-6)
+    assert by_id[44].num_attrs["numeric_value"] == pytest.approx(69.85322498, rel=1e-6)
+
+
 def test_blood_pressure_routes_to_measurement_obs_fallback():
     t0 = datetime(2024, 1, 1, 8, 0, 0)
     events = [SimpleNamespace(code="Blood Pressure", time=t0, value="120/80")]
@@ -500,6 +525,82 @@ def test_blood_pressure_routes_to_measurement_obs_fallback():
     assert len(obs_tokens) == 2
     assert obs_tokens[0].cat_attrs.get("obs_bundle_pos") == 1
     assert obs_tokens[1].cat_attrs.get("obs_bundle_pos") == 2
+
+
+def test_blood_pressure_obs_uses_exact_vocabs_when_present():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="Blood Pressure", time=t0, value="120/80")]
+    db = DummyDB({91: DummySubject(events)})
+
+    class EmptyMeasEncoder(DummyEncoder):
+        def __init__(self):
+            super().__init__(TokenCategory.MEASUREMENT, 123)
+
+        def encode_event(self, ev, dt_hours: float):
+            return []
+
+    obs_code_vocab = CategoryVocab(
+        name="obs_code",
+        offset=2_300_000,
+        code2id={"<UNK>": 0, "BLOOD PRESSURE::Blood Pressure": 1},
+    )
+    obs_value_vocab = CategoryVocab(
+        name="obs_value",
+        offset=2_320_000,
+        code2id={"<UNK>": 0, "UNK": 1, "N/A": 2, "NONE": 3, "": 4, "120/80": 5},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=91,
+        encoders={TokenCategory.MEASUREMENT: EmptyMeasEncoder()},
+        qual_obs_code_vocab=obs_code_vocab,
+        qual_obs_value_vocab=obs_value_vocab,
+        qual_obs_tail_policy="drop",
+    )
+
+    obs_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.MEASUREMENT)]
+    assert [int(tok.value_id) for tok in obs_tokens] == [2_300_001, 2_320_005]
+    assert obs_tokens[0].cat_attrs.get("obs_code_exact") == 1
+    assert obs_tokens[1].cat_attrs.get("obs_value_exact") == 1
+    assert obs_tokens[0].cat_attrs.get("obs_stage_exact") == 1
+    assert obs_tokens[1].cat_attrs.get("obs_stage_exact") == 1
+
+
+def test_blood_pressure_obs_tail_drops_when_value_missing_from_exact_vocab():
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="Blood Pressure", time=t0, value="120/80")]
+    db = DummyDB({92: DummySubject(events)})
+
+    class EmptyMeasEncoder(DummyEncoder):
+        def __init__(self):
+            super().__init__(TokenCategory.MEASUREMENT, 123)
+
+        def encode_event(self, ev, dt_hours: float):
+            return []
+
+    obs_code_vocab = CategoryVocab(
+        name="obs_code",
+        offset=2_300_000,
+        code2id={"<UNK>": 0, "BLOOD PRESSURE::Blood Pressure": 1},
+    )
+    obs_value_vocab = CategoryVocab(
+        name="obs_value",
+        offset=2_320_000,
+        code2id={"<UNK>": 0, "UNK": 1, "N/A": 2, "NONE": 3, "": 4},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=92,
+        encoders={TokenCategory.MEASUREMENT: EmptyMeasEncoder()},
+        qual_obs_code_vocab=obs_code_vocab,
+        qual_obs_value_vocab=obs_value_vocab,
+        qual_obs_tail_policy="drop",
+    )
+
+    obs_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.MEASUREMENT)]
+    assert obs_tokens == []
 
 
 def test_rare_critical_structural_event_does_not_force_window_boundary():
@@ -547,3 +648,29 @@ def test_demographic_tokens_use_admission_anchor_only():
     # Age token can exist via MEDS_BIRTH, but BMI should not leak from post-admission measurement.
     assert 34 in special_ids  # AGE_40_64
     assert 40 not in special_ids  # BMI_OBESE_1
+
+
+def test_height_weight_specials_do_not_leak_from_post_admission_measurements():
+    t_birth = datetime(1980, 1, 1, 0, 0, 0)
+    t_adm = datetime(2020, 1, 10, 0, 0, 0)
+    t_late = datetime(2020, 1, 11, 0, 0, 0)
+    events = [
+        SimpleNamespace(code="MEDS_BIRTH", time=t_birth),
+        SimpleNamespace(code="HOSPITAL_ADMISSION", time=t_adm),
+        SimpleNamespace(code="HEIGHT (INCHES)", time=t_late, numeric_value=70.0),
+        SimpleNamespace(code="WEIGHT (LBS)", time=t_late, numeric_value=154.0),
+    ]
+    db = DummyDB({13: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(name="struct", offset=50, code2id={"<UNK>": 0, "HOSPITAL_ADMISSION": 1})
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=13,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+    )
+    special_ids = {int(tok.value_id) for tok in tokens if tok.category_id == int(TokenCategory.SPECIAL)}
+
+    assert 43 not in special_ids
+    assert 44 not in special_ids

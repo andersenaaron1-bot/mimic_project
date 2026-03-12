@@ -226,6 +226,14 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
         json.dumps({"<UNK>": 0, "MEDICATION//ACETAMINOPHEN": 1, "MEDICATION//FUROSEMIDE": 2}),
         encoding="utf-8",
     )
+    (medtok_dir / "obs_code_vocab.json").write_text(
+        json.dumps({"<UNK>": 0, "BLOOD PRESSURE::Blood Pressure": 1}),
+        encoding="utf-8",
+    )
+    (medtok_dir / "obs_value_vocab.json").write_text(
+        json.dumps({"<UNK>": 0, "UNK": 1, "N/A": 2, "NONE": 3, "": 4, "120/80": 5}),
+        encoding="utf-8",
+    )
     (medtok_attr_dir / "route_vocab.json").write_text(json.dumps({"<UNK>": 0, "IV": 1}), encoding="utf-8")
 
     sparse_contract = build_sparse_vocab_contract(
@@ -241,6 +249,8 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
     assert sparse_contract["families"]["med_route"]["source_size"] == 2
     assert sparse_contract["families"]["structural"]["runtime_head"] == "logits_struct"
     assert sparse_contract["families"]["medication_residual"]["source_size"] == 3
+    assert sparse_contract["families"]["observation_code"]["source_size"] == 2
+    assert sparse_contract["families"]["observation_value"]["source_size"] == 6
     assert sparse_contract["families"]["medication_residual"]["family_type"] == "residual_exact"
     assert sparse_contract["residual_fallback"]["families"]["medication"]["mode"] == "exact_vocab"
     assert sparse_contract["residual_fallback"]["families"]["medication"]["tail_policy"] == "drop"

@@ -74,6 +74,11 @@ _RESIDUAL_FALLBACK_FILENAME_CANDIDATES = {
     "medication": ("med_fallback_vocab.json", "medication_residual_vocab.json"),
 }
 
+_OBSERVATION_VOCAB_FILENAME_CANDIDATES = {
+    "code": ("obs_code_vocab.json", "observation_code_vocab.json"),
+    "value": ("obs_value_vocab.json", "observation_value_vocab.json"),
+}
+
 
 def resolve_residual_fallback_vocab_path(
     vocab_dir: str | Path | None,
@@ -100,6 +105,33 @@ def load_residual_fallback_vocab(
     if fp is None:
         return None
     return load_medtok_vocab(str(fp), offset=offset, name=f"{family}_residual")
+
+
+def resolve_observation_vocab_path(
+    vocab_dir: str | Path | None,
+    kind: str,
+) -> Optional[Path]:
+    if vocab_dir is None:
+        return None
+    root = Path(vocab_dir)
+    candidates = _OBSERVATION_VOCAB_FILENAME_CANDIDATES.get(str(kind).lower(), ())
+    for filename in candidates:
+        fp = root / filename
+        if fp.exists():
+            return fp
+    return None
+
+
+def load_observation_vocab(
+    vocab_dir: str | Path | None,
+    *,
+    kind: str,
+    offset: int,
+) -> Optional[CategoryVocab]:
+    fp = resolve_observation_vocab_path(vocab_dir, kind)
+    if fp is None:
+        return None
+    return load_medtok_vocab(str(fp), offset=offset, name=f"observation_{kind}")
 
 
 def load_code_embeddings(json_fp: str) -> Dict[str, list]:

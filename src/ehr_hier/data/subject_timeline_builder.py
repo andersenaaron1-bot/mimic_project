@@ -7,7 +7,9 @@ import meds_reader as mr   # pip install meds_reader
 
 from .token_types import EventToken, TokenCategory
 from .event_router import classify_code_to_category
+from .observation_vocab import OBS_RESERVED_VALUE_IDS, observation_surfaces
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
+from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.data.structural_codes import StructuralCodebook, structural_surface_code
 from src.ehr_hier.data.demographics import (
     age_years_from_timestamps,
@@ -39,12 +41,12 @@ ACTIVE_TRANSITION_ACTIONS = {"open_next", "close_current", "close_open"}
 PROCESS_ACTION_TO_ID = {"START": 1, "END": 2, "STOP": 3}
 PROCESS_DOMAIN_TO_ID = {"MEDICATION": 1, "PROCEDURE": 2, "INFUSION": 3}
 OBS_SPECIAL_VALUE_IDS = {
-    "UNK": 1,
-    "N/A": 2,
-    "NA": 2,
-    "NONE": 3,
-    "NULL": 3,
-    "": 4,
+    "UNK": int(OBS_RESERVED_VALUE_IDS["UNK"]),
+    "N/A": int(OBS_RESERVED_VALUE_IDS["N/A"]),
+    "NA": int(OBS_RESERVED_VALUE_IDS["N/A"]),
+    "NONE": int(OBS_RESERVED_VALUE_IDS["NONE"]),
+    "NULL": int(OBS_RESERVED_VALUE_IDS["NONE"]),
+    "": int(OBS_RESERVED_VALUE_IDS[""]),
 }
 
 GLOBAL_DEMOGRAPHIC_TOKEN_IDS = {
@@ -61,6 +63,8 @@ GLOBAL_DEMOGRAPHIC_TOKEN_IDS = {
     "BMI_OBESE_1": 40,
     "BMI_OBESE_2": 41,
     "BMI_OBESE_3": 42,
+    "HEIGHT_AT_ADMISSION": 43,
+    "WEIGHT_AT_ADMISSION": 44,
 }
 
 DEMOGRAPHIC_ANCHOR_PREFIXES = {
@@ -98,6 +102,9 @@ def build_subject_timeline(
     qual_obs_code_offset: int = 2_300_000,
     qual_obs_value_offset: int = 2_320_000,
     qual_obs_value_vocab_size: int = 80_000,
+    qual_obs_code_vocab: Optional[CategoryVocab] = None,
+    qual_obs_value_vocab: Optional[CategoryVocab] = None,
+    qual_obs_tail_policy: str = "drop",
     struct_action_offset: int = 2_400_000,
     struct_entity_offset: int = 2_420_000,
     emit_process_struct_tokens: bool = False,
@@ -130,7 +137,8 @@ def build_subject_timeline(
     attach_med_numeric : bool
         If True, copy ev.numeric_value into EventToken.num_attrs["numeric_value"] for meds.
     emit_global_demographic_tokens : bool
-        If True, emit lightweight global demographic tokens (sex, age bucket, BMI bucket)
+        If True, emit lightweight global demographic tokens (sex, age bucket, BMI bucket,
+        plus numeric height/weight specials)
         as SPECIAL tokens. Collation prefixes SPECIAL tokens into each window/chunk,
         making these globally attendable without creating extra timeline events.
     structural_codebook : Optional[StructuralCodebook]
@@ -347,50 +355,6 @@ def build_subject_timeline(
         mod = max(1, int(modulo))
         return 1 + (zlib.crc32(data) % mod)
 
-    def _code_parts(code_value: Optional[str]) -> List[str]:
-        if code_value is None:
-            return []
-        return [p.strip() for p in str(code_value).split("//")]
-
-    def _normalize_obs_value(raw_value: object) -> str:
-        if raw_value is None:
-            return "UNK"
-        val = str(raw_value).strip()
-        if not val:
-            return "UNK"
-        val = " ".join(val.split())
-        upper = val.upper()
-        if upper in {"UNKNOWN", "UNK"}:
-            return "UNK"
-        if upper in {"N/A", "NA", "NOT APPLICABLE"}:
-            return "N/A"
-        return val[:96]
-
-    def _extract_obs_value(ev_obj: object, *, code_value: Optional[str]) -> str:
-        for attr in (
-            "text_value",
-            "value",
-            "value_as_string",
-            "value_text",
-            "result_value",
-            "status",
-        ):
-            if hasattr(ev_obj, attr):
-                raw = getattr(ev_obj, attr)
-                if raw is not None and str(raw).strip():
-                    return _normalize_obs_value(raw)
-        if hasattr(ev_obj, "numeric_value"):
-            try:
-                nval = float(getattr(ev_obj, "numeric_value"))
-            except (TypeError, ValueError):
-                nval = None
-            if nval is not None and math.isfinite(nval):
-                return _normalize_obs_value(f"{nval:.3f}".rstrip("0").rstrip("."))
-        parts = _code_parts(code_value)
-        if len(parts) >= 3:
-            return _normalize_obs_value(parts[2])
-        return "UNK"
-
     def _emit_qual_obs_tokens(
         *,
         code_value: Optional[str],
@@ -399,36 +363,51 @@ def build_subject_timeline(
     ) -> List[EventToken]:
         if code_value is None:
             return []
-        parts = _code_parts(code_value)
-        if not parts:
-            return []
-        prefix = parts[0].upper()
-        if prefix not in {
-            "LAB",
-            "VITAL",
-            "MEAS",
-            "SUBJECT_FLUID_OUTPUT",
-            "SUBJECT_WEIGHT_AT_INFUSION",
-            "OMR",
-            "BLOOD PRESSURE",
-        }:
+        surfaces = observation_surfaces(ev_view, code_value=code_value)
+        if surfaces is None:
             return []
 
         obs_code_lane = max(16, int(qual_obs_value_offset) - int(qual_obs_code_offset) - 1)
         obs_value_lane = max(16, int(qual_obs_value_vocab_size))
 
-        item_or_code = parts[1] if len(parts) >= 2 else code_value
-        local_code_id = _stable_local_id(f"{prefix}::{item_or_code}", modulo=obs_code_lane)
-        obs_code_gid = int(qual_obs_code_offset) + int(local_code_id)
+        code_exact = False
+        obs_code_gid: Optional[int] = None
+        local_code_id: Optional[int] = None
+        if qual_obs_code_vocab is not None:
+            obs_code_gid = qual_obs_code_vocab.maybe_encode(surfaces.code_surface)
+            if obs_code_gid is not None:
+                local_code_id = int(obs_code_gid) - int(qual_obs_code_vocab.offset)
+                code_exact = True
+            elif str(qual_obs_tail_policy).lower() == "drop":
+                return []
+        if obs_code_gid is None:
+            local_code_id = _stable_local_id(surfaces.code_surface, modulo=obs_code_lane)
+            obs_code_gid = int(qual_obs_code_offset) + int(local_code_id)
 
-        obs_val_text = _extract_obs_value(ev_view, code_value=code_value)
-        obs_val_upper = obs_val_text.upper()
-        special_local = OBS_SPECIAL_VALUE_IDS.get(obs_val_upper)
-        if special_local is not None and int(special_local) <= int(obs_value_lane):
-            obs_val_local = int(special_local)
-        else:
-            obs_val_local = _stable_local_id(f"OBS_VAL::{obs_val_text}", modulo=obs_value_lane)
-        obs_val_gid = int(qual_obs_value_offset) + int(obs_val_local)
+        value_exact = False
+        obs_val_text = surfaces.value_surface
+        obs_val_gid: Optional[int] = None
+        obs_val_local: Optional[int] = None
+        if qual_obs_value_vocab is not None:
+            obs_val_gid = qual_obs_value_vocab.maybe_encode(obs_val_text)
+            if obs_val_gid is not None:
+                obs_val_local = int(obs_val_gid) - int(qual_obs_value_vocab.offset)
+                value_exact = True
+            elif str(qual_obs_tail_policy).lower() == "drop":
+                return []
+        if obs_val_gid is None:
+            obs_val_upper = obs_val_text.upper()
+            special_local = OBS_SPECIAL_VALUE_IDS.get(obs_val_upper)
+            if special_local is not None and int(special_local) <= int(obs_value_lane):
+                obs_val_local = int(special_local)
+            else:
+                obs_val_local = _stable_local_id(f"OBS_VAL::{obs_val_text}", modulo=obs_value_lane)
+            obs_val_gid = int(qual_obs_value_offset) + int(obs_val_local)
+
+        if local_code_id is None or obs_val_local is None:
+            return []
+        obs_stage_exact = int(code_exact and value_exact)
+        obs_stage_hash = int(not code_exact and not value_exact)
         t_from_start = _t_from_start_hours(t_value) if isinstance(t_value, datetime) else 0.0
 
         return [
@@ -440,6 +419,9 @@ def build_subject_timeline(
                 cat_attrs={
                     "obs_bundle_pos": 1,
                     "obs_code_local_id": int(local_code_id),
+                    "obs_code_exact": int(code_exact),
+                    "obs_stage_exact": obs_stage_exact,
+                    "obs_stage_hash": obs_stage_hash,
                 },
                 num_attrs={},
                 raw_time=t_value if isinstance(t_value, datetime) else None,
@@ -453,6 +435,9 @@ def build_subject_timeline(
                 cat_attrs={
                     "obs_bundle_pos": 2,
                     "obs_value_local_id": int(obs_val_local),
+                    "obs_value_exact": int(value_exact),
+                    "obs_stage_exact": obs_stage_exact,
+                    "obs_stage_hash": obs_stage_hash,
                 },
                 num_attrs={},
                 raw_time=t_value if isinstance(t_value, datetime) else None,
@@ -472,7 +457,7 @@ def build_subject_timeline(
         if upper.startswith("INFUSION_END//"):
             return ("END", "INFUSION", code_norm.split("//", 1)[1])
 
-        parts = _code_parts(code_norm)
+        parts = [p.strip() for p in str(code_norm).split("//")]
         if len(parts) >= 3 and parts[0].upper() in {"MEDICATION", "PROCEDURE"}:
             marker = parts[1].upper()
             if marker in {"START", "END", "STOP"}:
@@ -653,19 +638,31 @@ def build_subject_timeline(
         out: List[EventToken] = []
         seen_ids: Set[int] = set()
 
-        def _emit_demog_token(local_id: int, *, feature_id: int) -> None:
+        def _emit_demog_token(
+            local_id: int,
+            *,
+            feature_id: int,
+            numeric_value: Optional[float] = None,
+        ) -> None:
             gid = int(special_token_offset) + int(local_id)
             if gid in seen_ids:
                 return
             seen_ids.add(gid)
+            num_attrs = {}
+            if numeric_value is not None and math.isfinite(float(numeric_value)):
+                num_attrs["numeric_value"] = float(numeric_value)
             out.append(
                 EventToken(
                     value_id=int(gid),
                     category_id=int(TokenCategory.SPECIAL),
                     t_from_start_hours=0.0,
                     dt_from_prev_hours=0.0,
-                    cat_attrs={"global_demographic": 1, "demographic_feature_id": int(feature_id)},
-                    num_attrs={},
+                    cat_attrs={
+                        "global_demographic": 1,
+                        "demographic_feature_id": int(feature_id),
+                        "demographic_numeric": 1 if numeric_value is not None else 0,
+                    },
+                    num_attrs=num_attrs,
                     raw_time=None,
                     window_hook=None,
                 )
@@ -692,6 +689,29 @@ def build_subject_timeline(
                 bmi_val = float(wt_lbs) * 703.0 / (float(ht_in) ** 2)
         if bmi_val is not None and math.isfinite(bmi_val) and bmi_val > 0.0:
             _emit_demog_token(_bmi_bucket_token_id(float(bmi_val)), feature_id=3)
+
+        # 4) Height/weight numeric specials at admission anchor, when directly observed.
+        height_in = _latest_numeric_for_aliases_at_or_before(
+            {"HEIGHT (INCHES)"},
+            anchor_time=demographic_anchor_time,
+        )
+        if height_in is not None and math.isfinite(height_in) and height_in > 0.0:
+            _emit_demog_token(
+                GLOBAL_DEMOGRAPHIC_TOKEN_IDS["HEIGHT_AT_ADMISSION"],
+                feature_id=4,
+                numeric_value=float(height_in) * 2.54,
+            )
+
+        weight_lbs = _latest_numeric_for_aliases_at_or_before(
+            {"WEIGHT (LBS)"},
+            anchor_time=demographic_anchor_time,
+        )
+        if weight_lbs is not None and math.isfinite(weight_lbs) and weight_lbs > 0.0:
+            _emit_demog_token(
+                GLOBAL_DEMOGRAPHIC_TOKEN_IDS["WEIGHT_AT_ADMISSION"],
+                feature_id=5,
+                numeric_value=float(weight_lbs) * 0.45359237,
+            )
 
         return out
 

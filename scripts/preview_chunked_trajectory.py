@@ -371,6 +371,9 @@ def main() -> None:
         subject_id=int(subject_id),
         encoders=encoders,
         structural_codebook=artifacts.structural_codebook,
+        qual_obs_code_vocab=artifacts.obs_code_vocab,
+        qual_obs_value_vocab=artifacts.obs_value_vocab,
+        qual_obs_tail_policy=artifacts.obs_tail_policy,
     )
 
     collator = AETHierarchicalCollator(

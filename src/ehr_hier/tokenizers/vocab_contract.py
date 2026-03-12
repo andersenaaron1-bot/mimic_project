@@ -315,8 +315,14 @@ def build_sparse_vocab_contract(
         else (_code2id_size(code2id_pt) or 10_000)
     )
     rvq_size_eff = int(rvq_size) if rvq_size is not None else (_rvq_size_from_ckpt(tokenizer_ckpt) or 1_024)
-    obs_code_size = _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
-    obs_val_size = int(_safe_dict(frozen.get("observation_value", {})).get("size", 80_000))
+    obs_code_size = (
+        _vocab_size_from_json((medtok_dir / "obs_code_vocab.json") if medtok_dir is not None else None)
+        or _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
+    )
+    obs_val_size = (
+        _vocab_size_from_json((medtok_dir / "obs_value_vocab.json") if medtok_dir is not None else None)
+        or int(_safe_dict(frozen.get("observation_value", {})).get("size", 80_000))
+    )
     diag_res_meta = _residual_vocab_meta(
         medtok_vocab_dir=medtok_dir,
         family="diagnosis",
