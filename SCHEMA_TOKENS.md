@@ -151,6 +151,12 @@ For the minimal v1 structural contract, synthetic process action/entity tokens a
 default. Structural semantics should come from the structural codebook path, not from extra
 generated token families.
 
+Fallback policy for unresolved semantic surfaces:
+- first try explicit MedTok resolution (`exact`, `canonicalized`, `parent_lookup`,
+  `crosswalk_lookup`, `lexical_bridge`)
+- then try an exact residual vocabulary for common unresolved surfaces
+- only the rare tail should hash or drop, depending on experiment policy
+
 ### 3.3 Numeric side-channel (`numeric_values`)
 The collator extracts `EventToken.num_attrs["numeric_value"]` into a dense tensor
 `numeric_values` (shape `(B,W,C,L,1)` in the chunked hierarchy) plus a `numeric_mask`.
@@ -180,7 +186,7 @@ single source of truth for global token families before dense runtime remapping.
 The sparse contract contains:
 - family offsets
 - source sizes
-- residual fallback ranges
+- exact residual fallback family sizes (when fallback vocab JSONs are present) or legacy hash ranges
 - special/window marker ids
 - runtime head routing for model-visible families
 

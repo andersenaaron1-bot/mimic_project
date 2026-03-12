@@ -18,10 +18,13 @@ The active MedTok resolution order is:
 3. `parent_lookup`
 4. `crosswalk_lookup`
 5. `lexical_bridge`
-6. `residual`
-7. `unk`
+6. `residual_exact`
+7. `residual_hash`
+8. `unk`
 
 `drop` is only possible when an encoder is explicitly configured with `drop_unknowns=True`.
+For v1 compressed vocabs, the preferred policy is `residual_exact` plus `drop` on the far tail;
+`residual_hash` is now a legacy-compatible fallback rather than the preferred default.
 
 ## Canonical Key Formats
 

@@ -220,6 +220,10 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
     (medtok_dir / "diag_vocab.json").write_text(json.dumps({"<UNK>": 0, "I10": 1}), encoding="utf-8")
     (medtok_dir / "proc_vocab.json").write_text(json.dumps({"<UNK>": 0, "XYZ": 1}), encoding="utf-8")
     (medtok_dir / "med_vocab.json").write_text(json.dumps({"<UNK>": 0, "RXNORM//1": 1}), encoding="utf-8")
+    (medtok_dir / "med_fallback_vocab.json").write_text(
+        json.dumps({"<UNK>": 0, "MEDICATION//ACETAMINOPHEN": 1, "MEDICATION//FUROSEMIDE": 2}),
+        encoding="utf-8",
+    )
     (medtok_attr_dir / "route_vocab.json").write_text(json.dumps({"<UNK>": 0, "IV": 1}), encoding="utf-8")
 
     sparse_contract = build_sparse_vocab_contract(
@@ -234,6 +238,10 @@ def test_sparse_vocab_contract_becomes_runtime_source_of_truth(tmp_path) -> None
     assert sparse_contract["families"]["diagnosis"]["offset"] == 1000000
     assert sparse_contract["families"]["med_route"]["source_size"] == 2
     assert sparse_contract["families"]["structural"]["runtime_head"] == "logits_struct"
+    assert sparse_contract["families"]["medication_residual"]["source_size"] == 3
+    assert sparse_contract["families"]["medication_residual"]["family_type"] == "residual_exact"
+    assert sparse_contract["residual_fallback"]["families"]["medication"]["mode"] == "exact_vocab"
+    assert sparse_contract["residual_fallback"]["families"]["medication"]["tail_policy"] == "drop"
 
     legacy_manifest = build_legacy_manifest_from_sparse_contract(sparse_contract)
     assert legacy_manifest["diagnosis"]["offset"] == 1000000

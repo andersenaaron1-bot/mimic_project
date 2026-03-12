@@ -61,6 +61,47 @@ def load_attr_vocab(json_fp: str, *, offset: int, name: str) -> CategoryVocab:
     return load_medtok_vocab(json_fp, offset=offset, name=name)
 
 
+def load_optional_vocab(json_fp: str | Path, *, offset: int, name: str) -> Optional[CategoryVocab]:
+    path = Path(json_fp)
+    if not path.exists():
+        return None
+    return load_medtok_vocab(str(path), offset=offset, name=name)
+
+
+_RESIDUAL_FALLBACK_FILENAME_CANDIDATES = {
+    "diagnosis": ("diag_fallback_vocab.json", "diagnosis_residual_vocab.json"),
+    "procedure": ("proc_fallback_vocab.json", "procedure_residual_vocab.json"),
+    "medication": ("med_fallback_vocab.json", "medication_residual_vocab.json"),
+}
+
+
+def resolve_residual_fallback_vocab_path(
+    vocab_dir: str | Path | None,
+    family: str,
+) -> Optional[Path]:
+    if vocab_dir is None:
+        return None
+    root = Path(vocab_dir)
+    candidates = _RESIDUAL_FALLBACK_FILENAME_CANDIDATES.get(str(family).lower(), ())
+    for filename in candidates:
+        fp = root / filename
+        if fp.exists():
+            return fp
+    return None
+
+
+def load_residual_fallback_vocab(
+    vocab_dir: str | Path | None,
+    *,
+    family: str,
+    offset: int,
+) -> Optional[CategoryVocab]:
+    fp = resolve_residual_fallback_vocab_path(vocab_dir, family)
+    if fp is None:
+        return None
+    return load_medtok_vocab(str(fp), offset=offset, name=f"{family}_residual")
+
+
 def load_code_embeddings(json_fp: str) -> Dict[str, list]:
     """
     Load MedTok code2embeddings.json mapping {<code>: [float...]}.

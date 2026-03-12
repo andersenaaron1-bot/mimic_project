@@ -11,6 +11,7 @@ from src.ehr_hier.data.structural_codes import (
     load_structural_codebook_yaml,
     structural_surface_vocab_codes,
 )
+from src.ehr_hier.tokenizers.medtok_loader import resolve_residual_fallback_vocab_path
 
 
 DEFAULT_SPARSE_VOCAB_JSON = "artifacts/token_vocab_sparse_v1.json"
@@ -125,6 +126,34 @@ def _vocab_size_from_json(vocab_fp: str | Path | None) -> Optional[int]:
     if not vals:
         return None
     return max(vals) + 1
+
+
+def _residual_vocab_meta(
+    *,
+    medtok_vocab_dir: str | Path | None,
+    family: str,
+    offset: int,
+    default_buckets: int,
+) -> Dict[str, Any]:
+    fp = resolve_residual_fallback_vocab_path(medtok_vocab_dir, family)
+    if fp is None:
+        return {
+            "offset": int(offset),
+            "mode": "hash",
+            "source_size": int(default_buckets),
+            "tail_policy": "hash",
+            "tail_buckets": int(default_buckets),
+            "vocab_json": None,
+        }
+    size = _vocab_size_from_json(fp) or 1
+    return {
+        "offset": int(offset),
+        "mode": "exact_vocab",
+        "source_size": int(size),
+        "tail_policy": "drop",
+        "tail_buckets": 0,
+        "vocab_json": str(fp),
+    }
 
 
 def _code2id_size(code2id_pt: str | Path | None) -> Optional[int]:
@@ -291,6 +320,24 @@ def build_sparse_vocab_contract(
     rvq_size_eff = int(rvq_size) if rvq_size is not None else (_rvq_size_from_ckpt(tokenizer_ckpt) or 1_024)
     obs_code_size = _size_from_gap(obs_code_offset, obs_val_offset, 20_000)
     obs_val_size = _size_from_gap(obs_val_offset, _offset("structural_action", 2_400_000), 80_000)
+    diag_res_meta = _residual_vocab_meta(
+        medtok_vocab_dir=medtok_dir,
+        family="diagnosis",
+        offset=diag_res_offset,
+        default_buckets=_bucket("diagnosis_residual", 39_999),
+    )
+    proc_res_meta = _residual_vocab_meta(
+        medtok_vocab_dir=medtok_dir,
+        family="procedure",
+        offset=proc_res_offset,
+        default_buckets=_bucket("procedure_residual", 39_999),
+    )
+    med_res_meta = _residual_vocab_meta(
+        medtok_vocab_dir=medtok_dir,
+        family="medication",
+        offset=med_res_offset,
+        default_buckets=_bucket("medication_residual", 39_999),
+    )
     try:
         structural_codebook = load_structural_codebook_yaml(str(structural_yaml), default_offset=int(structural_offset))
         structural_size = max(1, int(len(structural_surface_vocab_codes(structural_codebook))))
@@ -314,9 +361,10 @@ def build_sparse_vocab_contract(
         ),
         "diagnosis_residual": _family_entry(
             offset=diag_res_offset,
-            source_size=_bucket("diagnosis_residual", 39_999),
-            family_type="residual",
+            source_size=int(diag_res_meta["source_size"]),
+            family_type="residual_exact" if str(diag_res_meta["mode"]) == "exact_vocab" else "residual",
             runtime_head="logits_medtok",
+            meta=diag_res_meta,
         ),
         "procedure": _family_entry(
             offset=proc_offset,
@@ -326,9 +374,10 @@ def build_sparse_vocab_contract(
         ),
         "procedure_residual": _family_entry(
             offset=proc_res_offset,
-            source_size=_bucket("procedure_residual", 39_999),
-            family_type="residual",
+            source_size=int(proc_res_meta["source_size"]),
+            family_type="residual_exact" if str(proc_res_meta["mode"]) == "exact_vocab" else "residual",
             runtime_head="logits_medtok",
+            meta=proc_res_meta,
         ),
         "medication": _family_entry(
             offset=med_offset,
@@ -338,9 +387,10 @@ def build_sparse_vocab_contract(
         ),
         "medication_residual": _family_entry(
             offset=med_res_offset,
-            source_size=_bucket("medication_residual", 39_999),
-            family_type="residual",
+            source_size=int(med_res_meta["source_size"]),
+            family_type="residual_exact" if str(med_res_meta["mode"]) == "exact_vocab" else "residual",
             runtime_head="logits_medtok",
+            meta=med_res_meta,
         ),
         "med_route": _family_entry(
             offset=med_route_offset,
@@ -413,16 +463,16 @@ def build_sparse_vocab_contract(
     residual_offsets = _safe_dict(residual_cfg.get("offsets", {}))
     residual_families = {
         "diagnosis": {
+            **diag_res_meta,
             "offset": int(residual_offsets.get("diagnosis", diag_res_offset)),
-            "buckets": int(_bucket("diagnosis_residual", 39_999)),
         },
         "procedure": {
+            **proc_res_meta,
             "offset": int(residual_offsets.get("procedure", proc_res_offset)),
-            "buckets": int(_bucket("procedure_residual", 39_999)),
         },
         "medication": {
+            **med_res_meta,
             "offset": int(residual_offsets.get("medication", med_res_offset)),
-            "buckets": int(_bucket("medication_residual", 39_999)),
         },
     }
 
@@ -470,7 +520,7 @@ def build_legacy_manifest_from_sparse_contract(contract: Mapping[str, Any]) -> D
         entry: Dict[str, Any] = {"offset": int(fam["offset"])}
         if "source_size" in fam:
             entry["size"] = int(fam["source_size"])
-        if str(fam.get("family_type", "")) == "residual":
+        if str(fam.get("family_type", "")).startswith("residual"):
             entry["buckets"] = int(fam.get("source_size", 0))
         manifest[str(name)] = entry
 

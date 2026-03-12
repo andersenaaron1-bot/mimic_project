@@ -34,6 +34,9 @@ from src.ehr_hier.tokenizers.medtok_crosswalk import (  # noqa: E402
     load_crosswalk_candidate_map,
     resolve_crosswalk_target,
 )
+from src.ehr_hier.tokenizers.medtok_attr_encoder import (  # noqa: E402
+    residual_fallback_candidate_codes,
+)
 from src.ehr_hier.tokenizers.vocab_contract import validate_medtok_inputs
 
 
@@ -107,6 +110,57 @@ def _is_low_specificity_med_candidate(code: str) -> bool:
     return False
 
 
+def _is_process_like_row(routed_category: str, raw_code: str) -> bool:
+    category = str(routed_category).upper().strip()
+    code_u = str(raw_code).upper().strip()
+    if category == "MEDICATION":
+        return (
+            code_u.startswith("INFUSION_START//")
+            or code_u.startswith("INFUSION_END//")
+            or code_u.startswith("MEDICATION//START//")
+            or code_u.startswith("MEDICATION//END//")
+            or code_u.startswith("MEDICATION//STOP//")
+        )
+    if category == "PROCEDURE":
+        return (
+            code_u.startswith("PROCEDURE//START//")
+            or code_u.startswith("PROCEDURE//END//")
+            or code_u.startswith("PROCEDURE//STOP//")
+        )
+    return False
+
+
+def _resolve_full_medtok_target(
+    *,
+    raw_code: str,
+    routed_category: str,
+    canonicalize_fn: Callable[[object], object],
+    full_vocab: CategoryVocab,
+    crosswalk_candidates: Dict[str, List[str]] | None,
+    drop_low_specificity_med: bool = True,
+) -> str | None:
+    candidates = ensure_list(canonicalize_fn(raw_code))
+    for cand in candidates:
+        cand_str = str(cand)
+        if (
+            str(routed_category).upper() == "MEDICATION"
+            and bool(drop_low_specificity_med)
+            and _is_low_specificity_med_candidate(cand_str)
+        ):
+            continue
+        if cand_str in full_vocab.code2id and int(full_vocab.code2id[cand_str]) != int(full_vocab.unk_id):
+            return cand_str
+
+    target, _ = resolve_crosswalk_target(
+        family=str(routed_category).lower(),
+        candidate_map=crosswalk_candidates or {},
+        available_codes=full_vocab.code2id.keys(),
+        allow_unvalidated_fallback=True,
+        values=[raw_code],
+    )
+    return target
+
+
 def _load_full_vocab(
     *,
     name: str,
@@ -166,6 +220,8 @@ def _build_family_vocab(
         raw_code = _safe_code(row)
         if not raw_code:
             continue
+        if _is_process_like_row(str(routed_category), raw_code):
+            continue
         events_total = _safe_float(row, "events_total", default=0.0)
         if events_total <= 0.0:
             # fallback if table only has uncaptured counts
@@ -182,28 +238,14 @@ def _build_family_vocab(
         if rare_critical:
             rare_critical_rows += 1
 
-        candidates = ensure_list(canonicalize_fn(raw_code))
-        primary: str | None = None
-        for cand in candidates:
-            cand_str = str(cand)
-            if (
-                str(routed_category).upper() == "MEDICATION"
-                and bool(drop_low_specificity_med)
-                and _is_low_specificity_med_candidate(cand_str)
-            ):
-                continue
-            if cand_str in full_vocab.code2id and int(full_vocab.code2id[cand_str]) != int(full_vocab.unk_id):
-                primary = cand_str
-                break
-
-        if primary is None:
-            primary, _ = resolve_crosswalk_target(
-                family=str(routed_category).lower(),
-                candidate_map=crosswalk_candidates or {},
-                available_codes=full_vocab.code2id.keys(),
-                allow_unvalidated_fallback=True,
-                values=[raw_code],
-            )
+        primary = _resolve_full_medtok_target(
+            raw_code=raw_code,
+            routed_category=str(routed_category),
+            canonicalize_fn=canonicalize_fn,
+            full_vocab=full_vocab,
+            crosswalk_candidates=crosswalk_candidates,
+            drop_low_specificity_med=bool(drop_low_specificity_med),
+        )
 
         if primary is None:
             unmappable_events += float(events_total)
@@ -298,6 +340,122 @@ def _build_family_vocab(
     return code2id, report
 
 
+def _build_fallback_vocab(
+    *,
+    df: pd.DataFrame,
+    routed_category: str,
+    canonicalize_fn: Callable[[object], object],
+    full_vocab: CategoryVocab,
+    crosswalk_candidates: Dict[str, List[str]] | None,
+    max_explicit: int,
+    target_coverage: float,
+    drop_low_specificity_med: bool = True,
+) -> Tuple[Dict[str, int], Dict[str, Any]]:
+    fam = df[df["routed_category"].fillna("").astype(str).str.upper() == str(routed_category).upper()].copy()
+    rows_considered = int(len(fam))
+
+    code_stats: Dict[str, Dict[str, Any]] = defaultdict(
+        lambda: {"events": 0.0, "score": 0.0, "rows": 0}
+    )
+    unresolved_total = 0.0
+    skipped_process_rows = 0
+
+    for _, row in fam.iterrows():
+        raw_code = _safe_code(row)
+        if not raw_code:
+            continue
+        if _is_process_like_row(str(routed_category), raw_code):
+            skipped_process_rows += 1
+            continue
+        events_total = _safe_float(row, "events_total", default=0.0)
+        if events_total <= 0.0:
+            events_total = _safe_float(row, "uncaptured_events", default=0.0) + _safe_float(
+                row, "captured_events", default=0.0
+            )
+        if events_total <= 0.0:
+            continue
+
+        target = _resolve_full_medtok_target(
+            raw_code=raw_code,
+            routed_category=str(routed_category),
+            canonicalize_fn=canonicalize_fn,
+            full_vocab=full_vocab,
+            crosswalk_candidates=crosswalk_candidates,
+            drop_low_specificity_med=bool(drop_low_specificity_med),
+        )
+        if target is not None:
+            continue
+
+        fallback_candidates = residual_fallback_candidate_codes(
+            str(routed_category),
+            base_code=raw_code,
+            raw_code=raw_code,
+        )
+        if not fallback_candidates:
+            continue
+        fallback_key = str(fallback_candidates[0])
+        subj_cov = _safe_float(row, "subject_coverage_frac", default=0.0)
+        unresolved_total += float(events_total)
+        st = code_stats[fallback_key]
+        st["events"] += float(events_total)
+        st["score"] += float(events_total) * (1.0 + max(0.0, float(subj_cov)))
+        st["rows"] += 1
+
+    if int(max_explicit) <= 0:
+        return {"<UNK>": 0}, {
+            "rows_considered": rows_considered,
+            "skipped_process_rows": int(skipped_process_rows),
+            "unresolved_events": int(unresolved_total),
+            "selected_unresolved_events": 0,
+            "selected_unresolved_coverage": 0.0,
+            "exact_fallback_codes_selected": 0,
+            "top_selected_preview": [],
+        }
+
+    ranked = sorted(
+        code_stats.items(),
+        key=lambda kv: (-float(kv[1]["score"]), str(kv[0])),
+    )
+    selected: List[str] = []
+    selected_events = 0.0
+    target_coverage = min(1.0, max(0.0, float(target_coverage)))
+    for code, st in ranked:
+        if len(selected) >= int(max_explicit):
+            break
+        if unresolved_total > 0.0 and (selected_events / unresolved_total) >= target_coverage:
+            break
+        selected.append(code)
+        selected_events += float(st["events"])
+
+    code2id = {"<UNK>": 0}
+    for i, code in enumerate(selected, start=1):
+        code2id[str(code)] = int(i)
+
+    top_preview = []
+    for code in selected[:50]:
+        st = code_stats[code]
+        top_preview.append(
+            {
+                "code": code,
+                "events": int(st["events"]),
+                "score": float(st["score"]),
+                "rows": int(st["rows"]),
+            }
+        )
+
+    return code2id, {
+        "rows_considered": rows_considered,
+        "skipped_process_rows": int(skipped_process_rows),
+        "unresolved_events": int(unresolved_total),
+        "selected_unresolved_events": int(selected_events),
+        "selected_unresolved_coverage": (
+            float(selected_events / unresolved_total) if unresolved_total > 0 else 0.0
+        ),
+        "exact_fallback_codes_selected": int(len(selected)),
+        "top_selected_preview": top_preview,
+    }
+
+
 def _write_vocab_json(out_fp: Path, code2id: Dict[str, int]) -> None:
     out_fp.parent.mkdir(parents=True, exist_ok=True)
     out_fp.write_text(json.dumps(code2id, indent=2, sort_keys=False), encoding="utf-8")
@@ -306,8 +464,8 @@ def _write_vocab_json(out_fp: Path, code2id: Dict[str, int]) -> None:
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Build compressed MedTok vocabularies (diag/proc/med) from a routed decision table "
-            "using explicit-cap + coverage + rare-critical keep policy."
+            "Build compressed MedTok vocabularies (diag/proc/med) plus exact residual fallback vocabs "
+            "from a routed decision table using explicit-cap + coverage + rare-critical keep policy."
         )
     )
     ap.add_argument("--decision_csv", required=True)
@@ -323,6 +481,12 @@ def main() -> None:
     ap.add_argument("--diag_target_coverage", type=float, default=0.97)
     ap.add_argument("--proc_target_coverage", type=float, default=0.97)
     ap.add_argument("--med_target_coverage", type=float, default=0.97)
+    ap.add_argument("--diag_fallback_max_explicit", type=int, default=2_000)
+    ap.add_argument("--proc_fallback_max_explicit", type=int, default=2_000)
+    ap.add_argument("--med_fallback_max_explicit", type=int, default=12_000)
+    ap.add_argument("--diag_fallback_target_coverage", type=float, default=0.98)
+    ap.add_argument("--proc_fallback_target_coverage", type=float, default=0.98)
+    ap.add_argument("--med_fallback_target_coverage", type=float, default=0.98)
 
     ap.add_argument("--diag_residual_buckets", type=int, default=8_000)
     ap.add_argument("--proc_residual_buckets", type=int, default=4_000)
@@ -422,14 +586,53 @@ def main() -> None:
         keywords_upper=keywords_upper,
         drop_low_specificity_med=not bool(args.keep_low_specificity_med_codes),
     )
+    diag_fallback_code2id, diag_fallback_report = _build_fallback_vocab(
+        df=df,
+        routed_category="DIAGNOSIS",
+        canonicalize_fn=canonicalize_diagnosis_code,
+        full_vocab=full_diag,
+        crosswalk_candidates=diag_crosswalk,
+        max_explicit=int(args.diag_fallback_max_explicit),
+        target_coverage=float(args.diag_fallback_target_coverage),
+        drop_low_specificity_med=False,
+    )
+    proc_fallback_code2id, proc_fallback_report = _build_fallback_vocab(
+        df=df,
+        routed_category="PROCEDURE",
+        canonicalize_fn=canonicalize_procedure_code,
+        full_vocab=full_proc,
+        crosswalk_candidates=proc_crosswalk,
+        max_explicit=int(args.proc_fallback_max_explicit),
+        target_coverage=float(args.proc_fallback_target_coverage),
+        drop_low_specificity_med=False,
+    )
+    med_fallback_code2id, med_fallback_report = _build_fallback_vocab(
+        df=df,
+        routed_category="MEDICATION",
+        canonicalize_fn=canonicalize_medication_code,
+        full_vocab=full_med,
+        crosswalk_candidates=med_crosswalk,
+        max_explicit=int(args.med_fallback_max_explicit),
+        target_coverage=float(args.med_fallback_target_coverage),
+        drop_low_specificity_med=not bool(args.keep_low_specificity_med_codes),
+    )
 
     _write_vocab_json(out_dir / "diag_vocab.json", diag_code2id)
     _write_vocab_json(out_dir / "proc_vocab.json", proc_code2id)
     _write_vocab_json(out_dir / "med_vocab.json", med_code2id)
+    _write_vocab_json(out_dir / "diag_fallback_vocab.json", diag_fallback_code2id)
+    _write_vocab_json(out_dir / "proc_fallback_vocab.json", proc_fallback_code2id)
+    _write_vocab_json(out_dir / "med_fallback_vocab.json", med_fallback_code2id)
 
     medtok_explicit = (len(diag_code2id) - 1) + (len(proc_code2id) - 1) + (len(med_code2id) - 1)
+    exact_fallback_total = (
+        (len(diag_fallback_code2id) - 1)
+        + (len(proc_fallback_code2id) - 1)
+        + (len(med_fallback_code2id) - 1)
+    )
     residual_total = int(args.diag_residual_buckets) + int(args.proc_residual_buckets) + int(args.med_residual_buckets)
-    projected_total_vocab = int(args.assumed_non_medtok_vocab) + int(medtok_explicit) + int(residual_total)
+    projected_total_vocab = int(args.assumed_non_medtok_vocab) + int(medtok_explicit) + int(exact_fallback_total)
+    projected_total_vocab_with_hash_tail = int(projected_total_vocab) + int(residual_total)
 
     report = {
         "decision_csv": str(decision_fp),
@@ -442,6 +645,12 @@ def main() -> None:
             "diag_target_coverage": float(args.diag_target_coverage),
             "proc_target_coverage": float(args.proc_target_coverage),
             "med_target_coverage": float(args.med_target_coverage),
+            "diag_fallback_max_explicit": int(args.diag_fallback_max_explicit),
+            "proc_fallback_max_explicit": int(args.proc_fallback_max_explicit),
+            "med_fallback_max_explicit": int(args.med_fallback_max_explicit),
+            "diag_fallback_target_coverage": float(args.diag_fallback_target_coverage),
+            "proc_fallback_target_coverage": float(args.proc_fallback_target_coverage),
+            "med_fallback_target_coverage": float(args.med_fallback_target_coverage),
             "diag_residual_buckets": int(args.diag_residual_buckets),
             "proc_residual_buckets": int(args.proc_residual_buckets),
             "med_residual_buckets": int(args.med_residual_buckets),
@@ -454,13 +663,23 @@ def main() -> None:
             "proc_explicit": int(len(proc_code2id) - 1),
             "med_explicit": int(len(med_code2id) - 1),
             "medtok_explicit_total": int(medtok_explicit),
+            "diag_fallback_exact": int(len(diag_fallback_code2id) - 1),
+            "proc_fallback_exact": int(len(proc_fallback_code2id) - 1),
+            "med_fallback_exact": int(len(med_fallback_code2id) - 1),
+            "fallback_exact_total": int(exact_fallback_total),
             "residual_total": int(residual_total),
             "projected_total_vocab": int(projected_total_vocab),
+            "projected_total_vocab_with_hash_tail": int(projected_total_vocab_with_hash_tail),
         },
         "families": {
             "DIAGNOSIS": diag_report,
             "PROCEDURE": proc_report,
             "MEDICATION": med_report,
+        },
+        "fallback_families": {
+            "DIAGNOSIS": diag_fallback_report,
+            "PROCEDURE": proc_fallback_report,
+            "MEDICATION": med_fallback_report,
         },
     }
 
@@ -482,6 +701,9 @@ def main() -> None:
     print(f"Wrote: {out_dir / 'diag_vocab.json'}")
     print(f"Wrote: {out_dir / 'proc_vocab.json'}")
     print(f"Wrote: {out_dir / 'med_vocab.json'}")
+    print(f"Wrote: {out_dir / 'diag_fallback_vocab.json'}")
+    print(f"Wrote: {out_dir / 'proc_fallback_vocab.json'}")
+    print(f"Wrote: {out_dir / 'med_fallback_vocab.json'}")
     print(f"Wrote: {out_report}")
 
 

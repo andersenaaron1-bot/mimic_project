@@ -4,6 +4,7 @@ from pathlib import Path
 from types import SimpleNamespace
 import sys
 
+import pandas as pd
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -33,6 +34,7 @@ from src.ehr_hier.tokenizers.medtok_crosswalk import (
     build_medtok_crosswalk_artifact,
     load_resolved_crosswalk_lookup,
 )
+from scripts.build_compressed_medtok_vocabs import _build_fallback_vocab
 
 
 class FakeEvent:
@@ -323,6 +325,52 @@ def test_procedure_crosswalk_lookup_stage(tmp_path):
     resolution = proc_encoder.resolve_event(SimpleNamespace(code="PROCEDURE//CT scan"))
     assert resolution.stage == "crosswalk_lookup"
     assert resolution.matched_code == "77477000"
+
+
+def test_build_fallback_vocab_prefers_normalized_medication_surface():
+    df = pd.DataFrame(
+        [
+            {
+                "code": "MEDICATION//Acetaminophen//Administered",
+                "routed_category": "MEDICATION",
+                "events_total": 10,
+                "subject_coverage_frac": 0.2,
+            },
+            {
+                "code": "MEDICATION//Acetaminophen//Confirmed",
+                "routed_category": "MEDICATION",
+                "events_total": 5,
+                "subject_coverage_frac": 0.1,
+            },
+            {
+                "code": "MEDICATION//RareDrug//Administered",
+                "routed_category": "MEDICATION",
+                "events_total": 1,
+                "subject_coverage_frac": 0.0,
+            },
+        ]
+    )
+    med_vocab = CategoryVocab(
+        name="med",
+        offset=1_400_000,
+        code2id={"<UNK>": 0},
+    )
+    code2id, report = _build_fallback_vocab(
+        df=df,
+        routed_category="MEDICATION",
+        canonicalize_fn=canonicalize_medication_code,
+        full_vocab=med_vocab,
+        crosswalk_candidates={},
+        max_explicit=1,
+        target_coverage=0.90,
+        drop_low_specificity_med=False,
+    )
+    assert code2id == {
+        "<UNK>": 0,
+        "MEDICATION//ACETAMINOPHEN": 1,
+    }
+    assert report["unresolved_events"] == 16
+    assert report["selected_unresolved_events"] == 15
 
 
 def test_drop_unknown_diagnosis(monkeypatch, tiny_vocabs):

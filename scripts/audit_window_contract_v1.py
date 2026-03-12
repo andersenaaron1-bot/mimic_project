@@ -336,6 +336,7 @@ def _build_runtime_context(
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
         medtok_crosswalks=artifacts.medtok_crosswalks,
+        residual_fallback_vocabs=artifacts.residual_fallback_vocabs,
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),

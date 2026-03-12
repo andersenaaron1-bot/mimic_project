@@ -53,6 +53,7 @@ from src.ehr_hier.tokenizers.medtok_loader import (
     CategoryVocab,
     load_attr_vocab,
     load_medtok_vocab,
+    load_residual_fallback_vocab,
 )
 from src.ehr_hier.tokenizers.medtok_attr_encoder import (
     EXPLICIT_MEDTOK_RESOLUTION_STAGES,
@@ -96,6 +97,7 @@ class AuditArtifacts:
     med_numeric_attrs: Dict[str, NumericBinConfig]
     medtok_parent_lookup: Dict[str, List[str]]
     medtok_crosswalks: Dict[str, Dict[str, str]]
+    residual_fallback_vocabs: Dict[str, CategoryVocab]
 
 
 class _EventWithDemographics:
@@ -334,6 +336,7 @@ def _build_semantic_resolution_encoders(
     diag_residual = int(residual_offsets["diagnosis"]) if residual_enabled and "diagnosis" in residual_offsets else None
     proc_residual = int(residual_offsets["procedure"]) if residual_enabled and "procedure" in residual_offsets else None
     med_residual = int(residual_offsets["medication"]) if residual_enabled and "medication" in residual_offsets else None
+    residual_vocabs = artifacts.residual_fallback_vocabs if residual_enabled else {}
     return {
         "diagnosis": MedTokenWithAttrsEncoder(
             TokenCategory.DIAGNOSIS,
@@ -341,6 +344,7 @@ def _build_semantic_resolution_encoders(
             canonicalize_fn=canonicalize_diagnosis_code,
             parent_lookup=artifacts.medtok_parent_lookup,
             crosswalk_lookup=artifacts.medtok_crosswalks.get("diagnosis"),
+            residual_exact_vocab=residual_vocabs.get("diagnosis"),
             residual_fallback_offset=diag_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -350,6 +354,7 @@ def _build_semantic_resolution_encoders(
             canonicalize_fn=canonicalize_procedure_code,
             parent_lookup=artifacts.medtok_parent_lookup,
             crosswalk_lookup=artifacts.medtok_crosswalks.get("procedure"),
+            residual_exact_vocab=residual_vocabs.get("procedure"),
             residual_fallback_offset=proc_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -359,6 +364,7 @@ def _build_semantic_resolution_encoders(
             canonicalize_fn=canonicalize_medication_code,
             parent_lookup=artifacts.medtok_parent_lookup,
             crosswalk_lookup=artifacts.medtok_crosswalks.get("medication"),
+            residual_exact_vocab=residual_vocabs.get("medication"),
             residual_fallback_offset=med_residual,
             residual_fallback_buckets=int(residual_buckets),
         ),
@@ -515,6 +521,26 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
             available_codes=med_vocab.code2id.keys(),
         ),
     }
+    residual_fallback_vocabs = {
+        family: vocab
+        for family in ("diagnosis", "procedure", "medication")
+        for vocab in [
+            load_residual_fallback_vocab(
+                medtok_vocab_dir,
+                family=family,
+                offset=_offset(
+                    manifest,
+                    f"{family}_residual",
+                    {
+                        "diagnosis": 1_160_000,
+                        "procedure": 1_360_000,
+                        "medication": 1_800_000,
+                    }[family],
+                ),
+            )
+        ]
+        if vocab is not None
+    }
 
     med_attr_vocabs: Dict[str, CategoryVocab] = {}
     for name, filename, default_offset in (
@@ -562,6 +588,7 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         med_numeric_attrs=_build_med_numeric_cfg(manifest),
         medtok_parent_lookup=medtok_parent_lookup,
         medtok_crosswalks=medtok_crosswalks,
+        residual_fallback_vocabs=residual_fallback_vocabs,
     )
 
 
@@ -909,14 +936,18 @@ def _audit_subject_tokenization(
                     semantic_base_outcomes_by_category[category.name]["process_reroute"] += 1
                 elif resolution_stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
                     semantic_base_outcomes_by_category[category.name][str(resolution_stage)] += 1
-                elif resolution_stage == "residual":
-                    semantic_base_outcomes_by_category[category.name]["residual"] += 1
+                elif resolution_stage in {"residual_exact", "residual_hash"}:
+                    semantic_base_outcomes_by_category[category.name][str(resolution_stage)] += 1
                 elif resolution_stage == "unk":
                     semantic_base_outcomes_by_category[category.name]["unk"] += 1
                 elif resolution_stage == "drop":
                     semantic_base_outcomes_by_category[category.name]["drop"] += 1
+                elif int(base_tok.cat_attrs.get("residual_fallback_hash", 0) or 0) == 1:
+                    semantic_base_outcomes_by_category[category.name]["residual_hash"] += 1
+                elif int(base_tok.cat_attrs.get("residual_fallback_exact", 0) or 0) == 1:
+                    semantic_base_outcomes_by_category[category.name]["residual_exact"] += 1
                 elif int(base_tok.cat_attrs.get("residual_fallback", 0) or 0) == 1:
-                    semantic_base_outcomes_by_category[category.name]["residual"] += 1
+                    semantic_base_outcomes_by_category[category.name]["residual_exact"] += 1
                 elif unk_gid is not None and int(base_tok.value_id) == int(unk_gid):
                     semantic_base_outcomes_by_category[category.name]["unk"] += 1
                 else:
@@ -1340,7 +1371,9 @@ def _summarize_tokenization_and_collation(
         crosswalk_lookup = int(outcomes.get("crosswalk_lookup", 0))
         lexical_bridge = int(outcomes.get("lexical_bridge", 0))
         medtok_base = exact + canonicalized + parent_lookup + crosswalk_lookup + lexical_bridge
-        residual_base = int(outcomes.get("residual", 0))
+        residual_exact = int(outcomes.get("residual_exact", 0))
+        residual_hash = int(outcomes.get("residual_hash", 0))
+        residual_base = residual_exact + residual_hash
         unknown_base = int(outcomes.get("unk", 0))
         drop = int(outcomes.get("drop", 0))
         dropped = int(outcomes.get("dropped_or_no_encoder", 0))
@@ -1356,6 +1389,8 @@ def _summarize_tokenization_and_collation(
             "crosswalk_lookup": crosswalk_lookup,
             "lexical_bridge": lexical_bridge,
             "explicit_medtok_base": medtok_base,
+            "residual_exact": residual_exact,
+            "residual_hash": residual_hash,
             "residual": residual_base,
             "mapped_non_unk": mapped,
             "unk": unknown_base,
@@ -1589,6 +1624,7 @@ def main() -> None:
         med_numeric_attrs=artifacts.med_numeric_attrs,
         medtok_parent_lookup=artifacts.medtok_parent_lookup,
         medtok_crosswalks=artifacts.medtok_crosswalks,
+        residual_fallback_vocabs=artifacts.residual_fallback_vocabs,
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),
@@ -1625,6 +1661,10 @@ def main() -> None:
             "medtok_parent_lookup_entries": len(artifacts.medtok_parent_lookup),
             "medtok_crosswalk_entries": {
                 k: int(len(v)) for k, v in artifacts.medtok_crosswalks.items()
+            },
+            "residual_fallback_vocab_entries": {
+                k: int(max(0, len(v.code2id) - 1))
+                for k, v in artifacts.residual_fallback_vocabs.items()
             },
             "medtok_crosswalk_json": getattr(args, "medtok_crosswalk_json", None),
             "tokenization_yaml": args.tokenization_yaml,

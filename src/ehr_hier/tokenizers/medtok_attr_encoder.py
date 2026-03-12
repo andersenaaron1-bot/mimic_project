@@ -37,6 +37,10 @@ EXPLICIT_MEDTOK_RESOLUTION_STAGES = (
     "crosswalk_lookup",
     "lexical_bridge",
 )
+NON_MEDTOK_FALLBACK_STAGES = (
+    "residual_exact",
+    "residual_hash",
+)
 
 
 @dataclass(frozen=True)
@@ -45,6 +49,12 @@ class MedTokResolution:
     stage: str
     matched_code: Optional[str] = None
     source_code: Optional[str] = None
+
+
+def _category_name(category: TokenCategory | str | object) -> str:
+    if isinstance(category, TokenCategory):
+        return str(category.name).upper()
+    return str(category).strip().upper()
 
 
 def _normalize_lexical_key(raw: object) -> str:
@@ -68,6 +78,36 @@ def _strip_medication_action_tail(raw: object) -> Optional[str]:
     if len(parts) >= 3 and parts[-1].upper() in _MED_ACTION_SUFFIXES:
         return f"MEDICATION//{'//'.join(parts[1:-1])}"
     return None
+
+
+def normalize_residual_surface_key(raw: object) -> str:
+    return str(raw).strip().upper()
+
+
+def residual_fallback_candidate_codes(
+    category: TokenCategory | str | object,
+    *,
+    base_code: Optional[str],
+    raw_code: Optional[str],
+) -> List[str]:
+    out: List[str] = []
+    seen = set()
+
+    def _append(value: Optional[str]) -> None:
+        if value is None:
+            return
+        norm = normalize_residual_surface_key(value)
+        if not norm or norm in seen:
+            return
+        seen.add(norm)
+        out.append(norm)
+
+    category_name = _category_name(category)
+    if category_name == "MEDICATION":
+        _append(_strip_medication_action_tail(raw_code))
+    _append(base_code)
+    _append(raw_code)
+    return out
 
 
 def load_parent_lookup_from_codes_parquet(codes_parquet_fp: str) -> Dict[str, List[str]]:
@@ -160,8 +200,10 @@ class MedTokenWithAttrsEncoder:
         crosswalk_lookup: Optional[Dict[str, str]] = None,
         drop_unknowns: bool = False,
         fallback_to_raw: bool = True,
+        residual_exact_vocab: Optional[CategoryVocab] = None,
         residual_fallback_offset: Optional[int] = None,
         residual_fallback_buckets: int = 40_000,
+        residual_tail_policy: Optional[str] = None,
     ):
         self.category = category
         self.base_vocab = base_vocab
@@ -180,12 +222,21 @@ class MedTokenWithAttrsEncoder:
         }
         self.drop_unknowns = drop_unknowns
         self.fallback_to_raw = fallback_to_raw
+        self.residual_exact_vocab = residual_exact_vocab
         self.residual_fallback_offset = (
             int(residual_fallback_offset)
             if residual_fallback_offset is not None
             else None
         )
         self.residual_fallback_buckets = max(1, int(residual_fallback_buckets))
+        tail_policy = (
+            str(residual_tail_policy).strip().lower()
+            if residual_tail_policy is not None
+            else ("drop" if residual_exact_vocab is not None else "hash")
+        )
+        if tail_policy not in {"hash", "drop"}:
+            raise ValueError(f"Unsupported residual_tail_policy={residual_tail_policy!r}")
+        self.residual_tail_policy = tail_policy
         self.unk_gid = self.base_vocab.offset + self.base_vocab.unk_id
         self._cache: Dict[str, MedTokResolution] = {}
         self._lexical_bridge: Dict[str, str] = {}
@@ -356,11 +407,27 @@ class MedTokenWithAttrsEncoder:
         data = str(raw).encode("utf-8", errors="ignore")
         return 1 + (zlib.crc32(data) % max(1, int(buckets)))
 
-    def _is_residual_gid(self, gid: int) -> bool:
+    def _residual_exact_size(self) -> int:
+        if self.residual_exact_vocab is None:
+            return 0
+        vals = self.residual_exact_vocab.code2id.values()
+        return (max(int(v) for v in vals) + 1) if vals else 0
+
+    def _residual_hash_offset(self) -> Optional[int]:
         if self.residual_fallback_offset is None:
+            return None
+        return int(self.residual_fallback_offset) + int(self._residual_exact_size())
+
+    def _is_residual_gid(self, gid: int) -> bool:
+        if self.residual_exact_vocab is not None:
+            lo = int(self.residual_exact_vocab.offset)
+            hi = lo + max(0, int(self._residual_exact_size()) - 1)
+            if lo <= int(gid) <= hi:
+                return True
+        if self.residual_fallback_offset is None or self.residual_tail_policy != "hash":
             return False
-        lo = int(self.residual_fallback_offset)
-        hi = lo + int(self.residual_fallback_buckets)
+        lo = int(self._residual_hash_offset() or 0)
+        hi = lo + int(self.residual_fallback_buckets) - 1
         return lo <= int(gid) <= hi
 
     def _exact_candidates(
@@ -434,6 +501,30 @@ class MedTokenWithAttrsEncoder:
                 base_gid=gid,
                 stage="lexical_bridge",
                 matched_code=bridged,
+                source_code=cand,
+            )
+        return None
+
+    def _resolve_residual_exact(
+        self,
+        *,
+        base_code: Optional[str],
+        raw_code: Optional[str],
+    ) -> Optional[MedTokResolution]:
+        if self.residual_exact_vocab is None:
+            return None
+        for cand in residual_fallback_candidate_codes(
+            self.category,
+            base_code=base_code,
+            raw_code=raw_code,
+        ):
+            gid = self.residual_exact_vocab.maybe_encode(cand)
+            if gid is None:
+                continue
+            return MedTokResolution(
+                base_gid=gid,
+                stage="residual_exact",
+                matched_code=cand,
                 source_code=cand,
             )
         return None
@@ -547,20 +638,28 @@ class MedTokenWithAttrsEncoder:
             self._cache[cache_key] = bridge
             return bridge
 
+        residual_exact = self._resolve_residual_exact(
+            base_code=base_code,
+            raw_code=raw_code,
+        )
+        if residual_exact is not None:
+            self._cache[cache_key] = residual_exact
+            return residual_exact
+
         if self.drop_unknowns:
             dropped = MedTokResolution(base_gid=None, stage="drop")
             self._cache[cache_key] = dropped
             return dropped
 
-        if self.residual_fallback_offset is not None:
+        if self.residual_fallback_offset is not None and self.residual_tail_policy == "hash":
             seed = str(base_code if base_code is not None else raw_code)
-            fallback_gid = int(self.residual_fallback_offset) + self._stable_bucket(
+            fallback_gid = int(self._residual_hash_offset() or 0) + self._stable_bucket(
                 seed,
                 int(self.residual_fallback_buckets),
-            )
+            ) - 1
             residual = MedTokResolution(
                 base_gid=fallback_gid,
-                stage="residual",
+                stage="residual_hash",
                 matched_code=None,
                 source_code=seed,
             )
@@ -612,6 +711,10 @@ class MedTokenWithAttrsEncoder:
         cat_attrs = self._encode_categorical_attrs(ev)
         if self._is_residual_gid(base_gid):
             cat_attrs["residual_fallback"] = 1
+            if resolution.stage == "residual_exact":
+                cat_attrs["residual_fallback_exact"] = 1
+            elif resolution.stage == "residual_hash":
+                cat_attrs["residual_fallback_hash"] = 1
         num_attrs = self._encode_numeric_attrs(ev)
 
         tokens = [
