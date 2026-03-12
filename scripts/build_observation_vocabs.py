@@ -4,10 +4,9 @@ from __future__ import annotations
 import argparse
 from collections import Counter
 import json
-import random
 import sys
 from pathlib import Path
-from typing import Dict, Iterable, Tuple
+from typing import Dict, Tuple
 
 import meds_reader as mr
 import torch
@@ -97,12 +96,12 @@ def main() -> None:
 
     code2id = torch.load(args.code2id_pt, map_location="cpu")
     db = mr.SubjectDatabase(args.meds_reader_db)
-    subject_ids = _load_subject_ids(args.splits_parquet, args.split)
-    if args.sample_seed is not None:
-        rnd = random.Random(int(args.sample_seed))
-        rnd.shuffle(subject_ids)
-    if args.max_subjects and len(subject_ids) > int(args.max_subjects):
-        subject_ids = subject_ids[: int(args.max_subjects)]
+    subject_ids = _load_subject_ids(
+        args.splits_parquet,
+        args.split,
+        int(args.max_subjects),
+        sample_seed=args.sample_seed,
+    )
 
     code_counts: Counter[str] = Counter()
     value_counts: Counter[str] = Counter()
