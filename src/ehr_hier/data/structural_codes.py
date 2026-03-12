@@ -125,6 +125,19 @@ class StructuralCodebook:
         label: str | None = None,
         action: str | None = None,
     ) -> Optional[str]:
+        def _looks_icu(text: str) -> bool:
+            upper_text = str(text).upper()
+            return any(alias in upper_text for alias in ("ICU", "CCU", "CSRU"))
+
+        def _looks_or(text: str) -> bool:
+            upper_text = str(text).upper()
+            return (
+                "OPERATING ROOM" in upper_text
+                or upper_text.startswith("OR_")
+                or "//OR//" in upper_text
+                or "PACU" in upper_text
+            )
+
         candidates = []
         code_str = None
         if code is not None:
@@ -146,26 +159,26 @@ class StructuralCodebook:
             if prefix == "TRANSFER_TO":
                 if "//ED//" in upper or "EMERGENCY DEPARTMENT" in upper:
                     return "ED"
-                if "ICU" in upper:
+                if _looks_icu(upper):
                     return "ICU"
-                if "OPERATING ROOM" in upper or "//OR//" in upper:
+                if _looks_or(upper):
                     return "OR"
                 if prefix in self.window_type_map:
                     return self.window_type_map[prefix]
             if "EMERGENCY DEPARTMENT" in upper or "EMERGENCY ROOM" in upper or upper.startswith("ED_"):
                 return "ED"
-            if "ICU" in upper:
+            if _looks_icu(upper):
                 return "ICU"
-            if "OPERATING ROOM" in upper or upper.startswith("OR_") or "//OR//" in upper:
+            if _looks_or(upper):
                 return "OR"
             if prefix in self.window_type_map:
                 return self.window_type_map[prefix]
 
         if label is not None:
             label_str = str(label).upper()
-            if "ICU" in label_str:
+            if _looks_icu(label_str):
                 return "ICU"
-            if "OR" in label_str:
+            if _looks_or(label_str) or "OR" in label_str:
                 return "OR"
 
         if action == "suppress" and code_str == "MEDS_BIRTH":

@@ -420,6 +420,19 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
     assert codebook.window_type_id(code="EVT_BOUNDARY") == 2
 
 
+def test_structural_codebook_transfer_to_aliases_cover_ccu_csru_and_pacu():
+    codebook = StructuralCodebook(
+        code2label={},
+        transition_map={"TRANSFER_TO": "close_open"},
+        window_type2id_map={"UNK": 0, "ED": 2, "INPATIENT": 3, "ICU": 4, "OR": 5},
+        window_type_map={"TRANSFER_TO": "INPATIENT"},
+    )
+
+    assert codebook.window_type_name(code="TRANSFER_TO//Cardiac Care Unit (CCU)") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//Cardiac Surgery Recovery Unit (CSRU)") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//PACU") == "OR"
+
+
 def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():
     t_birth = datetime(2000, 1, 1, 0, 0, 0)
     t_meas = datetime(2020, 1, 1, 0, 0, 0)
