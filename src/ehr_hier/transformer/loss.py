@@ -199,20 +199,23 @@ class AETLossModule(nn.Module):
         marker_mask = type_mask | end_mask | continue_mask
 
         ignored_special = torch.zeros_like(ar_valid)
+        candidate_nonmarker_special = torch.zeros_like(ar_valid)
         if (
             token_type_ids is not None
             and self.ignore_nonmarker_special_targets
         ):
             target_token_types = token_type_ids[..., 1:]
-            ignored_special = (
+            candidate_nonmarker_special = (
                 (target_token_types == int(self.special_type_id))
                 & ~marker_mask
                 & ar_valid
             )
+            ignored_special = candidate_nonmarker_special
             ar_valid = ar_valid & ~ignored_special
 
         stats = {
             "candidate_targets": int((attention_mask[..., 1:].to(dtype=torch.bool).sum().item()) if attention_mask is not None else ar_targets.numel()),
+            "candidate_nonmarker_special_targets": int(candidate_nonmarker_special.sum().item()),
             "ignored_nonmarker_special_targets": int(ignored_special.sum().item()),
         }
         return ar_targets, ar_valid, marker_mask, stats
@@ -363,6 +366,7 @@ class AETLossModule(nn.Module):
                 logs["n_token_supervised"] = int(ar_valid.sum().item())
             else:
                 logs["n_token_supervised"] = 0
+            logs["candidate_nonmarker_special_targets"] = int(ar_stats["candidate_nonmarker_special_targets"])
             logs["ignored_nonmarker_special_targets"] = int(ar_stats["ignored_nonmarker_special_targets"])
             logs["frac_unrouted"] = 0.0
 
@@ -528,7 +532,7 @@ class AETLossModule(nn.Module):
         pred_val = head_outputs.get("pred_values", None)
         target_vals = targets_dict.get("numeric_values", None)
         numeric_mask = targets_dict.get("numeric_mask", None)
-        if pred_val is not None and target_vals is not None:
+        if pred_val is not None and target_vals is not None and float(self.weights.get("val", 1.0)) != 0.0:
             pred_val = torch.nan_to_num(pred_val, nan=0.0, posinf=0.0, neginf=0.0)
             if using_unified_token_loss:
                 pred_val_shift = pred_val[..., :-1, :].squeeze(-1)
