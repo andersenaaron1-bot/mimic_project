@@ -670,6 +670,7 @@ def main() -> None:
         epoch_loss_sum = 0.0
         epoch_log_acc: Dict[str, float] = {}
         epoch_batches = 0
+        stopped_on_max_steps = False
         pbar = tqdm(train_loader, desc=f"train epoch {epoch}")
         for batch_idx, batch in enumerate(pbar, start=1):
             tensor_batch = _move_batch_to_device(batch, device)
@@ -766,13 +767,19 @@ def main() -> None:
                 )
 
             if global_step >= max_steps:
+                stopped_on_max_steps = True
                 break
 
         latest_train_metrics = {
             "loss": float(epoch_loss_sum) / float(max(1, epoch_batches)),
             **_mean_logs(epoch_log_acc, epoch_batches),
         }
-        if eval_loader is not None and (int(args.eval_every_steps) <= 0 or global_step % int(args.eval_every_steps) != 0):
+        should_run_final_eval = (
+            eval_loader is not None
+            and not stopped_on_max_steps
+            and (int(args.eval_every_steps) <= 0 or global_step % int(args.eval_every_steps) != 0)
+        )
+        if should_run_final_eval:
             latest_val_metrics = evaluate(
                 model=model,
                 criterion=criterion,
@@ -821,6 +828,7 @@ def main() -> None:
             "train": latest_train_metrics,
             "val": latest_val_metrics,
             "best_val_loss": best_val_loss,
+            "stopped_on_max_steps": bool(stopped_on_max_steps),
         }
         print(json.dumps(epoch_summary, indent=2))
         with log_jsonl.open("a", encoding="utf-8") as fp:
