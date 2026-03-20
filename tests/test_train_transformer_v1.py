@@ -3,7 +3,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from scripts.train_transformer_v1 import build_lr_lambda, build_optimizer_param_groups
+from scripts.train_transformer_v1 import build_lr_lambda, build_optimizer_param_groups, resolve_epoch_range
 
 
 class _TinyModel(nn.Module):
@@ -37,3 +37,9 @@ def test_build_lr_lambda_has_warmup_then_decay() -> None:
     assert vals[2] <= 1.0
     assert vals[-1] >= 0.1
     assert vals[-1] < vals[2]
+
+
+def test_resolve_epoch_range_treats_epochs_as_epochs_to_run() -> None:
+    assert list(resolve_epoch_range(start_epoch=1, epochs_to_run=1)) == [1]
+    assert list(resolve_epoch_range(start_epoch=2, epochs_to_run=1)) == [2]
+    assert list(resolve_epoch_range(start_epoch=2, epochs_to_run=3)) == [2, 3, 4]

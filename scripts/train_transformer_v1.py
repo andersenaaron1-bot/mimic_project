@@ -142,6 +142,13 @@ def build_lr_lambda(*, total_steps: int, warmup_steps: int, min_lr_scale: float)
     return _fn
 
 
+def resolve_epoch_range(*, start_epoch: int, epochs_to_run: int) -> range:
+    start_epoch = max(1, int(start_epoch))
+    epochs_to_run = max(1, int(epochs_to_run))
+    end_epoch = start_epoch + epochs_to_run - 1
+    return range(start_epoch, end_epoch + 1)
+
+
 class OnTheFlyTimelineDataset(Dataset):
     def __init__(
         self,
@@ -664,7 +671,7 @@ def main() -> None:
     latest_train_metrics: Dict[str, float] | None = None
     latest_val_metrics: Dict[str, float] | None = None
 
-    for epoch in range(start_epoch, max(1, int(args.epochs)) + 1):
+    for epoch in resolve_epoch_range(start_epoch=start_epoch, epochs_to_run=int(args.epochs)):
         model.train()
         optimizer.zero_grad(set_to_none=True)
         epoch_loss_sum = 0.0
