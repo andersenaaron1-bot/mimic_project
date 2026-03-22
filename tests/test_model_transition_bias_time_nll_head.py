@@ -59,7 +59,7 @@ def test_model_biases_transition_controls_with_time_nll_head() -> None:
         window_type_ids=window_type_ids,
     )
 
-    assert logits["logits_transition_boundary"][0, 0, 3, 1].item() != 0.0
-    assert logits["logits_transition_boundary"][0, 0, 2, 1].item() == 0.0
-    assert torch.any(logits["logits_boundary_next_window_type"][0, 0, 3, :].abs() > 1e-6)
+    assert logits["logits_transition_boundary"][0, 0, 2, 1].item() != 0.0
+    assert logits["logits_transition_boundary"][0, 0, 1, 1].item() == 0.0
+    assert torch.all(logits["logits_boundary_next_window_type"][0, 0, 2, :] == 0)
     assert torch.all(logits["logits_struct"] == 0)

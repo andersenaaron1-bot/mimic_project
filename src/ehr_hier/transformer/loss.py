@@ -169,6 +169,91 @@ class AETLossModule(nn.Module):
         continue_mask = target_ids == continue_id
         return type_mask, end_mask, continue_mask
 
+    def _predictive_marker_masks(
+        self,
+        *,
+        target_ids: torch.Tensor,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+    ) -> dict[str, torch.Tensor]:
+        if target_ids.ndim not in {3, 4}:
+            raise ValueError(
+                f"target_ids must be 3D or 4D for predictive marker masks, got shape {tuple(target_ids.shape)}"
+            )
+        if target_ids.shape[-1] < 2:
+            empty_shape = target_ids.shape[:-1] + (0,)
+            empty = torch.zeros(empty_shape, device=target_ids.device, dtype=torch.bool)
+            return {
+                "source_valid": empty,
+                "next_type": empty,
+                "next_end": empty,
+                "next_continue": empty,
+                "predict_continue": empty,
+                "predict_end": empty,
+            }
+
+        next_targets = target_ids[..., 1:]
+        next_type_mask, next_end_mask, next_continue_mask = self._marker_masks(next_targets)
+        source_valid = (
+            attention_mask[..., :-1].to(dtype=torch.bool) & attention_mask[..., 1:].to(dtype=torch.bool)
+            if attention_mask is not None
+            else torch.ones_like(next_targets, dtype=torch.bool)
+        )
+        if token_type_ids is not None:
+            source_non_special = token_type_ids[..., :-1] != int(self.special_type_id)
+        else:
+            source_non_special = torch.ones_like(source_valid)
+
+        predict_continue = source_valid & source_non_special & next_continue_mask
+        predict_end = source_valid & source_non_special & (next_end_mask | next_type_mask)
+        return {
+            "source_valid": source_valid,
+            "next_type": next_type_mask,
+            "next_end": next_end_mask,
+            "next_continue": next_continue_mask,
+            "predict_continue": predict_continue,
+            "predict_end": predict_end,
+        }
+
+    @classmethod
+    def _broadcast_next_window_targets(
+        cls,
+        *,
+        window_type_ids: torch.Tensor,
+        window_mask: torch.Tensor | None,
+        target_shape: torch.Size,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if window_type_ids.ndim != 2:
+            raise ValueError(f"window_type_ids must be (B,W), got shape {tuple(window_type_ids.shape)}")
+        B, W = window_type_ids.shape
+        if target_shape[:2] != (B, W):
+            raise ValueError(
+                "target_shape must align with window_type_ids on (B,W); "
+                f"got {tuple(target_shape[:2])} vs {(B, W)}"
+            )
+        if window_mask is None:
+            window_mask = torch.ones_like(window_type_ids, dtype=torch.long)
+        if window_mask.shape != (B, W):
+            raise ValueError(f"window_mask must be (B,W), got shape {tuple(window_mask.shape)}")
+
+        next_type_ids = torch.zeros_like(window_type_ids)
+        has_next_window = torch.zeros_like(window_mask, dtype=torch.bool)
+        if W >= 2:
+            next_type_ids[:, :-1] = window_type_ids[:, 1:]
+            has_next_window[:, :-1] = (
+                window_mask[:, :-1].to(dtype=torch.bool) & window_mask[:, 1:].to(dtype=torch.bool)
+            )
+
+        if len(target_shape) == 3:
+            next_type_ids = next_type_ids.unsqueeze(-1).expand(target_shape)
+            has_next_window = has_next_window.unsqueeze(-1).expand(target_shape)
+        elif len(target_shape) == 4:
+            next_type_ids = next_type_ids.unsqueeze(-1).unsqueeze(-1).expand(target_shape)
+            has_next_window = has_next_window.unsqueeze(-1).unsqueeze(-1).expand(target_shape)
+        else:
+            raise ValueError(f"target_shape must be 3D or 4D, got {tuple(target_shape)}")
+        return next_type_ids.to(dtype=torch.long), has_next_window
+
     def _autoregressive_targets(
         self,
         *,
@@ -326,6 +411,8 @@ class AETLossModule(nn.Module):
         attention_mask = targets_dict.get("attention_mask", None)
         valid = attention_mask.to(dtype=torch.bool) if attention_mask is not None else torch.ones_like(target_ids, dtype=torch.bool)
         token_type_ids = targets_dict.get("token_type_ids", None)
+        window_type_ids = targets_dict.get("window_type_ids", None)
+        window_mask = targets_dict.get("window_mask", None)
 
         total_loss = target_ids.new_zeros((), dtype=torch.float32)
         logs = {}
@@ -455,15 +542,14 @@ class AETLossModule(nn.Module):
                     "Update vocab_config['routing'] (or offsets/sizes) to cover all tokens."
                 )
 
-        attention_mask_local = targets_dict.get("attention_mask", None)
-        if attention_mask_local is not None:
-            boundary_positions = self._chunk_end_positions(attention_mask_local)
-        else:
-            boundary_positions = torch.zeros_like(target_ids, dtype=torch.bool)
-
-        type_mask = marker_type_mask_all
-        end_mask = marker_end_mask_all
-        continue_mask = marker_continue_mask_all
+        predictive_markers = self._predictive_marker_masks(
+            target_ids=target_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+        )
+        predict_continue_mask = predictive_markers["predict_continue"]
+        predict_end_mask = predictive_markers["predict_end"]
+        predict_next_type_mask = predictive_markers["next_type"]
 
         logits_transition_boundary = head_outputs.get("logits_transition_boundary", None)
         if logits_transition_boundary is not None:
@@ -475,13 +561,19 @@ class AETLossModule(nn.Module):
                     "logits_transition_boundary must be (...,2) aligned with input_ids; "
                     f"got {tuple(logits_transition_boundary.shape)} vs {tuple(target_ids.shape)}"
                 )
+            logits_transition_boundary = logits_transition_boundary[..., :-1, :]
+            if logits_transition_boundary.shape[:-1] != predict_end_mask.shape:
+                raise ValueError(
+                    "logits_transition_boundary autoregressive slice must align with predictive masks; "
+                    f"got {tuple(logits_transition_boundary.shape[:-1])} vs {tuple(predict_end_mask.shape)}"
+                )
 
-            supervise_continue = boundary_positions & continue_mask & valid
-            supervise_end = boundary_positions & (end_mask | type_mask) & valid
+            supervise_continue = predict_continue_mask
+            supervise_end = predict_end_mask
             supervise_mask = supervise_continue | supervise_end
 
             if supervise_mask.any():
-                targets_boundary = torch.zeros_like(target_ids, dtype=torch.long)
+                targets_boundary = torch.zeros_like(predict_end_mask, dtype=torch.long)
                 targets_boundary[supervise_end] = 1
                 loss_boundary = self.ce_loss(
                     logits_transition_boundary[supervise_mask],
@@ -509,11 +601,32 @@ class AETLossModule(nn.Module):
                     "logits_boundary_next_window_type must be (*input_shape, num_window_types); "
                     f"got {tuple(logits_boundary_next_window_type.shape)} expected {tuple(expected_shape)}"
                 )
+            logits_boundary_next_window_type = logits_boundary_next_window_type[..., :-1, :]
+            if logits_boundary_next_window_type.shape[:-1] != predict_end_mask.shape:
+                raise ValueError(
+                    "logits_boundary_next_window_type autoregressive slice must align with predictive masks; "
+                    f"got {tuple(logits_boundary_next_window_type.shape[:-1])} vs {tuple(predict_end_mask.shape)}"
+                )
 
-            type_boundary_mask = boundary_positions & type_mask & valid
-            if type_boundary_mask.any():
+            if window_type_ids is not None:
+                if window_mask is None:
+                    window_mask = (
+                        self._default_window_mask(attention_mask)
+                        if attention_mask is not None
+                        else torch.ones_like(window_type_ids, dtype=torch.long)
+                    )
+                targets_next_type, has_next_window = self._broadcast_next_window_targets(
+                    window_type_ids=window_type_ids,
+                    window_mask=window_mask,
+                    target_shape=predict_end_mask.shape,
+                )
+                type_boundary_mask = predict_end_mask & has_next_window
+            else:
                 type_start = int(self._marker_info["type_start"])
-                targets_next_type = (target_ids - type_start).to(dtype=torch.long)
+                targets_next_type = (target_ids[..., 1:] - type_start).to(dtype=torch.long)
+                type_boundary_mask = predict_end_mask & predict_next_type_mask
+
+            if type_boundary_mask.any():
                 loss_next_type_boundary = self.ce_loss(
                     logits_boundary_next_window_type[type_boundary_mask],
                     targets_next_type[type_boundary_mask],
@@ -563,8 +676,6 @@ class AETLossModule(nn.Module):
                 logs["loss_val"] = float(loss.mean().item())
 
         logits_next_window_type = head_outputs.get("logits_next_window_type", None)
-        window_type_ids = targets_dict.get("window_type_ids", None)
-        window_mask = targets_dict.get("window_mask", None)
         if logits_next_window_type is not None and window_type_ids is not None:
             logits_next_window_type = torch.nan_to_num(
                 logits_next_window_type, nan=0.0, posinf=0.0, neginf=0.0
