@@ -383,6 +383,7 @@ def main() -> None:
     ap.add_argument("--eval_every_steps", type=int, default=500)
     ap.add_argument("--max_eval_batches", type=int, default=None)
     ap.add_argument("--resume_from", default=None)
+    ap.add_argument("--eval_only", action="store_true")
 
     ap.add_argument("--max_windows", type=int, default=32)
     ap.add_argument("--max_chunks_per_window", type=int, default=4)
@@ -665,6 +666,37 @@ def main() -> None:
         },
     }
     (output_dir / "run_config.json").write_text(json.dumps(run_meta, indent=2), encoding="utf-8")
+
+    if args.eval_only:
+        if not args.resume_from:
+            raise ValueError("--eval_only requires --resume_from to load a trained checkpoint.")
+        if eval_loader is None:
+            raise ValueError("--eval_only requires a non-empty eval loader.")
+        latest_val_metrics = evaluate(
+            model=model,
+            criterion=criterion,
+            dataloader=eval_loader,
+            device=device,
+            autocast_enabled=autocast_enabled,
+            autocast_dtype=autocast_dtype,
+            max_batches=args.max_eval_batches,
+        )
+        eval_payload = {
+            "event": "eval_only",
+            "checkpoint": str(args.resume_from),
+            "epoch": int(start_epoch - 1),
+            "global_step": int(global_step),
+            "best_val_loss": best_val_loss,
+            "val": latest_val_metrics,
+        }
+        print(json.dumps(eval_payload, indent=2))
+        (output_dir / "eval_only_metrics.json").write_text(
+            json.dumps(eval_payload, indent=2),
+            encoding="utf-8",
+        )
+        with log_jsonl.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(eval_payload) + "\n")
+        return
 
     grad_accum_steps = max(1, int(args.grad_accum_steps))
     max_steps = max(1, int(args.max_steps))

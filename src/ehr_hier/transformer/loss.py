@@ -1,5 +1,5 @@
 import math
-from typing import Dict
+from typing import Dict, List, Tuple
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,22 @@ class AETLossModule(nn.Module):
       - train with shifted autoregressive next-token targets inside each local chunk
       - keep transition/window heads as auxiliary supervision
     """
+
+    TOKEN_FAMILY_GROUPS: Tuple[str, ...] = (
+        "diagnosis",
+        "diagnosis_residual",
+        "procedure",
+        "procedure_residual",
+        "medication",
+        "medication_residual",
+        "measurement_code",
+        "measurement_value",
+        "observation_code",
+        "observation_value",
+        "structural",
+        "special_marker",
+        "unk",
+    )
 
     def __init__(
         self,
@@ -57,6 +73,9 @@ class AETLossModule(nn.Module):
         self.mse_loss = nn.MSELoss(reduction="none")
         self.routing = self._build_routing(self.vocab_config)
         self._marker_info = self._build_marker_info(self.vocab_config)
+        token_family_names, token_family_ids = self._build_token_family_group_ids(self.vocab_config)
+        self._token_family_group_names = token_family_names
+        self.register_buffer("_token_family_group_ids", token_family_ids, persistent=False)
 
     @staticmethod
     def _build_marker_info(vocab_config: dict) -> dict[str, int]:
@@ -108,6 +127,94 @@ class AETLossModule(nn.Module):
             "logits_meas": [{"offset": _need("MEAS"), "size": size_meas, "name": "MEAS"}],
             "logits_medtok": [{"offset": _need("MED"), "size": size_med, "name": "MED"}],
         }
+
+    @classmethod
+    def _build_token_family_group_ids(cls, vocab_config: dict) -> tuple[Tuple[str, ...], torch.Tensor]:
+        group_names = tuple(cls.TOKEN_FAMILY_GROUPS)
+        total_size = int(vocab_config.get("total_size", 0))
+        if total_size <= 0:
+            return group_names, torch.empty((0,), dtype=torch.long)
+
+        group_to_idx = {name: idx for idx, name in enumerate(group_names)}
+        dense_group_ids = torch.full((total_size,), fill_value=-1, dtype=torch.long)
+        unk_dense_id = int(vocab_config.get("unk_dense_id", 0))
+        if 0 <= unk_dense_id < total_size:
+            dense_group_ids[unk_dense_id] = int(group_to_idx["unk"])
+
+        dense_blocks = vocab_config.get("dense_blocks", [])
+        if not isinstance(dense_blocks, list):
+            return group_names, dense_group_ids
+
+        sparse_contract = vocab_config.get("sparse_vocab_contract", {})
+        families = sparse_contract.get("families", {}) if isinstance(sparse_contract, dict) else {}
+        family_offsets: Dict[str, int] = {}
+        if isinstance(families, dict):
+            for name, payload in families.items():
+                if isinstance(payload, dict) and "offset" in payload:
+                    family_offsets[str(name)] = int(payload["offset"])
+
+        block_to_group = {
+            "diagnosis": "diagnosis",
+            "diagnosis_residual": "diagnosis_residual",
+            "procedure": "procedure",
+            "procedure_residual": "procedure_residual",
+            "medication": "medication",
+            "medication_residual": "medication_residual",
+            "measurement_code": "measurement_code",
+            "measurement_value": "measurement_value",
+            "observation_code": "observation_code",
+            "observation_value": "observation_value",
+            "structural": "structural",
+        }
+
+        type_start = int(vocab_config.get("offsets", {}).get("SPECIAL", 0)) + int(
+            vocab_config.get("window_markers", {}).get("type_token_offset", 0)
+        )
+        num_types = int(vocab_config.get("window_markers", {}).get("num_types", 0))
+        type_end_excl = type_start + max(0, num_types)
+        end_id = int(vocab_config.get("offsets", {}).get("SPECIAL", 0)) + int(
+            vocab_config.get("window_markers", {}).get("end_token_id", type_end_excl)
+        )
+        continue_id = int(vocab_config.get("offsets", {}).get("SPECIAL", 0)) + int(
+            vocab_config.get("window_markers", {}).get("continue_token_id", end_id + 1)
+        )
+
+        def _is_marker(dense_id: int) -> bool:
+            return (type_start <= dense_id < type_end_excl) or dense_id in {end_id, continue_id}
+
+        for block in dense_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_name = str(block.get("name", ""))
+            dense_offset = int(block.get("dense_offset", 0))
+            dense_size = int(block.get("dense_size", 0))
+            global_offset = int(block.get("global_offset", 0))
+            sparse_ids = block.get("sparse_global_ids", None)
+            family_offset = family_offsets.get(block_name, global_offset)
+            block_group = block_to_group.get(block_name, None)
+
+            for local_idx in range(max(0, dense_size)):
+                dense_id = dense_offset + local_idx
+                if dense_id < 0 or dense_id >= total_size:
+                    continue
+                sparse_global_id = (
+                    int(sparse_ids[local_idx])
+                    if isinstance(sparse_ids, list) and local_idx < len(sparse_ids)
+                    else int(global_offset) + int(local_idx)
+                )
+
+                if block_name == "special":
+                    if _is_marker(dense_id):
+                        dense_group_ids[dense_id] = int(group_to_idx["special_marker"])
+                    continue
+
+                if int(sparse_global_id) == int(family_offset):
+                    dense_group_ids[dense_id] = int(group_to_idx["unk"])
+                    continue
+                if block_group is not None:
+                    dense_group_ids[dense_id] = int(group_to_idx[block_group])
+
+        return group_names, dense_group_ids
 
     @staticmethod
     def _default_window_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -305,6 +412,43 @@ class AETLossModule(nn.Module):
         }
         return ar_targets, ar_valid, marker_mask, stats
 
+    def _log_token_family_metrics(
+        self,
+        *,
+        ar_logits: torch.Tensor,
+        ar_targets: torch.Tensor,
+        ar_valid: torch.Tensor,
+        pred_next: torch.Tensor,
+        logs: Dict[str, float],
+    ) -> None:
+        group_ids = self._token_family_group_ids
+        group_names = self._token_family_group_names
+        for group_name in group_names:
+            logs[f"n_token_family_{group_name}"] = 0
+
+        if group_ids.numel() == 0 or not ar_valid.any():
+            return
+
+        valid_targets = ar_targets[ar_valid]
+        valid_logits = ar_logits[ar_valid]
+        valid_preds = pred_next[ar_valid]
+
+        target_groups = torch.full_like(valid_targets, fill_value=-1, dtype=torch.long)
+        in_bounds = (valid_targets >= 0) & (valid_targets < int(group_ids.shape[0]))
+        if in_bounds.any():
+            target_groups[in_bounds] = group_ids[valid_targets[in_bounds]]
+
+        for group_idx, group_name in enumerate(group_names):
+            group_mask = target_groups == int(group_idx)
+            count = int(group_mask.sum().item())
+            logs[f"n_token_family_{group_name}"] = count
+            if count <= 0:
+                continue
+            group_loss = self.ce_loss(valid_logits[group_mask], valid_targets[group_mask]).mean()
+            group_acc = (valid_preds[group_mask] == valid_targets[group_mask]).to(dtype=torch.float32).mean()
+            logs[f"loss_token_family_{group_name}"] = float(group_loss.item())
+            logs[f"acc_token_family_{group_name}"] = float(group_acc.item())
+
     @classmethod
     def _window_targets(
         cls,
@@ -451,8 +595,22 @@ class AETLossModule(nn.Module):
                 acc_token = (pred_next[ar_valid] == ar_targets[ar_valid]).to(dtype=torch.float32).mean()
                 logs["acc_token"] = float(acc_token.item())
                 logs["n_token_supervised"] = int(ar_valid.sum().item())
+                self._log_token_family_metrics(
+                    ar_logits=ar_logits,
+                    ar_targets=ar_targets,
+                    ar_valid=ar_valid,
+                    pred_next=pred_next,
+                    logs=logs,
+                )
             else:
                 logs["n_token_supervised"] = 0
+                self._log_token_family_metrics(
+                    ar_logits=ar_logits,
+                    ar_targets=ar_targets,
+                    ar_valid=ar_valid,
+                    pred_next=ar_logits.argmax(dim=-1),
+                    logs=logs,
+                )
             logs["candidate_nonmarker_special_targets"] = int(ar_stats["candidate_nonmarker_special_targets"])
             logs["ignored_nonmarker_special_targets"] = int(ar_stats["ignored_nonmarker_special_targets"])
             logs["frac_unrouted"] = 0.0
