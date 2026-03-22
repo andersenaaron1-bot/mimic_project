@@ -312,10 +312,11 @@ def main() -> None:
     if args.subject_id is not None:
         subject_id = int(args.subject_id)
     else:
+        subject_cap = max(1, int(args.subject_index) + 1)
         subject_ids = _load_subject_ids(
             str(effective.splits_parquet),
             split,
-            None,
+            subject_cap,
             sample_seed=sample_seed,
         )
         if not subject_ids:
