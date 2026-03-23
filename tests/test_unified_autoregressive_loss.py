@@ -349,3 +349,83 @@ def test_unified_token_logs_family_stratified_metrics() -> None:
         assert logs[f"n_token_family_{group_name}"] == 1
         assert logs[f"acc_token_family_{group_name}"] == 1.0
         assert logs[f"loss_token_family_{group_name}"] < 1e-3
+
+
+def test_unified_token_family_weights_affect_optimized_loss_not_reported_accuracy() -> None:
+    from ehr_hier.transformer.loss import AETLossModule
+
+    vocab_config = {
+        "total_size": 18,
+        "size_special": 16,
+        "size_rvq": 0,
+        "size_meas_labels": 0,
+        "size_meds": 2,
+        "offsets": {"SPECIAL": 0, "RVQ": 16, "MEAS": 16, "MED": 16},
+        "window_markers": {
+            "type_token_offset": 10,
+            "num_types": 4,
+            "end_token_id": 14,
+            "continue_token_id": 15,
+        },
+        "dense_blocks": [
+            {
+                "name": "special",
+                "dense_offset": 0,
+                "dense_size": 16,
+                "global_offset": 0,
+                "sparse_global_ids": list(range(16)),
+            },
+            {
+                "name": "structural",
+                "dense_offset": 16,
+                "dense_size": 2,
+                "global_offset": 2_200_000,
+                "sparse_global_ids": [2_200_000, 2_200_001],
+            },
+        ],
+        "sparse_vocab_contract": {
+            "families": {
+                "special": {"offset": 0},
+                "structural": {"offset": 2_200_000},
+            }
+        },
+    }
+
+    target_ids = torch.tensor([[[[2, 11, 17]]]], dtype=torch.long)
+    attention_mask = torch.tensor([[[[1, 1, 1]]]], dtype=torch.long)
+    token_type_ids = torch.tensor([[[[0, 0, 5]]]], dtype=torch.long)
+    logits_token = torch.zeros((1, 1, 1, 3, 18), dtype=torch.float)
+    logits_token[0, 0, 0, 0, 0] = 10.0
+    logits_token[0, 0, 0, 1, 17] = 20.0
+
+    baseline = AETLossModule(
+        vocab_config=vocab_config,
+        strict_routing=True,
+        weights={"token": 1.0, "val": 0.0},
+    )
+    weighted = AETLossModule(
+        vocab_config=vocab_config,
+        token_family_weights={"special_marker": 5.0},
+        strict_routing=True,
+        weights={"token": 1.0, "val": 0.0},
+    )
+
+    batch = {
+        "input_ids": target_ids,
+        "attention_mask": attention_mask,
+        "token_type_ids": token_type_ids,
+        "numeric_values": torch.zeros((1, 1, 1, 3, 1), dtype=torch.float),
+        "numeric_mask": torch.zeros((1, 1, 1, 3), dtype=torch.long),
+    }
+    head_outputs = {
+        "logits_token": logits_token,
+        "pred_values": torch.zeros((1, 1, 1, 3, 1), dtype=torch.float),
+    }
+
+    loss_base, logs_base = baseline(head_outputs, batch)
+    loss_weighted, logs_weighted = weighted(head_outputs, batch)
+
+    assert logs_base["acc_token"] == logs_weighted["acc_token"]
+    assert logs_base["loss_token"] == logs_weighted["loss_token"]
+    assert logs_weighted["loss_token_weighted"] > logs_base["loss_token"]
+    assert loss_weighted.item() > loss_base.item()

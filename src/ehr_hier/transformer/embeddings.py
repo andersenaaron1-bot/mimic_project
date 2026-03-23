@@ -116,12 +116,22 @@ class AETEmbeddings(nn.Module):
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
 
-    def forward(self, input_ids, numeric_values, *, window_type_ids=None, token_type_ids=None):
+    def forward(
+        self,
+        input_ids,
+        numeric_values,
+        *,
+        numeric_mask=None,
+        window_type_ids=None,
+        token_type_ids=None,
+    ):
         """
         Args:
             input_ids: (Batch, Windows, Len) or (Batch, Windows, Chunks, Len) LongTensor
             numeric_values: matching float tensor with trailing singleton channel.
                             Note: Must be 0.0 for tokens without values!
+            numeric_mask: Optional mask matching input_ids without trailing channel.
+                          When provided, value projections are applied only where mask==1.
             window_type_ids: Optional (Batch, Num_Windows) LongTensor of per-window type ids.
             token_type_ids: Optional (Batch, Num_Windows, Seq) LongTensor of TokenCategory ids.
         """
@@ -129,13 +139,16 @@ class AETEmbeddings(nn.Module):
         x = self.token_embedding(input_ids)
 
         # 2. Embed Value (Side Channel)
-        # numeric_values is (B, S, 1)
+        # numeric_values is (..., 1)
         val_emb = self.value_encoder(numeric_values)
+        if numeric_mask is None:
+            numeric_mask = numeric_values.ne(0).any(dim=-1)
+        else:
+            numeric_mask = numeric_mask.to(dtype=torch.bool)
+        val_emb = val_emb * numeric_mask.unsqueeze(-1).to(dtype=val_emb.dtype)
 
         # 3. Fuse
-        # x = Identity + Value
-        # For tokens where value=0, val_emb should be close to 0 vector (due to Linear bias init)
-        # Ideally, Linear bias should be 0 init, or use Masking if strict 0 is needed.
+        # x = Identity + masked Value
         x = x + val_emb
 
         # 4. Window type segment embedding (optional)

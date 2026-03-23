@@ -44,6 +44,24 @@ from src.ehr_hier.transformer.vocab_runtime import (  # noqa: E402
     load_runtime_vocab_bundle,
 )
 
+TOKEN_FAMILY_WEIGHT_PRESETS: Dict[str, Dict[str, float]] = {
+    "none": {},
+    "semantic_boost_v1": {
+        "diagnosis": 3.0,
+        "diagnosis_residual": 2.5,
+        "procedure": 5.0,
+        "procedure_residual": 3.0,
+        "medication": 2.0,
+        "medication_residual": 1.5,
+        "measurement_value": 0.5,
+        "observation_code": 0.75,
+        "observation_value": 0.75,
+        "structural": 0.75,
+        "special_marker": 0.5,
+        "unk": 0.1,
+    },
+}
+
 
 @dataclass
 class TrainModelConfig:
@@ -147,6 +165,41 @@ def resolve_epoch_range(*, start_epoch: int, epochs_to_run: int) -> range:
     epochs_to_run = max(1, int(epochs_to_run))
     end_epoch = start_epoch + epochs_to_run - 1
     return range(start_epoch, end_epoch + 1)
+
+
+def resolve_token_family_weights(
+    *,
+    preset: str = "none",
+    overrides: Iterable[str] | None = None,
+) -> Dict[str, float]:
+    preset_key = str(preset or "none").strip() or "none"
+    if preset_key not in TOKEN_FAMILY_WEIGHT_PRESETS:
+        raise KeyError(
+            f"Unknown token family weight preset {preset_key!r}; expected one of {sorted(TOKEN_FAMILY_WEIGHT_PRESETS)}"
+        )
+    resolved = dict(TOKEN_FAMILY_WEIGHT_PRESETS[preset_key])
+    allowed = set(AETLossModule.TOKEN_FAMILY_GROUPS)
+    for raw in overrides or []:
+        item = str(raw).strip()
+        if not item:
+            continue
+        if "=" not in item:
+            raise ValueError(
+                f"Invalid --token_family_weight entry {item!r}; expected format family=value"
+            )
+        name, value = item.split("=", 1)
+        family = str(name).strip()
+        if family not in allowed:
+            raise KeyError(
+                f"Unknown token family {family!r}; expected one of {sorted(allowed)}"
+            )
+        weight = float(str(value).strip())
+        if not math.isfinite(weight) or weight <= 0.0:
+            raise ValueError(
+                f"Token family weight for {family!r} must be finite and > 0, got {value!r}"
+            )
+        resolved[family] = weight
+    return resolved
 
 
 class OnTheFlyTimelineDataset(Dataset):
@@ -259,6 +312,7 @@ def _run_model_and_loss(
             numeric_values=tensor_batch["numeric_values"],
             token_type_ids=tensor_batch["token_type_ids"],
             attention_mask=tensor_batch["attention_mask"],
+            numeric_mask=tensor_batch.get("numeric_mask", None),
             window_start_times=tensor_batch.get("window_start_times", None),
             window_mask=tensor_batch.get("window_mask", None),
             window_type_ids=tensor_batch.get("window_type_ids", None),
@@ -416,6 +470,17 @@ def main() -> None:
     ap.add_argument("--emit_switched_heads", action="store_true")
 
     ap.add_argument("--token_loss_weight", type=float, default=1.0)
+    ap.add_argument(
+        "--token_family_weight_preset",
+        choices=sorted(TOKEN_FAMILY_WEIGHT_PRESETS.keys()),
+        default="none",
+    )
+    ap.add_argument(
+        "--token_family_weight",
+        action="append",
+        default=[],
+        help="Optional per-family unified token loss reweighting, e.g. diagnosis=3.0",
+    )
     ap.add_argument("--value_loss_weight", type=float, default=0.0)
     ap.add_argument("--transition_loss_weight", type=float, default=1.0)
     ap.add_argument("--win_boundary_loss_weight", type=float, default=1.0)
@@ -608,9 +673,14 @@ def main() -> None:
         enable_transition_bias=not bool(args.disable_transition_bias),
         emit_switched_heads=bool(args.emit_switched_heads),
     )
+    token_family_weights = resolve_token_family_weights(
+        preset=str(args.token_family_weight_preset),
+        overrides=args.token_family_weight,
+    )
     model = AdaptiveEpisodicTransformer(model_cfg, vocab_config).to(device)
     criterion = AETLossModule(
         vocab_config=vocab_config,
+        token_family_weights=token_family_weights,
         strict_routing=True,
         weights={
             "token": float(args.token_loss_weight),
@@ -656,6 +726,7 @@ def main() -> None:
 
     run_meta = {
         "args": vars(args),
+        "token_family_weights": token_family_weights,
         "model_config": asdict(model_cfg),
         "vocab_summary": {
             "total_size": int(vocab_config["total_size"]),

@@ -42,6 +42,7 @@ class AETLossModule(nn.Module):
         *,
         vocab_config: dict,
         weights: dict | None = None,
+        token_family_weights: dict[str, float] | None = None,
         strict_routing: bool = True,
         prefer_unified_token_loss: bool = True,
         ignore_nonmarker_special_targets: bool = True,
@@ -76,6 +77,11 @@ class AETLossModule(nn.Module):
         token_family_names, token_family_ids = self._build_token_family_group_ids(self.vocab_config)
         self._token_family_group_names = token_family_names
         self.register_buffer("_token_family_group_ids", token_family_ids, persistent=False)
+        token_family_loss_weights = self._build_token_family_loss_weights(
+            token_family_names,
+            token_family_weights,
+        )
+        self.register_buffer("_token_family_loss_weights", token_family_loss_weights, persistent=False)
 
     @staticmethod
     def _build_marker_info(vocab_config: dict) -> dict[str, int]:
@@ -215,6 +221,28 @@ class AETLossModule(nn.Module):
                     dense_group_ids[dense_id] = int(group_to_idx[block_group])
 
         return group_names, dense_group_ids
+
+    @classmethod
+    def _build_token_family_loss_weights(
+        cls,
+        group_names: Tuple[str, ...],
+        token_family_weights: dict[str, float] | None,
+    ) -> torch.Tensor:
+        weights = torch.ones((len(group_names),), dtype=torch.float32)
+        if not token_family_weights:
+            return weights
+
+        group_to_idx = {name: idx for idx, name in enumerate(group_names)}
+        for name, value in token_family_weights.items():
+            if name not in group_to_idx:
+                raise KeyError(
+                    f"Unknown token family weight {name!r}; expected one of {sorted(group_to_idx)}"
+                )
+            weight_val = float(value)
+            if not math.isfinite(weight_val) or weight_val <= 0.0:
+                raise ValueError(f"Token family weight for {name!r} must be finite and > 0, got {value!r}")
+            weights[int(group_to_idx[name])] = weight_val
+        return weights
 
     @staticmethod
     def _default_window_mask(attention_mask: torch.Tensor) -> torch.Tensor:
@@ -412,31 +440,32 @@ class AETLossModule(nn.Module):
         }
         return ar_targets, ar_valid, marker_mask, stats
 
+    def _target_groups_for_valid_targets(self, valid_targets: torch.Tensor) -> torch.Tensor:
+        group_ids = self._token_family_group_ids
+        target_groups = torch.full_like(valid_targets, fill_value=-1, dtype=torch.long)
+        if group_ids.numel() == 0 or valid_targets.numel() == 0:
+            return target_groups
+        in_bounds = (valid_targets >= 0) & (valid_targets < int(group_ids.shape[0]))
+        if in_bounds.any():
+            target_groups[in_bounds] = group_ids[valid_targets[in_bounds]]
+        return target_groups
+
     def _log_token_family_metrics(
         self,
         *,
-        ar_logits: torch.Tensor,
-        ar_targets: torch.Tensor,
-        ar_valid: torch.Tensor,
-        pred_next: torch.Tensor,
+        valid_logits: torch.Tensor,
+        valid_targets: torch.Tensor,
+        valid_preds: torch.Tensor,
         logs: Dict[str, float],
     ) -> None:
-        group_ids = self._token_family_group_ids
         group_names = self._token_family_group_names
         for group_name in group_names:
             logs[f"n_token_family_{group_name}"] = 0
 
-        if group_ids.numel() == 0 or not ar_valid.any():
+        if valid_targets.numel() == 0:
             return
 
-        valid_targets = ar_targets[ar_valid]
-        valid_logits = ar_logits[ar_valid]
-        valid_preds = pred_next[ar_valid]
-
-        target_groups = torch.full_like(valid_targets, fill_value=-1, dtype=torch.long)
-        in_bounds = (valid_targets >= 0) & (valid_targets < int(group_ids.shape[0]))
-        if in_bounds.any():
-            target_groups[in_bounds] = group_ids[valid_targets[in_bounds]]
+        target_groups = self._target_groups_for_valid_targets(valid_targets)
 
         for group_idx, group_name in enumerate(group_names):
             group_mask = target_groups == int(group_idx)
@@ -588,27 +617,40 @@ class AETLossModule(nn.Module):
                     f"got {tuple(ar_logits.shape[:-1])} vs {tuple(ar_targets.shape)}"
                 )
             if ar_valid.any():
-                loss_token = self.ce_loss(ar_logits[ar_valid], ar_targets[ar_valid]).mean()
-                total_loss = total_loss + float(self.weights.get("token", 1.0)) * loss_token
-                logs["loss_token"] = float(loss_token.item())
                 pred_next = ar_logits.argmax(dim=-1)
-                acc_token = (pred_next[ar_valid] == ar_targets[ar_valid]).to(dtype=torch.float32).mean()
+                valid_logits = ar_logits[ar_valid]
+                valid_targets = ar_targets[ar_valid]
+                valid_preds = pred_next[ar_valid]
+                token_losses = self.ce_loss(valid_logits, valid_targets)
+                loss_token_unweighted = token_losses.mean()
+                target_groups = self._target_groups_for_valid_targets(valid_targets)
+                loss_weights = torch.ones_like(token_losses)
+                if self._token_family_loss_weights.numel() > 0:
+                    in_groups = target_groups >= 0
+                    if in_groups.any():
+                        loss_weights[in_groups] = self._token_family_loss_weights[
+                            target_groups[in_groups]
+                        ].to(dtype=token_losses.dtype, device=token_losses.device)
+                loss_token_weighted = (token_losses * loss_weights).sum() / loss_weights.sum().clamp(min=1.0)
+                total_loss = total_loss + float(self.weights.get("token", 1.0)) * loss_token_weighted
+                logs["loss_token"] = float(loss_token_unweighted.item())
+                if not torch.allclose(loss_weights, torch.ones_like(loss_weights)):
+                    logs["loss_token_weighted"] = float(loss_token_weighted.item())
+                acc_token = (valid_preds == valid_targets).to(dtype=torch.float32).mean()
                 logs["acc_token"] = float(acc_token.item())
                 logs["n_token_supervised"] = int(ar_valid.sum().item())
                 self._log_token_family_metrics(
-                    ar_logits=ar_logits,
-                    ar_targets=ar_targets,
-                    ar_valid=ar_valid,
-                    pred_next=pred_next,
+                    valid_logits=valid_logits,
+                    valid_targets=valid_targets,
+                    valid_preds=valid_preds,
                     logs=logs,
                 )
             else:
                 logs["n_token_supervised"] = 0
                 self._log_token_family_metrics(
-                    ar_logits=ar_logits,
-                    ar_targets=ar_targets,
-                    ar_valid=ar_valid,
-                    pred_next=ar_logits.argmax(dim=-1),
+                    valid_logits=ar_logits.new_zeros((0, ar_logits.shape[-1])),
+                    valid_targets=ar_targets.new_zeros((0,), dtype=torch.long),
+                    valid_preds=ar_targets.new_zeros((0,), dtype=torch.long),
                     logs=logs,
                 )
             logs["candidate_nonmarker_special_targets"] = int(ar_stats["candidate_nonmarker_special_targets"])

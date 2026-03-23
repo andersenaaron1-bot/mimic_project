@@ -251,6 +251,7 @@ class AdaptiveEpisodicTransformer(nn.Module):
         numeric_values,
         token_type_ids,
         attention_mask,
+        numeric_mask=None,
         prev_global_state=None,
         window_start_times=None,
         window_mask=None,
@@ -265,6 +266,8 @@ class AdaptiveEpisodicTransformer(nn.Module):
             input_ids = input_ids.unsqueeze(2)
             time_ids = time_ids.unsqueeze(2)
             numeric_values = numeric_values.unsqueeze(2)
+            if numeric_mask is not None:
+                numeric_mask = numeric_mask.unsqueeze(2)
             token_type_ids = token_type_ids.unsqueeze(2)
             attention_mask = attention_mask.unsqueeze(2)
         elif input_ids.ndim != 4:
@@ -294,6 +297,7 @@ class AdaptiveEpisodicTransformer(nn.Module):
         x = self.embeddings(
             input_ids,
             numeric_values,
+            numeric_mask=numeric_mask,
             window_type_ids=window_type_ids,
             token_type_ids=token_type_ids,
         )

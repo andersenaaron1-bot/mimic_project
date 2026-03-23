@@ -3,7 +3,12 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from scripts.train_transformer_v1 import build_lr_lambda, build_optimizer_param_groups, resolve_epoch_range
+from scripts.train_transformer_v1 import (
+    build_lr_lambda,
+    build_optimizer_param_groups,
+    resolve_epoch_range,
+    resolve_token_family_weights,
+)
 
 
 class _TinyModel(nn.Module):
@@ -43,3 +48,14 @@ def test_resolve_epoch_range_treats_epochs_as_epochs_to_run() -> None:
     assert list(resolve_epoch_range(start_epoch=1, epochs_to_run=1)) == [1]
     assert list(resolve_epoch_range(start_epoch=2, epochs_to_run=1)) == [2]
     assert list(resolve_epoch_range(start_epoch=2, epochs_to_run=3)) == [2, 3, 4]
+
+
+def test_resolve_token_family_weights_merges_preset_and_overrides() -> None:
+    weights = resolve_token_family_weights(
+        preset="semantic_boost_v1",
+        overrides=["measurement_value=0.25", "diagnosis=4.0"],
+    )
+    assert weights["diagnosis"] == 4.0
+    assert weights["measurement_value"] == 0.25
+    assert weights["procedure"] == 5.0
+    assert weights["unk"] == 0.1

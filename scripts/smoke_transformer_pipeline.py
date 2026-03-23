@@ -296,6 +296,7 @@ def main() -> None:
         numeric_values=tensor_batch["numeric_values"],
         token_type_ids=tensor_batch["token_type_ids"],
         attention_mask=tensor_batch["attention_mask"],
+        numeric_mask=tensor_batch.get("numeric_mask", None),
         window_start_times=tensor_batch.get("window_start_times", None),
         window_mask=tensor_batch.get("window_mask", None),
         window_type_ids=tensor_batch.get("window_type_ids", None),

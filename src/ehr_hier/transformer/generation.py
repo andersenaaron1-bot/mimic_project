@@ -790,6 +790,7 @@ def rollout_subject_with_model(
                 numeric_values=batch["numeric_values"],
                 token_type_ids=batch["token_type_ids"],
                 attention_mask=batch["attention_mask"],
+                numeric_mask=batch["numeric_mask"],
                 window_start_times=batch["window_start_times"],
                 window_mask=batch["window_mask"],
                 window_type_ids=batch["window_type_ids"],

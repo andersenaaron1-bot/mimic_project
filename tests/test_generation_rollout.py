@@ -92,6 +92,7 @@ class _ScriptedRolloutModel(torch.nn.Module):
         input_ids,
         time_ids,
         numeric_values,
+        numeric_mask,
         token_type_ids,
         attention_mask,
         window_start_times,
