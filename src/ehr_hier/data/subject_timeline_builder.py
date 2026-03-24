@@ -221,6 +221,11 @@ def build_subject_timeline(
         if structural_codebook is None or code_str is None:
             return {}, None
         transition_action = structural_codebook.transition_action(code=code_str, label=label)
+        transition_window_type_name = structural_codebook.window_type_name(
+            code=code_str,
+            label=label,
+            action=transition_action,
+        )
         transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
         transition_window_type_id = structural_codebook.window_type_id(
             code=code_str,
@@ -259,6 +264,12 @@ def build_subject_timeline(
             attrs["transition_discharge_like"] = 1
         if code_prefix == "MEDS_DEATH":
             attrs["transition_death_like"] = 1
+        if transition_window_type_name == "ED":
+            attrs["transition_ed_like"] = 1
+        if transition_window_type_name == "ICU":
+            attrs["transition_icu_like"] = 1
+        if transition_window_type_name == "OR":
+            attrs["transition_or_like"] = 1
         return attrs, transition_action
 
     def _struct_surface_for_event(*, code_str: Optional[str], category: TokenCategory) -> Optional[str]:

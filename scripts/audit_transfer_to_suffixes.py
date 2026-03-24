@@ -17,7 +17,12 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from scripts.audit_tokenization_flow import _load_subject_ids
-from src.ehr_hier.data.structural_codes import load_structural_codebook_yaml
+from src.ehr_hier.data.structural_codes import (
+    load_structural_codebook_yaml,
+    looks_ed_location,
+    looks_icu_location,
+    looks_or_location,
+)
 
 
 def _code_suffix(code: str) -> str:
@@ -34,9 +39,9 @@ def _normalize_space(text: str) -> str:
 def _pathway_flags(text: str) -> Dict[str, int]:
     upper = str(text).upper()
     return {
-        "looks_ed": int("//ED//" in upper or "EMERGENCY DEPARTMENT" in upper or "EMERGENCY ROOM" in upper),
-        "looks_icu": int("ICU" in upper or "MICU" in upper or "SICU" in upper or "CCU" in upper or "CSRU" in upper),
-        "looks_or": int("OPERATING ROOM" in upper or "//OR//" in upper or "PACU" in upper),
+        "looks_ed": int(looks_ed_location(upper)),
+        "looks_icu": int(looks_icu_location(upper)),
+        "looks_or": int(looks_or_location(upper)),
     }
 
 

@@ -137,14 +137,26 @@ def _resolve_opening_window_type(
     if not opening_tokens:
         return int(config.unk_window_type_id)
 
-    preferred_tokens = [
+    specific_override_tokens = [
+        tok
+        for tok in opening_tokens
+        if not _token_has_flag(tok, "transition_transfer_like")
+        and (
+            _token_has_flag(tok, "transition_icu_like")
+            or _token_has_flag(tok, "transition_or_like")
+        )
+    ]
+    if specific_override_tokens:
+        source_tokens = [specific_override_tokens[0]]
+    else:
+        preferred_tokens = [
         tok for tok in opening_tokens
         if _token_has_flag(tok, "transition_transfer_like")
-    ]
-    if preferred_tokens:
-        source_tokens = [preferred_tokens[0]]
-    else:
-        source_tokens = [opening_tokens[0]]
+        ]
+        if preferred_tokens:
+            source_tokens = [preferred_tokens[0]]
+        else:
+            source_tokens = [opening_tokens[0]]
 
     explicit_ids = [
         int(type_id)

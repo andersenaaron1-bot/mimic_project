@@ -15,6 +15,70 @@ TRANSITION_ACTION_TO_ID: Dict[str, int] = {
 }
 TRANSITION_ACTION_FROM_ID: Dict[int, str] = {v: k for k, v in TRANSITION_ACTION_TO_ID.items()}
 
+ICU_LOCATION_ALIASES = (
+    "//ICU//",
+    "MICU",
+    "SICU",
+    "TSICU",
+    "CCU",
+    "CSRU",
+    "CVICU",
+    "CICU",
+    "NSICU",
+    "PICU",
+    "NICU",
+    "INTENSIVE CARE UNIT",
+    "MEDICAL ICU",
+    "SURGICAL ICU",
+    "TRAUMA ICU",
+    "TRAUMA SICU",
+    "CARDIAC ICU",
+    "CARDIAC CARE UNIT",
+    "CORONARY CARE UNIT",
+    "CARDIAC SURGERY RECOVERY UNIT",
+    "NEURO ICU",
+    "NEUROLOGIC ICU",
+)
+
+OR_LOCATION_ALIASES = (
+    "OPERATING ROOM",
+    "//OR//",
+    "PACU",
+    "POST ANESTHESIA CARE UNIT",
+    "POST-ANESTHESIA CARE UNIT",
+    "RECOVERY ROOM",
+    "PRE-OP",
+    "PRE OP",
+    "PREOP",
+    "POST-OP",
+    "POST OP",
+    "POSTOP",
+)
+
+ED_LOCATION_ALIASES = (
+    "//ED//",
+    "EMERGENCY DEPARTMENT",
+    "EMERGENCY ROOM",
+)
+
+
+def looks_icu_location(text: str) -> bool:
+    upper_text = str(text).upper()
+    return any(alias in upper_text for alias in ICU_LOCATION_ALIASES)
+
+
+def looks_or_location(text: str) -> bool:
+    upper_text = str(text).upper()
+    return (
+        upper_text.startswith("OR_")
+        or any(alias in upper_text for alias in OR_LOCATION_ALIASES)
+    )
+
+
+def looks_ed_location(text: str) -> bool:
+    upper_text = str(text).upper()
+    return upper_text.startswith("ED_") or any(alias in upper_text for alias in ED_LOCATION_ALIASES)
+
 
 @dataclass
 class StructuralCodebook:
@@ -125,19 +189,6 @@ class StructuralCodebook:
         label: str | None = None,
         action: str | None = None,
     ) -> Optional[str]:
-        def _looks_icu(text: str) -> bool:
-            upper_text = str(text).upper()
-            return any(alias in upper_text for alias in ("ICU", "CCU", "CSRU"))
-
-        def _looks_or(text: str) -> bool:
-            upper_text = str(text).upper()
-            return (
-                "OPERATING ROOM" in upper_text
-                or upper_text.startswith("OR_")
-                or "//OR//" in upper_text
-                or "PACU" in upper_text
-            )
-
         candidates = []
         code_str = None
         if code is not None:
@@ -157,28 +208,28 @@ class StructuralCodebook:
             if prefix in {"ICU_ADMISSION", "ICU_DISCHARGE"} and prefix in self.window_type_map:
                 return self.window_type_map[prefix]
             if prefix == "TRANSFER_TO":
-                if "//ED//" in upper or "EMERGENCY DEPARTMENT" in upper:
+                if looks_ed_location(upper):
                     return "ED"
-                if _looks_icu(upper):
+                if looks_icu_location(upper):
                     return "ICU"
-                if _looks_or(upper):
+                if looks_or_location(upper):
                     return "OR"
                 if prefix in self.window_type_map:
                     return self.window_type_map[prefix]
-            if "EMERGENCY DEPARTMENT" in upper or "EMERGENCY ROOM" in upper or upper.startswith("ED_"):
+            if looks_ed_location(upper):
                 return "ED"
-            if _looks_icu(upper):
+            if looks_icu_location(upper):
                 return "ICU"
-            if _looks_or(upper):
+            if looks_or_location(upper):
                 return "OR"
             if prefix in self.window_type_map:
                 return self.window_type_map[prefix]
 
         if label is not None:
             label_str = str(label).upper()
-            if _looks_icu(label_str):
+            if looks_icu_location(label_str):
                 return "ICU"
-            if _looks_or(label_str) or "OR" in label_str:
+            if looks_or_location(label_str) or "OR" in label_str:
                 return "OR"
 
         if action == "suppress" and code_str == "MEDS_BIRTH":

@@ -315,6 +315,7 @@ def test_routed_transfer_event_uses_prefix_transition_action_and_infers_ed_windo
     assert tok.cat_attrs["transition_action_id"] == TRANSITION_ACTION_TO_ID["close_open"]
     assert tok.cat_attrs["transition_window_type_id"] == 2
     assert tok.cat_attrs["window_type_id"] == 2
+    assert tok.cat_attrs["transition_ed_like"] == 1
     assert tok.window_hook == "episode"
     assert tok.value_id == struct_vocab.offset + struct_vocab.code2id["TRANSFER_TO"]
 
@@ -420,7 +421,7 @@ def test_load_structural_codebook_yaml_respects_boundary_labels_and_soft_signifi
     assert codebook.window_type_id(code="EVT_BOUNDARY") == 2
 
 
-def test_structural_codebook_transfer_to_aliases_cover_ccu_csru_and_pacu():
+def test_structural_codebook_transfer_to_aliases_cover_common_icu_and_or_suffixes():
     codebook = StructuralCodebook(
         code2label={},
         transition_map={"TRANSFER_TO": "close_open"},
@@ -430,7 +431,14 @@ def test_structural_codebook_transfer_to_aliases_cover_ccu_csru_and_pacu():
 
     assert codebook.window_type_name(code="TRANSFER_TO//Cardiac Care Unit (CCU)") == "ICU"
     assert codebook.window_type_name(code="TRANSFER_TO//Cardiac Surgery Recovery Unit (CSRU)") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//MICU") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//SICU") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//CVICU") == "ICU"
+    assert codebook.window_type_name(code="TRANSFER_TO//Coronary Care Unit") == "ICU"
     assert codebook.window_type_name(code="TRANSFER_TO//PACU") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO//Post Anesthesia Care Unit") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO//Recovery Room") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO//Pre-Op Holding") == "OR"
 
 
 def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():

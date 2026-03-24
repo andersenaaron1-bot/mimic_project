@@ -290,3 +290,65 @@ def test_segment_prefers_transfer_to_for_bundle_action_and_opening_type() -> Non
     assert windows[0].window_type_id == 1
     assert windows[1].window_type_id == 4
     assert [tok.value_id for tok in windows[1].tokens[:2]] == [202, 203]
+
+
+def test_segment_allows_immediate_icu_admission_to_override_weak_transfer_suffix() -> None:
+    events = [
+        EventToken(
+            value_id=101,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={},
+            num_attrs={},
+        ),
+        EventToken(
+            value_id=201,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+                "transition_window_type_id": 3,
+                "window_type_id": 3,
+                "transition_transfer_like": 1,
+                "transition_admission_like": 1,
+            },
+            num_attrs={},
+            window_hook="episode",
+        ),
+        EventToken(
+            value_id=202,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_window_type_id": 4,
+                "window_type_id": 4,
+                "transition_admission_like": 1,
+                "transition_icu_like": 1,
+            },
+            num_attrs={},
+            window_hook="episode",
+        ),
+        EventToken(
+            value_id=301,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=2.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
+        ),
+    ]
+    cfg = WindowSegmentationConfig(
+        unk_window_type_id=0,
+        default_first_window_type_id=1,
+        propagate_prev_type_for_unknown_windows=False,
+    )
+
+    windows = segment_event_tokens(events, config=cfg)
+    assert len(windows) == 2
+    assert windows[0].window_type_id == 1
+    assert windows[1].window_type_id == 4
+    assert [tok.value_id for tok in windows[1].tokens[:2]] == [201, 202]
