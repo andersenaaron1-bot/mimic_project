@@ -39,6 +39,7 @@ def main() -> None:
     ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--num_output_shards", type=int, default=100)
     ap.add_argument("--skip_existing", action="store_true")
+    ap.add_argument("--progress_every", type=int, default=100)
 
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
@@ -107,6 +108,22 @@ def main() -> None:
         int(args.max_subjects) if args.max_subjects is not None else None,
         sample_seed=int(args.sample_seed),
     )
+    print(
+        json.dumps(
+            {
+                "event": "compile_timelines_config",
+                "split": str(args.split),
+                "subject_count": int(len(subject_ids)),
+                "output_dir": str(args.output_dir),
+                "num_workers": None if args.num_workers is None else int(args.num_workers),
+                "num_output_shards": int(args.num_output_shards),
+                "skip_existing": bool(args.skip_existing),
+                "progress_every": int(args.progress_every),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
     manifest = compile_dataset(
         db_path=str(args.meds_reader_db),
         encoders=encoders,
@@ -121,6 +138,7 @@ def main() -> None:
         splits_parquet=str(args.splits_parquet),
         write_index=True,
         skip_existing=bool(args.skip_existing),
+        progress_every=int(args.progress_every),
     )
     print(json.dumps(manifest, indent=2))
 
