@@ -8,6 +8,7 @@ import math
 import random
 import sys
 from dataclasses import asdict, dataclass
+import os
 from pathlib import Path
 from typing import Any, Dict, Iterable, List
 
@@ -59,6 +60,20 @@ TOKEN_FAMILY_WEIGHT_PRESETS: Dict[str, Dict[str, float]] = {
         "structural": 0.75,
         "special_marker": 0.5,
         "unk": 0.1,
+    },
+    "semantic_boost_v2": {
+        "diagnosis": 2.5,
+        "diagnosis_residual": 2.0,
+        "procedure": 4.0,
+        "procedure_residual": 2.5,
+        "medication": 1.75,
+        "medication_residual": 1.35,
+        "measurement_value": 0.75,
+        "observation_code": 0.9,
+        "observation_value": 0.9,
+        "structural": 0.85,
+        "special_marker": 0.75,
+        "unk": 0.35,
     },
 }
 
@@ -200,6 +215,36 @@ def resolve_token_family_weights(
             )
         resolved[family] = weight
     return resolved
+
+
+def resolve_precompiled_num_workers(requested_num_workers: int) -> int:
+    requested = int(requested_num_workers)
+    if requested > 0:
+        return requested
+    cpu_total = os.cpu_count() or 2
+    return max(1, min(8, cpu_total - 1))
+
+
+def build_dataloader_kwargs(
+    *,
+    device: torch.device,
+    num_workers: int,
+    precompiled: bool,
+    prefetch_factor: int,
+) -> Dict[str, Any]:
+    resolved_workers = (
+        resolve_precompiled_num_workers(int(num_workers))
+        if precompiled
+        else int(num_workers)
+    )
+    kwargs: Dict[str, Any] = {
+        "num_workers": int(resolved_workers),
+        "pin_memory": (device.type == "cuda"),
+    }
+    if int(resolved_workers) > 0:
+        kwargs["persistent_workers"] = True
+        kwargs["prefetch_factor"] = max(2, int(prefetch_factor))
+    return kwargs
 
 
 class OnTheFlyTimelineDataset(Dataset):
@@ -446,6 +491,7 @@ def main() -> None:
     ap.add_argument("--batch_size", type=int, default=8)
     ap.add_argument("--eval_batch_size", type=int, default=8)
     ap.add_argument("--num_workers", type=int, default=0)
+    ap.add_argument("--prefetch_factor", type=int, default=2)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--max_steps", type=int, default=1000)
     ap.add_argument("--grad_accum_steps", type=int, default=1)
@@ -553,7 +599,14 @@ def main() -> None:
 
     precompiled_train_root = args.precompiled_train_root or args.precompiled_root
     precompiled_eval_root = args.precompiled_eval_root or args.precompiled_root
+    pipeline_summary: Dict[str, Any] = {}
     if precompiled_train_root:
+        train_loader_kwargs = build_dataloader_kwargs(
+            device=device,
+            num_workers=int(args.num_workers),
+            precompiled=True,
+            prefetch_factor=int(args.prefetch_factor),
+        )
         train_ds = PrecompiledMEDSDataset(
             precompiled_train_root,
             split=str(args.train_split),
@@ -563,12 +616,26 @@ def main() -> None:
             train_ds,
             batch_size=int(args.batch_size),
             shuffle=True,
-            num_workers=int(args.num_workers),
             collate_fn=collate_fn,
-            pin_memory=(device.type == "cuda"),
+            **train_loader_kwargs,
         )
+        pipeline_summary = {
+            "mode": "precompiled",
+            "train_root": str(precompiled_train_root),
+            "eval_root": str(precompiled_eval_root or precompiled_train_root),
+            "resolved_num_workers": int(train_loader_kwargs["num_workers"]),
+            "prefetch_factor": int(train_loader_kwargs.get("prefetch_factor", 0)),
+            "persistent_workers": bool(train_loader_kwargs.get("persistent_workers", False)),
+            "train_subject_count": int(len(train_ds)),
+        }
         if args.eval_split:
             eval_root = precompiled_eval_root or precompiled_train_root
+            eval_loader_kwargs = build_dataloader_kwargs(
+                device=device,
+                num_workers=int(args.num_workers),
+                precompiled=True,
+                prefetch_factor=int(args.prefetch_factor),
+            )
             eval_ds = PrecompiledMEDSDataset(
                 eval_root,
                 split=str(args.eval_split),
@@ -578,10 +645,10 @@ def main() -> None:
                 eval_ds,
                 batch_size=int(args.eval_batch_size),
                 shuffle=False,
-                num_workers=int(args.num_workers),
                 collate_fn=collate_fn,
-                pin_memory=(device.type == "cuda"),
+                **eval_loader_kwargs,
             )
+            pipeline_summary["eval_subject_count"] = int(len(eval_ds))
     else:
         if not args.meds_reader_db:
             raise ValueError("--meds_reader_db is required unless --precompiled_root is provided.")
@@ -636,6 +703,11 @@ def main() -> None:
             collate_fn=collate_fn,
             pin_memory=(device.type == "cuda"),
         )
+        pipeline_summary = {
+            "mode": "on_the_fly",
+            "resolved_num_workers": 0,
+            "train_subject_count": int(len(train_ds)),
+        }
         if args.eval_split:
             eval_subject_ids = _load_subject_ids(
                 str(args.splits_parquet),
@@ -660,6 +732,7 @@ def main() -> None:
                 collate_fn=collate_fn,
                 pin_memory=(device.type == "cuda"),
             )
+            pipeline_summary["eval_subject_count"] = int(len(eval_ds))
 
     model_cfg = TrainModelConfig(
         d_model=int(args.d_model),
@@ -728,6 +801,7 @@ def main() -> None:
         "args": vars(args),
         "token_family_weights": token_family_weights,
         "model_config": asdict(model_cfg),
+        "input_pipeline": pipeline_summary,
         "vocab_summary": {
             "total_size": int(vocab_config["total_size"]),
             "size_special": int(vocab_config["size_special"]),

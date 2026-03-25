@@ -7,11 +7,13 @@ upstream and pass a meds_reader DB path. We shard outputs as <root>/<shard>/<sid
 from __future__ import annotations
 
 import os
+import json
 from functools import partial
 from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from typing import Dict, Optional, Iterable, List
 
+import pandas as pd
 import torch
 import meds_reader as mr
 from tqdm import tqdm
@@ -21,6 +23,60 @@ from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.data.structural_codes import StructuralCodebook
+
+
+def write_precompiled_index(
+    *,
+    output_dir: str,
+    splits_parquet: str | None = None,
+    index_filename: str = "index.csv",
+    manifest_filename: str = "manifest.json",
+) -> Dict[str, object]:
+    root = Path(output_dir)
+    files = sorted(root.glob("**/*.pt"))
+    rows: List[Dict[str, object]] = []
+    skipped_non_integer = 0
+    for fp in files:
+        stem = fp.stem
+        if not stem.isdigit():
+            skipped_non_integer += 1
+            continue
+        rows.append(
+            {
+                "subject_id": int(stem),
+                "rel_path": str(fp.relative_to(root)).replace("\\", "/"),
+            }
+        )
+    if not rows:
+        raise ValueError(f"No precompiled .pt timelines found under {output_dir}")
+
+    index_df = pd.DataFrame.from_records(rows).sort_values("subject_id").reset_index(drop=True)
+    split_counts: Dict[str, int] = {}
+    if splits_parquet is not None:
+        split_df = pd.read_parquet(splits_parquet)[["subject_id", "split"]].copy()
+        split_df["subject_id"] = split_df["subject_id"].astype("int64")
+        index_df = index_df.merge(split_df, on="subject_id", how="left", validate="one_to_one")
+        split_counts = {
+            str(k): int(v)
+            for k, v in index_df["split"].fillna("<missing>").value_counts().sort_index().items()
+        }
+
+    index_path = root / str(index_filename)
+    index_df.to_csv(index_path, index=False)
+
+    manifest = {
+        "version": 1,
+        "data_root": str(root),
+        "index_filename": str(index_filename),
+        "total_timelines": int(len(index_df)),
+        "skipped_non_integer_files": int(skipped_non_integer),
+        "subject_id_min": int(index_df["subject_id"].min()),
+        "subject_id_max": int(index_df["subject_id"].max()),
+        "split_counts": split_counts,
+    }
+    manifest_path = root / str(manifest_filename)
+    manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+    return manifest
 
 
 def _process_subject(
@@ -36,6 +92,7 @@ def _process_subject(
     qual_obs_code_vocab: Optional[CategoryVocab] = None,
     qual_obs_value_vocab: Optional[CategoryVocab] = None,
     qual_obs_tail_policy: str = "drop",
+    skip_existing: bool = True,
 ) -> bool:
     """
     Worker-safe timeline build + save for a single subject.
@@ -56,6 +113,8 @@ def _process_subject(
     shard_idx = int(subject_id) % int(num_output_shards)
     shard_folder = f"{shard_idx:02d}"
     save_path = Path(output_dir) / shard_folder / f"{subject_id}.pt"
+    if bool(skip_existing) and save_path.exists():
+        return True
     save_path.parent.mkdir(parents=True, exist_ok=True)
     torch.save(timeline, save_path)
     return True
@@ -73,7 +132,10 @@ def compile_dataset(
     num_workers: Optional[int] = None,
     subject_ids: Optional[Iterable[int]] = None,
     num_output_shards: int = 100,
-) -> None:
+    splits_parquet: str | None = None,
+    write_index: bool = True,
+    skip_existing: bool = True,
+) -> Dict[str, object]:
     """
     Build timelines for selected subjects and persist them to disk.
     """
@@ -99,6 +161,7 @@ def compile_dataset(
         qual_obs_code_vocab=qual_obs_code_vocab,
         qual_obs_value_vocab=qual_obs_value_vocab,
         qual_obs_tail_policy=qual_obs_tail_policy,
+        skip_existing=bool(skip_existing),
     )
 
     os.makedirs(output_dir, exist_ok=True)
@@ -113,6 +176,19 @@ def compile_dataset(
 
     ok = sum(results)
     print(f"compiled {ok}/{len(subject_id_list)} subjects -> {output_dir}")
+    if bool(write_index):
+        manifest = write_precompiled_index(
+            output_dir=output_dir,
+            splits_parquet=splits_parquet,
+        )
+        print(f"wrote precompiled index -> {Path(output_dir) / 'index.csv'}")
+        return manifest
+    return {
+        "version": 1,
+        "data_root": str(output_dir),
+        "total_timelines_requested": int(len(subject_id_list)),
+        "total_timelines_compiled": int(ok),
+    }
 
 
 if __name__ == "__main__":

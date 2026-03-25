@@ -2,7 +2,7 @@
 
 This board captures the current end-to-end review state and the next concrete work items for tokenization, windowing, and transformer development.
 
-## Status Snapshot (2026-03-23)
+## Status Snapshot (2026-03-25)
 
 ### Completed
 
@@ -25,26 +25,26 @@ This board captures the current end-to-end review state and the next concrete wo
 - `TOK-2` Observation exact-vocab tail policy
   - Current state: exact OBS coverage is strong and hash fallback is gone, but tail reporting and explicit guardrails still need to be tightened.
 - `TRAIN-3` Loss balancing review
-  - Current state: family-stratified metrics now show severe semantic under-learning relative to measurement/structural lanes, and configurable family-weighted token loss has been added. It still needs short-run A/B validation.
+  - Current state: family-stratified metrics showed severe semantic under-learning relative to measurement/structural lanes; `semantic_boost_v1` materially improved diagnosis/procedure/medication families but was too aggressive on easy lanes. A softer `semantic_boost_v2` preset is now available and still needs a short validation run.
+- `TRAIN-2` Throughput and data loading
+  - Current state: precompiled-timeline support now has an index/manifest path, a compile CLI, and trainer dataloader wiring with auto worker/prefetch settings. It still needs LRZ validation and throughput benchmarking on a real compiled subset before being treated as the default long-run path.
 - `EVAL-1B` End-to-end generation audit
   - Current state: rollout exists and can be audited per subject. The first real rollout already showed a plausible causal transition but overconfident structural generation (`VASO_OFF`) relative to semantic content. Multi-subject audit coverage is still missing.
 
 ### Not Started / Still Missing
 
 - `ARCH-3` Hierarchy ablations
-- `ARCH-5` Numeric side-channel masking
 - `TOK-4` Production no-hash guardrails
-- `TRAIN-2` Throughput and data loading
 - `EVAL-2` Clinical probe set
 - `EVAL-3` Representation sanity checks
 
 ### Current Priority Order
 
-1. `TRAIN-3`: validate the new semantic-rebalancing lever with a short A/B continuation against the current baseline.
-2. `EVAL-1B`: expand rollout audit from single-subject examples to a small multi-subject review set.
-3. `TRAIN-2`: move long runs onto precompiled timelines and benchmark throughput.
-4. `ARCH-3` and `EVAL-3`: justify the hierarchy with ablations once the training distribution is better balanced.
-5. `TOK-4`: harden production no-hash guardrails after the optimization and rollout loops are in a more stable place.
+1. `TRAIN-2`: compile a real precompiled subset on LRZ, confirm the new index/manifest path, and benchmark throughput versus on-the-fly loading.
+2. `TRAIN-3`: validate `semantic_boost_v2` with a short continuation and `EVAL-4`, then decide the long-run recipe.
+3. `EVAL-1B`: expand rollout audit from single-subject examples to a small multi-subject review set after the softer weighting pass.
+4. `TOK-4`: harden production no-hash guardrails once the long-run input pipeline and weighting recipe are stable.
+5. `ARCH-3` and `EVAL-3`: justify the hierarchy with ablations after the training recipe stops moving.
 
 ## Architecture
 
