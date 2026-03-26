@@ -130,6 +130,15 @@ def _init_compile_worker(
     """
     Initialize per-worker resources once to avoid reopening the DB for every subject.
     """
+    os.environ.setdefault("OMP_NUM_THREADS", "1")
+    os.environ.setdefault("MKL_NUM_THREADS", "1")
+    os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+    try:
+        torch.set_num_threads(1)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(1)
+    except Exception:
+        pass
     _WORKER_STATE.clear()
     _WORKER_STATE.update(
         {
