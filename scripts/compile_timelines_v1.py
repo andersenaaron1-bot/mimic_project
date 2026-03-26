@@ -38,6 +38,7 @@ def main() -> None:
     ap.add_argument("--output_dir", required=True)
     ap.add_argument("--num_workers", type=int, default=None)
     ap.add_argument("--num_output_shards", type=int, default=100)
+    ap.add_argument("--chunksize", type=int, default=None)
     ap.add_argument("--skip_existing", action="store_true")
     ap.add_argument("--progress_every", type=int, default=100)
 
@@ -117,6 +118,7 @@ def main() -> None:
                 "output_dir": str(args.output_dir),
                 "num_workers": None if args.num_workers is None else int(args.num_workers),
                 "num_output_shards": int(args.num_output_shards),
+                "chunksize": None if args.chunksize is None else int(args.chunksize),
                 "skip_existing": bool(args.skip_existing),
                 "progress_every": int(args.progress_every),
             },
@@ -139,6 +141,7 @@ def main() -> None:
         write_index=True,
         skip_existing=bool(args.skip_existing),
         progress_every=int(args.progress_every),
+        chunksize=None if args.chunksize is None else int(args.chunksize),
     )
     print(json.dumps(manifest, indent=2))
 

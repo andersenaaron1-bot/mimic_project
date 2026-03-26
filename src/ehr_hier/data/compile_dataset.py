@@ -197,6 +197,7 @@ def compile_dataset(
     write_index: bool = True,
     skip_existing: bool = True,
     progress_every: int = 100,
+    chunksize: int | None = None,
 ) -> Dict[str, object]:
     """
     Build timelines for selected subjects and persist them to disk.
@@ -215,7 +216,11 @@ def compile_dataset(
     workers = num_workers if num_workers is not None else max(1, cpu_count() - 2)
     workers = max(1, int(workers))
     os.makedirs(output_dir, exist_ok=True)
-    chunksize = max(1, min(64, len(subject_id_list) // max(1, workers * 8)))
+    resolved_chunksize = (
+        max(1, int(chunksize))
+        if chunksize is not None
+        else max(1, min(8, len(subject_id_list) // max(1, workers * 32)))
+    )
     started_at = time.perf_counter()
     print(
         json.dumps(
@@ -224,7 +229,7 @@ def compile_dataset(
                 "output_dir": str(output_dir),
                 "subjects": int(len(subject_id_list)),
                 "workers": int(workers),
-                "chunksize": int(chunksize),
+                "chunksize": int(resolved_chunksize),
                 "num_output_shards": int(num_output_shards),
                 "skip_existing": bool(skip_existing),
                 "write_index": bool(write_index),
@@ -259,7 +264,7 @@ def compile_dataset(
             mininterval=1.0,
             dynamic_ncols=True,
         ) as pbar:
-            for status in pool.imap_unordered(_process_subject, subject_id_list, chunksize=chunksize):
+            for status in pool.imap_unordered(_process_subject, subject_id_list, chunksize=resolved_chunksize):
                 done += 1
                 if status == "compiled":
                     compiled += 1
@@ -293,7 +298,7 @@ def compile_dataset(
             splits_parquet=splits_parquet,
         )
         manifest["compile_workers"] = int(workers)
-        manifest["compile_chunksize"] = int(chunksize)
+        manifest["compile_chunksize"] = int(resolved_chunksize)
         manifest["compile_elapsed_seconds"] = float(elapsed)
         manifest["compiled_subjects"] = int(compiled)
         manifest["skipped_existing_subjects"] = int(skipped_existing_count)
@@ -308,7 +313,7 @@ def compile_dataset(
         "total_timelines_compiled": int(compiled),
         "total_timelines_skipped_existing": int(skipped_existing_count),
         "compile_workers": int(workers),
-        "compile_chunksize": int(chunksize),
+        "compile_chunksize": int(resolved_chunksize),
         "compile_elapsed_seconds": float(elapsed),
     }
 
