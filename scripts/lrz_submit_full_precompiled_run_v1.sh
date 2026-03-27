@@ -27,6 +27,11 @@ PRECOMP_CT="${PRECOMP_CT:-/dss/etl/$PRECOMP_BASENAME}"
 RUN_HOST="${RUN_HOST:-$DSS_HOST/etl/$RUN_BASENAME}"
 RUN_CT="${RUN_CT:-/dss/etl/$RUN_BASENAME}"
 
+PRECOMP_HOST_BASENAME="$(basename "$PRECOMP_HOST")"
+RUN_HOST_BASENAME="$(basename "$RUN_HOST")"
+[[ "$(basename "$PRECOMP_CT")" == "$PRECOMP_HOST_BASENAME" ]] || lrz_die "PRECOMP_CT basename ($(basename "$PRECOMP_CT")) does not match PRECOMP_HOST basename ($PRECOMP_HOST_BASENAME). Unset stale PRECOMP_CT or set both roots consistently."
+[[ "$(basename "$RUN_CT")" == "$RUN_HOST_BASENAME" ]] || lrz_die "RUN_CT basename ($(basename "$RUN_CT")) does not match RUN_HOST basename ($RUN_HOST_BASENAME). Unset stale RUN_CT or set both roots consistently."
+
 TUNING_MAX_SUBJECTS="${TUNING_MAX_SUBJECTS:-1024}"
 TUNING_SAMPLE_SEED="${TUNING_SAMPLE_SEED:-1337}"
 
@@ -79,7 +84,9 @@ TRAIN_JOB="$RUN_HOST/submit_meta/train_full_semboost_v2.sbatch"
 
 lrz_log "Preparing LRZ submission chain"
 lrz_log "PRECOMP_HOST=$PRECOMP_HOST"
+lrz_log "PRECOMP_CT=$PRECOMP_CT"
 lrz_log "RUN_HOST=$RUN_HOST"
+lrz_log "RUN_CT=$RUN_CT"
 lrz_log "TRAIN_PARTITION=$TRAIN_PARTITION"
 lrz_log "IMAGE_CPU=$IMAGE_CPU"
 lrz_log "IMAGE_GPU=$IMAGE_GPU"
