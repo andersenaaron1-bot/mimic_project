@@ -268,7 +268,7 @@ def _resolve_residual_policy(
 def _load_subject_ids(
     splits_parquet: str,
     split: str,
-    max_subjects: int,
+    max_subjects: Optional[int],
     *,
     sample_seed: Optional[int] = None,
 ) -> List[int]:
@@ -279,7 +279,7 @@ def _load_subject_ids(
     if sample_seed is not None:
         rng = random.Random(int(sample_seed))
         rng.shuffle(ids)
-    if max_subjects > 0:
+    if max_subjects is not None and max_subjects > 0:
         ids = ids[:max_subjects]
     return [int(x) for x in ids]
 

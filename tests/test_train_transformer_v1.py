@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import pandas as pd
 import torch
 import torch.nn as nn
 
+from scripts.audit_tokenization_flow import _load_subject_ids
 from scripts.train_transformer_v1 import (
     build_dataloader_kwargs,
     build_lr_lambda,
@@ -103,3 +105,20 @@ def test_build_dataloader_kwargs_keeps_on_the_fly_zero_workers() -> None:
         prefetch_factor=5,
     )
     assert kwargs == {"num_workers": 0, "pin_memory": False}
+
+
+def test_load_subject_ids_allows_no_max_subjects(monkeypatch) -> None:
+    def _fake_read_parquet(_: str) -> pd.DataFrame:
+        return pd.DataFrame(
+            [
+                {"subject_id": 101, "split": "train"},
+                {"subject_id": 202, "split": "train"},
+                {"subject_id": 303, "split": "tuning"},
+            ]
+        )
+
+    monkeypatch.setattr("scripts.audit_tokenization_flow.pd.read_parquet", _fake_read_parquet)
+
+    ids = _load_subject_ids("dummy.parquet", "train", None, sample_seed=13)
+
+    assert sorted(ids) == [101, 202]
