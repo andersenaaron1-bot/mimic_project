@@ -43,6 +43,9 @@ ICU_LOCATION_ALIASES = (
 OR_LOCATION_ALIASES = (
     "OPERATING ROOM",
     "//OR//",
+)
+
+PERIOP_LOCATION_ALIASES = (
     "PACU",
     "POST ANESTHESIA CARE UNIT",
     "POST-ANESTHESIA CARE UNIT",
@@ -69,6 +72,8 @@ def looks_icu_location(text: str) -> bool:
 
 def looks_or_location(text: str) -> bool:
     upper_text = str(text).upper()
+    if any(alias in upper_text for alias in PERIOP_LOCATION_ALIASES):
+        return False
     return (
         upper_text.startswith("OR_")
         or any(alias in upper_text for alias in OR_LOCATION_ALIASES)
@@ -229,7 +234,7 @@ class StructuralCodebook:
             label_str = str(label).upper()
             if looks_icu_location(label_str):
                 return "ICU"
-            if looks_or_location(label_str) or "OR" in label_str:
+            if looks_or_location(label_str):
                 return "OR"
 
         if action == "suppress" and code_str == "MEDS_BIRTH":

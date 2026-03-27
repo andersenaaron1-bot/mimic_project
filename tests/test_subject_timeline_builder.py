@@ -435,10 +435,13 @@ def test_structural_codebook_transfer_to_aliases_cover_common_icu_and_or_suffixe
     assert codebook.window_type_name(code="TRANSFER_TO//SICU") == "ICU"
     assert codebook.window_type_name(code="TRANSFER_TO//CVICU") == "ICU"
     assert codebook.window_type_name(code="TRANSFER_TO//Coronary Care Unit") == "ICU"
-    assert codebook.window_type_name(code="TRANSFER_TO//PACU") == "OR"
-    assert codebook.window_type_name(code="TRANSFER_TO//Post Anesthesia Care Unit") == "OR"
-    assert codebook.window_type_name(code="TRANSFER_TO//Recovery Room") == "OR"
-    assert codebook.window_type_name(code="TRANSFER_TO//Pre-Op Holding") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO//Operating Room") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO////OR//Suite 12") == "OR"
+    assert codebook.window_type_name(code="TRANSFER_TO//PACU") == "INPATIENT"
+    assert codebook.window_type_name(code="TRANSFER_TO//Post Anesthesia Care Unit") == "INPATIENT"
+    assert codebook.window_type_name(code="TRANSFER_TO//Recovery Room") == "INPATIENT"
+    assert codebook.window_type_name(code="TRANSFER_TO//Pre-Op Holding") == "INPATIENT"
+    assert codebook.window_type_name(label="FLOOR_TRANSFER_ORTHOPEDICS") is None
 
 
 def test_subject_timeline_injects_age_and_sex_for_measurement_encoders():
