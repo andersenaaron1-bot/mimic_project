@@ -7,16 +7,19 @@ upstream and pass a meds_reader DB path. Packed shard outputs are written under
 """
 from __future__ import annotations
 
+import atexit
+import csv
 import json
 import math
 import os
 import time
-from multiprocessing import Pool, cpu_count
+from multiprocessing import Pool, cpu_count, current_process
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 import pandas as pd
 import meds_reader as mr
+import torch
 from tqdm import tqdm
 
 from src.ehr_hier.data.precompiled_format import (
@@ -144,6 +147,8 @@ def _init_compile_worker(
     db_path: str,
     encoders: Dict[TokenCategory, EventTokenEncoder],
     codebook: Optional[StructuralCodebook],
+    output_dir: str,
+    target_subjects_per_shard: int,
     window_hook_label: str = "window_boundary",
     attach_med_numeric: bool = True,
     qual_obs_code_vocab: Optional[CategoryVocab] = None,
@@ -162,22 +167,93 @@ def _init_compile_worker(
             torch.set_num_interop_threads(1)
     except Exception:
         pass
+    proc = current_process()
+    worker_tag = (
+        f"w{int(proc._identity[0]):03d}"  # type: ignore[attr-defined]
+        if getattr(proc, "_identity", None)
+        else f"pid{os.getpid()}"
+    )
+    shards_dir = Path(output_dir) / "shards"
+    index_parts_dir = Path(output_dir) / ".index_parts"
+    shards_dir.mkdir(parents=True, exist_ok=True)
+    index_parts_dir.mkdir(parents=True, exist_ok=True)
     _WORKER_STATE.clear()
     _WORKER_STATE.update(
         {
             "db": mr.SubjectDatabase(db_path),
             "encoders": encoders,
             "codebook": codebook,
+            "output_dir": str(output_dir),
+            "target_subjects_per_shard": int(target_subjects_per_shard),
             "window_hook_label": str(window_hook_label),
             "attach_med_numeric": bool(attach_med_numeric),
             "qual_obs_code_vocab": qual_obs_code_vocab,
             "qual_obs_value_vocab": qual_obs_value_vocab,
             "qual_obs_tail_policy": str(qual_obs_tail_policy),
+            "worker_tag": worker_tag,
+            "worker_local_shard_idx": 0,
+            "pending_rows": [],
+            "index_parts_dir": str(index_parts_dir),
         }
     )
+    atexit.register(_finalize_compile_worker)
 
 
-def _process_subject(subject_id: int) -> tuple[int, Dict[str, Any]]:
+def _append_worker_index_rows(*, path: Path, rows: List[Dict[str, object]]) -> None:
+    if not rows:
+        return
+    fieldnames = ["subject_id", "rel_path", "subject_idx"]
+    write_header = not path.exists()
+    with path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+def _flush_worker_pending_rows() -> int:
+    if not _WORKER_STATE:
+        return 0
+    pending_rows = _WORKER_STATE.get("pending_rows", [])
+    if not pending_rows:
+        return 0
+    worker_tag = str(_WORKER_STATE["worker_tag"])
+    shard_idx = int(_WORKER_STATE["worker_local_shard_idx"])
+    shard_rel_path = f"shards/{worker_tag}_{shard_idx:06d}{PRECOMPILED_SHARD_SUFFIX}"
+    ordered = sorted(pending_rows, key=lambda item: int(item[0]))
+    subject_ids = [int(subject_id) for subject_id, _ in ordered]
+    timelines = [payload for _, payload in ordered]
+    save_packed_shard(
+        Path(str(_WORKER_STATE["output_dir"])) / shard_rel_path,
+        subject_ids=subject_ids,
+        serialized_timelines=timelines,
+    )
+    index_rows = [
+        {
+            "subject_id": int(subject_id),
+            "rel_path": shard_rel_path,
+            "subject_idx": int(pos),
+        }
+        for pos, subject_id in enumerate(subject_ids)
+    ]
+    _append_worker_index_rows(
+        path=Path(str(_WORKER_STATE["index_parts_dir"])) / f"{worker_tag}.csv",
+        rows=index_rows,
+    )
+    _WORKER_STATE["worker_local_shard_idx"] = shard_idx + 1
+    _WORKER_STATE["pending_rows"] = []
+    return int(len(subject_ids))
+
+
+def _finalize_compile_worker() -> None:
+    try:
+        _flush_worker_pending_rows()
+    except Exception:
+        pass
+
+
+def _process_subject(subject_id: int) -> str:
     """
     Worker-safe timeline build + compact serialization for a single subject.
     """
@@ -199,7 +275,12 @@ def _process_subject(subject_id: int) -> tuple[int, Dict[str, Any]]:
     except Exception as exc:  # pragma: no cover - exercised in integration contexts
         raise RuntimeError(f"Failed to compile subject_id={int(subject_id)}") from exc
 
-    return int(subject_id), serialize_timeline_compact(timeline)
+    pending_rows: list[tuple[int, Dict[str, Any]]] = list(_WORKER_STATE.get("pending_rows", []))
+    pending_rows.append((int(subject_id), serialize_timeline_compact(timeline)))
+    _WORKER_STATE["pending_rows"] = pending_rows
+    if len(pending_rows) >= int(_WORKER_STATE["target_subjects_per_shard"]):
+        _flush_worker_pending_rows()
+    return "compiled"
 
 
 def _load_existing_index_records(output_dir: str) -> List[Dict[str, object]]:
@@ -227,44 +308,27 @@ def _load_existing_index_records(output_dir: str) -> List[Dict[str, object]]:
     ]
 
 
-def _next_shard_index(output_dir: str) -> int:
-    shard_root = Path(output_dir) / "shards"
-    if not shard_root.exists():
-        return 0
-    max_idx = -1
-    for fp in shard_root.glob(f"*{PRECOMPILED_SHARD_SUFFIX}"):
-        try:
-            max_idx = max(max_idx, int(fp.stem))
-        except ValueError:
-            continue
-    return max_idx + 1
-
-
-def _flush_packed_shard(
-    *,
-    output_dir: str,
-    shard_idx: int,
-    rows: List[tuple[int, Dict[str, Any]]],
-) -> List[Dict[str, object]]:
-    if not rows:
+def _collect_index_part_records(output_dir: str) -> List[Dict[str, object]]:
+    part_dir = Path(output_dir) / ".index_parts"
+    if not part_dir.exists():
         return []
-    shard_rel_path = f"shards/{int(shard_idx):06d}{PRECOMPILED_SHARD_SUFFIX}"
-    ordered = sorted(rows, key=lambda item: int(item[0]))
-    subject_ids = [int(subject_id) for subject_id, _ in ordered]
-    timelines = [payload for _, payload in ordered]
-    save_packed_shard(
-        Path(output_dir) / shard_rel_path,
-        subject_ids=subject_ids,
-        serialized_timelines=timelines,
-    )
-    return [
-        {
-            "subject_id": int(subject_id),
-            "rel_path": shard_rel_path,
-            "subject_idx": int(pos),
-        }
-        for pos, subject_id in enumerate(subject_ids)
-    ]
+    rows: List[Dict[str, object]] = []
+    for csv_path in sorted(part_dir.glob("*.csv")):
+        part_df = pd.read_csv(csv_path)
+        required = {"subject_id", "rel_path", "subject_idx"}
+        if not required.issubset(part_df.columns):
+            raise ValueError(
+                f"Index part at {csv_path} must contain columns {sorted(required)}"
+            )
+        for rec in part_df.to_dict(orient="records"):
+            rows.append(
+                {
+                    "subject_id": int(rec["subject_id"]),
+                    "rel_path": str(rec["rel_path"]),
+                    "subject_idx": int(rec["subject_idx"]),
+                }
+            )
+    return rows
 
 
 def compile_dataset(
@@ -302,6 +366,10 @@ def compile_dataset(
     workers = num_workers if num_workers is not None else max(1, cpu_count() - 2)
     workers = max(1, int(workers))
     os.makedirs(output_dir, exist_ok=True)
+    index_parts_dir = Path(output_dir) / ".index_parts"
+    index_parts_dir.mkdir(parents=True, exist_ok=True)
+    for old_part in index_parts_dir.glob("*.csv"):
+        old_part.unlink()
     existing_records = _load_existing_index_records(output_dir) if bool(skip_existing) else []
     existing_subject_ids = {int(rec["subject_id"]) for rec in existing_records}
     requested_subjects = list(subject_id_list)
@@ -322,6 +390,7 @@ def compile_dataset(
             )
         ),
     )
+    resolved_subjects_per_shard = max(8, min(128, int(target_subjects_per_shard)))
     started_at = time.perf_counter()
     print(
         json.dumps(
@@ -334,6 +403,7 @@ def compile_dataset(
                 "chunksize": int(resolved_chunksize),
                 "num_output_shards": int(num_output_shards),
                 "target_subjects_per_shard": int(target_subjects_per_shard),
+                "resolved_subjects_per_shard": int(resolved_subjects_per_shard),
                 "skip_existing": bool(skip_existing),
                 "write_index": bool(write_index),
                 "storage_format": PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
@@ -369,6 +439,8 @@ def compile_dataset(
             db_path,
             encoders,
             structural_codebook,
+            output_dir,
+            int(resolved_subjects_per_shard),
             "window_boundary",
             True,
             qual_obs_code_vocab,
@@ -378,33 +450,20 @@ def compile_dataset(
     ) as pool:
         compiled = 0
         done = 0
-        next_shard_idx = _next_shard_index(output_dir)
-        pending_rows: List[tuple[int, Dict[str, Any]]] = []
-        index_rows: List[Dict[str, object]] = list(existing_records)
         with tqdm(
             total=len(subject_id_list),
             desc="compiling timelines",
             mininterval=1.0,
             dynamic_ncols=True,
         ) as pbar:
-            for subject_id, compact_payload in pool.imap_unordered(
+            for status in pool.imap_unordered(
                 _process_subject,
                 subject_id_list,
                 chunksize=resolved_chunksize,
             ):
                 done += 1
-                compiled += 1
-                pending_rows.append((int(subject_id), compact_payload))
-                if len(pending_rows) >= int(target_subjects_per_shard):
-                    index_rows.extend(
-                        _flush_packed_shard(
-                            output_dir=output_dir,
-                            shard_idx=next_shard_idx,
-                            rows=pending_rows,
-                        )
-                    )
-                    next_shard_idx += 1
-                    pending_rows = []
+                if status == "compiled":
+                    compiled += 1
                 pbar.update(1)
                 if int(progress_every) > 0 and (
                     done % int(progress_every) == 0 or done == len(subject_id_list)
@@ -416,14 +475,6 @@ def compile_dataset(
                         skipped_existing=skipped_existing_count,
                         started_at=started_at,
                     )
-        if pending_rows:
-            index_rows.extend(
-                _flush_packed_shard(
-                    output_dir=output_dir,
-                    shard_idx=next_shard_idx,
-                    rows=pending_rows,
-                )
-            )
 
     elapsed = time.perf_counter() - started_at
     print(
@@ -436,6 +487,8 @@ def compile_dataset(
         flush=True,
     )
     if bool(write_index):
+        index_rows: List[Dict[str, object]] = list(existing_records)
+        index_rows.extend(_collect_index_part_records(output_dir))
         manifest = write_precompiled_index(
             output_dir=output_dir,
             splits_parquet=splits_parquet,
@@ -448,6 +501,7 @@ def compile_dataset(
         manifest["compiled_subjects"] = int(compiled)
         manifest["skipped_existing_subjects"] = int(skipped_existing_count)
         manifest["target_subjects_per_shard"] = int(target_subjects_per_shard)
+        manifest["resolved_subjects_per_shard"] = int(resolved_subjects_per_shard)
         manifest["shard_count"] = len({str(rec["rel_path"]) for rec in index_rows})
         manifest_path = Path(output_dir) / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
