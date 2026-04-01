@@ -12,8 +12,10 @@ if str(PROJECT_ROOT) not in sys.path:
 
 from scripts.audit_tokenization_flow import (  # noqa: E402
     _build_measurement_config,
+    _build_segmentation_config,
     _build_static_artifacts,
     _build_struct_vocab,
+    _build_trajectory_split_config,
     _load_subject_ids,
     _load_tokenization_contract,
     _resolve_residual_policy,
@@ -41,6 +43,12 @@ def main() -> None:
     ap.add_argument("--chunksize", type=int, default=None)
     ap.add_argument("--skip_existing", action="store_true")
     ap.add_argument("--progress_every", type=int, default=100)
+    ap.add_argument(
+        "--trajectory_mode",
+        default="full_subject",
+        choices=["none", "full_subject", "admission_chain"],
+    )
+    ap.add_argument("--post_discharge_cutoff_days", type=float, default=31.0)
 
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--structural_yaml", default="configs/data/structural_codes.yaml")
@@ -109,6 +117,15 @@ def main() -> None:
         int(args.max_subjects) if args.max_subjects is not None else None,
         sample_seed=int(args.sample_seed),
     )
+    segmentation_cfg = _build_segmentation_config(
+        tokenization_contract=tokenization_contract,
+        structural_codebook=artifacts.structural_codebook,
+        unk_type_id=int(tokenization_contract.get("window_markers", {}).get("unk_type_id", 0)),
+    )
+    trajectory_split_cfg = _build_trajectory_split_config(
+        mode=str(args.trajectory_mode),
+        post_discharge_cutoff_days=float(args.post_discharge_cutoff_days),
+    )
     print(
         json.dumps(
             {
@@ -121,6 +138,8 @@ def main() -> None:
                 "chunksize": None if args.chunksize is None else int(args.chunksize),
                 "skip_existing": bool(args.skip_existing),
                 "progress_every": int(args.progress_every),
+                "trajectory_mode": str(args.trajectory_mode),
+                "post_discharge_cutoff_days": float(args.post_discharge_cutoff_days),
             },
             indent=2,
         ),
@@ -142,6 +161,8 @@ def main() -> None:
         skip_existing=bool(args.skip_existing),
         progress_every=int(args.progress_every),
         chunksize=None if args.chunksize is None else int(args.chunksize),
+        segmentation_config=segmentation_cfg,
+        trajectory_split_config=trajectory_split_cfg,
     )
     print(json.dumps(manifest, indent=2))
 

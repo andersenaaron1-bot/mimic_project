@@ -19,6 +19,11 @@ from src.ehr_hier.data.precompiled_format import (
     deserialize_timeline_compact,
 )
 from src.ehr_hier.data.token_types import EventToken
+from src.ehr_hier.data.trajectory_splitting import (
+    TrajectorySplitConfig,
+    build_trajectory_timelines,
+)
+from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
 
 
 class PrecompiledMEDSDataset(Dataset):
@@ -34,17 +39,23 @@ class PrecompiledMEDSDataset(Dataset):
         split_ratio: float = 0.8,
         splits_parquet: str | None = None,
         shard_cache_size: int = 2,
+        index_filename: str = "index.csv",
+        segmentation_config: WindowSegmentationConfig | None = None,
+        trajectory_split_config: TrajectorySplitConfig | None = None,
     ) -> None:
         self.data_root = str(data_root)
         root = Path(self.data_root)
-        index_csv = root / "index.csv"
+        index_csv = root / str(index_filename)
         manifest_path = root / "manifest.json"
         self.storage_format = "legacy_subject_pt"
+        self.segmentation_config = segmentation_config
+        self.trajectory_split_config = trajectory_split_config
         if manifest_path.exists():
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
             self.storage_format = str(manifest.get("storage_format", self.storage_format))
         self._shard_cache_size = max(1, int(shard_cache_size))
         self._shard_cache: OrderedDict[str, Any] = OrderedDict()
+        self.materialized_trajectory_flags: List[bool] = []
 
         index_df: pd.DataFrame | None = None
         if index_csv.exists():
@@ -113,6 +124,17 @@ class PrecompiledMEDSDataset(Dataset):
                 )
             self.file_paths = selected
             self.subject_positions = [None if pd.isna(v) else int(v) for v in selected_subject_idx]
+            self.trajectory_orders = (
+                index_df.loc[index_df["subject_id"].isin(keep), "trajectory_ord"].tolist()
+                if "trajectory_ord" in index_df.columns
+                else [None] * len(selected)
+            )
+            self.trajectory_orders = [None if pd.isna(v) else int(v) for v in self.trajectory_orders]
+            self.materialized_trajectory_flags = (
+                index_df.loc[index_df["subject_id"].isin(keep), "materialized_trajectory"].fillna(0).astype(bool).tolist()
+                if "materialized_trajectory" in index_df.columns
+                else [False] * len(selected)
+            )
             return
 
         # Backward-compatible fallback: deterministic but not cohort-aware.
@@ -132,6 +154,17 @@ class PrecompiledMEDSDataset(Dataset):
                 )
             self.file_paths = selected
             self.subject_positions = [None if pd.isna(v) else int(v) for v in selected_subject_idx]
+            self.trajectory_orders = (
+                selected_df["trajectory_ord"].tolist()
+                if "trajectory_ord" in selected_df.columns
+                else [None] * len(selected)
+            )
+            self.trajectory_orders = [None if pd.isna(v) else int(v) for v in self.trajectory_orders]
+            self.materialized_trajectory_flags = (
+                selected_df["materialized_trajectory"].fillna(0).astype(bool).tolist()
+                if "materialized_trajectory" in selected_df.columns
+                else [False] * len(selected)
+            )
             return
 
         files = index_df["file_path"].astype(str).tolist()
@@ -145,6 +178,8 @@ class PrecompiledMEDSDataset(Dataset):
         selected = files[:cut] if split == "train" else files[cut:]
         self.file_paths = selected
         self.subject_positions = [None] * len(selected)
+        self.trajectory_orders = [None] * len(selected)
+        self.materialized_trajectory_flags = [False] * len(selected)
 
     def __len__(self) -> int:
         return len(self.file_paths)
@@ -162,16 +197,56 @@ class PrecompiledMEDSDataset(Dataset):
             self._shard_cache.popitem(last=False)
         return payload
 
-    def __getitem__(self, idx: int) -> List[EventToken]:
-        fp = self.file_paths[idx]
-        subject_pos = self.subject_positions[idx]
+    def _resolve_serialized_payload(self, *, file_path: str, subject_pos: int | None) -> tuple[object, dict[str, Any]]:
         if subject_pos is None:
-            timeline = torch.load(fp, map_location="cpu", weights_only=False)
-            return timeline
+            payload = torch.load(file_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and "value_ids" in payload:
+                return payload, dict(payload.get("metadata", {}) or {})
+            return payload, {}
         if self.storage_format != PRECOMPILED_STORAGE_FORMAT_PACKED_V2:
             raise ValueError(
                 f"Precompiled index row uses subject_idx but storage_format={self.storage_format!r}"
             )
-        shard = self._load_shard(fp)
+        shard = self._load_shard(file_path)
         serialized = shard["timelines"][int(subject_pos)]
-        return deserialize_timeline_compact(serialized)
+        return serialized, dict(serialized.get("metadata", {}) or {})
+
+    def __getitem__(self, idx: int) -> List[EventToken]:
+        fp = self.file_paths[idx]
+        subject_pos = self.subject_positions[idx]
+        trajectory_ord = self.trajectory_orders[idx] if idx < len(self.trajectory_orders) else None
+        materialized_trajectory = (
+            bool(self.materialized_trajectory_flags[idx])
+            if idx < len(self.materialized_trajectory_flags)
+            else False
+        )
+        serialized_or_timeline, metadata = self._resolve_serialized_payload(
+            file_path=fp,
+            subject_pos=subject_pos,
+        )
+        if isinstance(serialized_or_timeline, list):
+            timeline = serialized_or_timeline
+        else:
+            timeline = deserialize_timeline_compact(serialized_or_timeline)
+        if materialized_trajectory:
+            return timeline
+        if trajectory_ord is None:
+            return timeline
+        if self.segmentation_config is None or self.trajectory_split_config is None:
+            raise ValueError(
+                "trajectory_ord rows require segmentation_config and trajectory_split_config"
+            )
+        subject_metadata = metadata.get("subject_demographics", None)
+        trajectories = build_trajectory_timelines(
+            timeline=timeline,
+            segmentation_config=self.segmentation_config,
+            split_config=self.trajectory_split_config,
+            subject_metadata=subject_metadata if isinstance(subject_metadata, dict) else None,
+        )
+        if not trajectories:
+            trajectories = [timeline]
+        if int(trajectory_ord) < 0 or int(trajectory_ord) >= len(trajectories):
+            raise IndexError(
+                f"trajectory_ord={int(trajectory_ord)} out of range for subject sample with {len(trajectories)} trajectories"
+            )
+        return trajectories[int(trajectory_ord)]

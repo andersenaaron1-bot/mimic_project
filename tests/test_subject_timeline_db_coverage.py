@@ -18,6 +18,7 @@ pytest.importorskip("meds_reader")
 import meds_reader as mr  # noqa: E402
 
 from src.ehr_hier.data.event_router import classify_code_to_category
+from src.ehr_hier.data.structural_codes import structural_surface_code
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers.medtok_attr_encoder import MedTokenWithAttrsEncoder
@@ -94,7 +95,15 @@ def _scan_vocab_from_db(
             code = getattr(ev, "code", None)
             if code is None:
                 continue
-            seen.add(str(code))
+            if target_category == TokenCategory.STRUCTURAL:
+                surface = structural_surface_code(
+                    code,
+                    routed_category=TokenCategory.STRUCTURAL,
+                )
+                if surface:
+                    seen.add(str(surface))
+            else:
+                seen.add(str(code))
 
     code2id = {c: i + 1 for i, c in enumerate(sorted(seen))}
     code2id["<UNK>"] = 0

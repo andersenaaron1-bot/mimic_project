@@ -24,11 +24,19 @@ from src.ehr_hier.data.precompiled_format import (
     PRECOMPILED_PAYLOAD_VERSION,
     PRECOMPILED_SHARD_SUFFIX,
     PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
+    deserialize_timeline_compact,
+    load_packed_shard,
     save_packed_shard,
     serialize_timeline_compact,
 )
+from src.ehr_hier.data.demographics import collect_subject_demographic_metadata
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import TokenCategory
+from src.ehr_hier.data.trajectory_splitting import (
+    TrajectorySplitConfig,
+    build_trajectory_timelines,
+)
+from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
 from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.data.structural_codes import StructuralCodebook
@@ -82,18 +90,19 @@ def write_precompiled_index(
     rows: List[Dict[str, object]]
     skipped_non_integer = 0
     if records is not None:
-        rows = [
-            {
+        rows = []
+        for rec in records:
+            row = {
                 "subject_id": int(rec["subject_id"]),
                 "rel_path": str(rec["rel_path"]),
-                **(
-                    {"subject_idx": int(rec["subject_idx"])}
-                    if "subject_idx" in rec and rec["subject_idx"] is not None
-                    else {}
-                ),
             }
-            for rec in records
-        ]
+            if "subject_idx" in rec and rec["subject_idx"] is not None and not pd.isna(rec["subject_idx"]):
+                row["subject_idx"] = int(rec["subject_idx"])
+            for key, value in dict(rec).items():
+                if key in row or key in {"subject_id", "rel_path", "subject_idx", "split", "file_path"}:
+                    continue
+                row[str(key)] = value
+            rows.append(row)
     else:
         files = sorted(root.glob("**/*.pt"))
         rows = []
@@ -111,12 +120,14 @@ def write_precompiled_index(
     if not rows:
         raise ValueError(f"No precompiled timelines found under {output_dir}")
 
-    index_df = pd.DataFrame.from_records(rows).sort_values("subject_id").reset_index(drop=True)
+    sort_cols = ["subject_id"] + [col for col in ("trajectory_ord", "trajectory_id") if col in rows[0]]
+    index_df = pd.DataFrame.from_records(rows).sort_values(sort_cols).reset_index(drop=True)
     split_counts: Dict[str, int] = {}
     if splits_parquet is not None:
         split_df = pd.read_parquet(splits_parquet)[["subject_id", "split"]].copy()
         split_df["subject_id"] = split_df["subject_id"].astype("int64")
-        index_df = index_df.merge(split_df, on="subject_id", how="left", validate="one_to_one")
+        merge_validate = "one_to_one" if index_df["subject_id"].is_unique else "many_to_one"
+        index_df = index_df.merge(split_df, on="subject_id", how="left", validate=merge_validate)
         split_counts = {
             str(k): int(v)
             for k, v in index_df["split"].fillna("<missing>").value_counts().sort_index().items()
@@ -225,6 +236,18 @@ def _process_subject_batch(subject_ids: Sequence[int]) -> List[Dict[str, object]
     rows: List[tuple[int, Dict[str, Any]]] = []
     for subject_id in subject_ids:
         try:
+            subject = _WORKER_STATE["db"][int(subject_id)]
+            subject_events = list(subject.events)
+            timeline_start_ts = None
+            for ev in subject_events:
+                t_ev = getattr(ev, "time", None)
+                if t_ev is None or not hasattr(t_ev, "timestamp"):
+                    continue
+                try:
+                    timeline_start_ts = float(t_ev.timestamp())
+                except Exception:
+                    timeline_start_ts = None
+                break
             timeline = build_subject_timeline(
                 db=_WORKER_STATE["db"],
                 subject_id=int(subject_id),
@@ -238,12 +261,24 @@ def _process_subject_batch(subject_ids: Sequence[int]) -> List[Dict[str, object]
             )
         except Exception as exc:  # pragma: no cover - exercised in integration contexts
             raise RuntimeError(f"Failed to compile subject_id={int(subject_id)}") from exc
-        rows.append((int(subject_id), serialize_timeline_compact(timeline)))
+        metadata = collect_subject_demographic_metadata(
+            subject_events,
+            timeline_start_ts=timeline_start_ts,
+        )
+        rows.append(
+            (
+                int(subject_id),
+                serialize_timeline_compact(
+                    timeline,
+                    metadata={"subject_demographics": metadata},
+                ),
+            )
+        )
     return _flush_worker_rows(rows)
 
 
-def _load_existing_index_records(output_dir: str) -> List[Dict[str, object]]:
-    index_path = Path(output_dir) / "index.csv"
+def _load_existing_index_records(output_dir: str, *, index_filename: str = "index.csv") -> List[Dict[str, object]]:
+    index_path = Path(output_dir) / str(index_filename)
     if not index_path.exists():
         return []
     index_df = pd.read_csv(index_path)
@@ -253,18 +288,132 @@ def _load_existing_index_records(output_dir: str) -> List[Dict[str, object]]:
             f"Existing index at {index_path} must contain columns {sorted(required)}"
         )
     records = index_df.to_dict(orient="records")
-    return [
-        {
+    out: List[Dict[str, object]] = []
+    for rec in records:
+        row = {
             "subject_id": int(rec["subject_id"]),
             "rel_path": str(rec["rel_path"]),
-            **(
-                {"subject_idx": int(rec["subject_idx"])}
-                if "subject_idx" in rec and not pd.isna(rec["subject_idx"])
-                else {}
-            ),
         }
-        for rec in records
-    ]
+        if "subject_idx" in rec and not pd.isna(rec["subject_idx"]):
+            row["subject_idx"] = int(rec["subject_idx"])
+        for key, value in rec.items():
+            if key in row or key in {"subject_id", "rel_path", "subject_idx", "split", "file_path"}:
+                continue
+            row[str(key)] = value
+        out.append(row)
+    return out
+
+
+def _build_trajectory_index_records(
+    *,
+    output_dir: str,
+    records: Sequence[Dict[str, object]],
+    segmentation_config: WindowSegmentationConfig,
+    trajectory_split_config: TrajectorySplitConfig,
+) -> List[Dict[str, object]]:
+    root = Path(output_dir)
+    shard_cache: Dict[str, Dict[str, Any]] = {}
+    materialized_subject_ids: List[int] = []
+    materialized_payloads: List[Dict[str, Any]] = []
+    materialized_rows: List[Dict[str, object]] = []
+    out: List[Dict[str, object]] = []
+    shard_idx = 0
+    target_trajectories_per_shard = 512
+
+    def _flush_materialized_shard() -> None:
+        nonlocal shard_idx
+        if not materialized_payloads:
+            return
+        shard_rel_path = f"trajectory_shards/{shard_idx:06d}{PRECOMPILED_SHARD_SUFFIX}"
+        save_packed_shard(
+            root / shard_rel_path,
+            subject_ids=list(materialized_subject_ids),
+            serialized_timelines=list(materialized_payloads),
+        )
+        for pos, row in enumerate(materialized_rows):
+            out.append(
+                {
+                    "subject_id": int(row["subject_id"]),
+                    "rel_path": shard_rel_path,
+                    "subject_idx": int(pos),
+                    "trajectory_id": int(row["trajectory_id"]),
+                    "trajectory_ord": int(row["trajectory_ord"]),
+                    "materialized_trajectory": 1,
+                    "source_rel_path": str(row["source_rel_path"]),
+                    **(
+                        {"source_subject_idx": int(row["source_subject_idx"])}
+                        if row.get("source_subject_idx") is not None
+                        else {}
+                    ),
+                }
+            )
+        materialized_subject_ids.clear()
+        materialized_payloads.clear()
+        materialized_rows.clear()
+        shard_idx += 1
+
+    for rec in sorted(records, key=lambda row: (int(row["subject_id"]), int(row.get("subject_idx", 0) or 0))):
+        rel_path = str(rec["rel_path"])
+        subject_idx = rec.get("subject_idx", None)
+        subject_id = int(rec["subject_id"])
+        file_path = root / rel_path
+        if subject_idx is None or pd.isna(subject_idx):
+            payload = torch.load(file_path, map_location="cpu", weights_only=False)
+            if isinstance(payload, dict) and "value_ids" in payload:
+                serialized = payload
+            else:
+                continue
+        else:
+            cached = shard_cache.get(rel_path)
+            if cached is None:
+                cached = load_packed_shard(file_path)
+                shard_cache[rel_path] = cached
+            serialized = cached["timelines"][int(subject_idx)]
+        timeline = deserialize_timeline_compact(serialized)
+        metadata = dict((serialized or {}).get("metadata", {}) or {})
+        subject_metadata = metadata.get("subject_demographics", None)
+        trajectories = build_trajectory_timelines(
+            timeline=timeline,
+            segmentation_config=segmentation_config,
+            split_config=trajectory_split_config,
+            subject_metadata=subject_metadata if isinstance(subject_metadata, dict) else None,
+        )
+        if not trajectories:
+            trajectories = [timeline]
+        for trajectory_ord, trajectory in enumerate(trajectories):
+            trajectory_id = len(out) + len(materialized_rows)
+            materialized_subject_ids.append(int(subject_id))
+            materialized_payloads.append(
+                serialize_timeline_compact(
+                    trajectory,
+                    metadata={
+                        "view": "trajectory",
+                        "subject_id": int(subject_id),
+                        "trajectory_ord": int(trajectory_ord),
+                        "source_rel_path": rel_path,
+                        **(
+                            {"source_subject_idx": int(subject_idx)}
+                            if subject_idx is not None and not pd.isna(subject_idx)
+                            else {}
+                        ),
+                    },
+                )
+            )
+            materialized_rows.append(
+                {
+                    "subject_id": int(subject_id),
+                    "trajectory_id": int(trajectory_id),
+                    "trajectory_ord": int(trajectory_ord),
+                    "source_rel_path": rel_path,
+                    "source_subject_idx": (
+                        int(subject_idx) if subject_idx is not None and not pd.isna(subject_idx) else None
+                    ),
+                }
+            )
+            if len(materialized_payloads) >= int(target_trajectories_per_shard):
+                _flush_materialized_shard()
+    _flush_materialized_shard()
+    return out
 
 
 def _iter_subject_batches(subject_ids: Sequence[int], batch_size: int) -> List[List[int]]:
@@ -292,6 +441,8 @@ def compile_dataset(
     skip_existing: bool = True,
     progress_every: int = 100,
     chunksize: int | None = None,
+    segmentation_config: WindowSegmentationConfig | None = None,
+    trajectory_split_config: TrajectorySplitConfig | None = None,
 ) -> Dict[str, object]:
     """
     Build timelines for selected subjects and persist them to disk.
@@ -362,6 +513,23 @@ def compile_dataset(
             records=existing_records,
             storage_format=PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
         )
+        trajectory_index_count = 0
+        if segmentation_config is not None and trajectory_split_config is not None:
+            trajectory_records = _build_trajectory_index_records(
+                output_dir=output_dir,
+                records=existing_records,
+                segmentation_config=segmentation_config,
+                trajectory_split_config=trajectory_split_config,
+            )
+            write_precompiled_index(
+                output_dir=output_dir,
+                splits_parquet=splits_parquet,
+                index_filename="trajectory_index.csv",
+                manifest_filename="trajectory_manifest.json",
+                records=trajectory_records,
+                storage_format=PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
+            )
+            trajectory_index_count = int(len(trajectory_records))
         manifest["compile_workers"] = int(workers)
         manifest["compile_chunksize"] = int(resolved_chunksize)
         manifest["compile_elapsed_seconds"] = float(elapsed)
@@ -369,6 +537,9 @@ def compile_dataset(
         manifest["skipped_existing_subjects"] = int(skipped_existing_count)
         manifest["target_subjects_per_shard"] = int(target_subjects_per_shard)
         manifest["shard_count"] = len({str(rec["rel_path"]) for rec in existing_records})
+        if trajectory_index_count > 0:
+            manifest["trajectory_index_filename"] = "trajectory_index.csv"
+            manifest["trajectory_count"] = int(trajectory_index_count)
         manifest_path = Path(output_dir) / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"wrote precompiled index -> {Path(output_dir) / 'index.csv'}")
@@ -436,6 +607,23 @@ def compile_dataset(
             records=index_rows,
             storage_format=PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
         )
+        trajectory_index_count = 0
+        if segmentation_config is not None and trajectory_split_config is not None:
+            trajectory_records = _build_trajectory_index_records(
+                output_dir=output_dir,
+                records=index_rows,
+                segmentation_config=segmentation_config,
+                trajectory_split_config=trajectory_split_config,
+            )
+            write_precompiled_index(
+                output_dir=output_dir,
+                splits_parquet=splits_parquet,
+                index_filename="trajectory_index.csv",
+                manifest_filename="trajectory_manifest.json",
+                records=trajectory_records,
+                storage_format=PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
+            )
+            trajectory_index_count = int(len(trajectory_records))
         manifest["compile_workers"] = int(workers)
         manifest["compile_chunksize"] = int(resolved_chunksize)
         manifest["compile_elapsed_seconds"] = float(elapsed)
@@ -444,6 +632,9 @@ def compile_dataset(
         manifest["target_subjects_per_shard"] = int(target_subjects_per_shard)
         manifest["resolved_subjects_per_shard"] = int(resolved_subjects_per_shard)
         manifest["shard_count"] = len({str(rec["rel_path"]) for rec in index_rows})
+        if trajectory_index_count > 0:
+            manifest["trajectory_index_filename"] = "trajectory_index.csv"
+            manifest["trajectory_count"] = int(trajectory_index_count)
         manifest_path = Path(output_dir) / "manifest.json"
         manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
         print(f"wrote precompiled index -> {Path(output_dir) / 'index.csv'}")

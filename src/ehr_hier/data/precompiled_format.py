@@ -31,7 +31,11 @@ def _epoch_us_to_datetime(value: int) -> datetime | None:
     return _EPOCH + timedelta(microseconds=int(value))
 
 
-def serialize_timeline_compact(timeline: Sequence[EventToken]) -> dict[str, Any]:
+def serialize_timeline_compact(
+    timeline: Sequence[EventToken],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
     token_count = int(len(timeline))
     value_ids = torch.empty(token_count, dtype=torch.int32)
     category_ids = torch.empty(token_count, dtype=torch.int16)
@@ -103,6 +107,7 @@ def serialize_timeline_compact(timeline: Sequence[EventToken]) -> dict[str, Any]
     return {
         "version": PRECOMPILED_PAYLOAD_VERSION,
         "token_count": token_count,
+        "metadata": dict(metadata or {}),
         "value_ids": value_ids,
         "category_ids": category_ids,
         "t_from_start_hours": t_from_start_hours,

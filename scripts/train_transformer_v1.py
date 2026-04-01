@@ -27,6 +27,7 @@ from scripts.audit_tokenization_flow import (  # noqa: E402
     _build_segmentation_config,
     _build_static_artifacts,
     _build_struct_vocab,
+    _build_trajectory_split_config,
     _build_window_marker_config,
     _load_subject_ids,
     _load_tokenization_contract,
@@ -458,6 +459,12 @@ def main() -> None:
     ap.add_argument("--precompiled_root", default=None)
     ap.add_argument("--precompiled_train_root", default=None)
     ap.add_argument("--precompiled_eval_root", default=None)
+    ap.add_argument(
+        "--trajectory_mode",
+        default="full_subject",
+        choices=["full_subject", "admission_chain"],
+    )
+    ap.add_argument("--post_discharge_cutoff_days", type=float, default=31.0)
 
     ap.add_argument("--tokenization_yaml", default="configs/data/tokenization_v1.yaml")
     ap.add_argument("--vocab_manifest", default="artifacts/vocab_manifest.json")
@@ -583,6 +590,10 @@ def main() -> None:
         structural_codebook=artifacts.structural_codebook,
         unk_type_id=int(window_markers_cfg.unk_type_id),
     )
+    trajectory_split_cfg = _build_trajectory_split_config(
+        mode=str(args.trajectory_mode),
+        post_discharge_cutoff_days=float(args.post_discharge_cutoff_days),
+    )
 
     collator = AETHierarchicalCollator(
         max_windows=int(args.max_windows),
@@ -611,6 +622,9 @@ def main() -> None:
             precompiled_train_root,
             split=str(args.train_split),
             splits_parquet=str(args.splits_parquet),
+            index_filename=("trajectory_index.csv" if str(args.trajectory_mode) == "admission_chain" else "index.csv"),
+            segmentation_config=segmentation_cfg,
+            trajectory_split_config=trajectory_split_cfg,
         )
         train_loader = DataLoader(
             train_ds,
@@ -623,6 +637,7 @@ def main() -> None:
             "mode": "precompiled",
             "train_root": str(precompiled_train_root),
             "eval_root": str(precompiled_eval_root or precompiled_train_root),
+            "trajectory_mode": str(args.trajectory_mode),
             "resolved_num_workers": int(train_loader_kwargs["num_workers"]),
             "prefetch_factor": int(train_loader_kwargs.get("prefetch_factor", 0)),
             "persistent_workers": bool(train_loader_kwargs.get("persistent_workers", False)),
@@ -640,6 +655,9 @@ def main() -> None:
                 eval_root,
                 split=str(args.eval_split),
                 splits_parquet=str(args.splits_parquet),
+                index_filename=("trajectory_index.csv" if str(args.trajectory_mode) == "admission_chain" else "index.csv"),
+                segmentation_config=segmentation_cfg,
+                trajectory_split_config=trajectory_split_cfg,
             )
             eval_loader = DataLoader(
                 eval_ds,
@@ -654,6 +672,10 @@ def main() -> None:
             raise ValueError("--meds_reader_db is required unless --precompiled_root is provided.")
         if int(args.num_workers) != 0:
             raise ValueError("On-the-fly timeline building currently requires --num_workers 0.")
+        if str(args.trajectory_mode) != "full_subject":
+            raise ValueError(
+                "On-the-fly timeline building does not support --trajectory_mode admission_chain; use precompiled trajectories."
+            )
         residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
             args,
             tokenization_contract=tokenization_contract,
@@ -705,6 +727,7 @@ def main() -> None:
         )
         pipeline_summary = {
             "mode": "on_the_fly",
+            "trajectory_mode": "full_subject",
             "resolved_num_workers": 0,
             "train_subject_count": int(len(train_ds)),
         }

@@ -8,12 +8,15 @@ import torch
 
 import src.ehr_hier.data.compile_dataset as compile_mod
 import src.ehr_hier.data.dataset as dataset_mod
+from src.ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
 from src.ehr_hier.data.precompiled_format import (
     deserialize_timeline_compact,
     save_packed_shard,
     serialize_timeline_compact,
 )
-from src.ehr_hier.data.token_types import EventToken
+from src.ehr_hier.data.token_types import EventToken, TokenCategory
+from src.ehr_hier.data.trajectory_splitting import TrajectorySplitConfig
+from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
 
 
 def _write_timeline(root: Path, rel_path: str, payload: object) -> None:
@@ -46,6 +49,87 @@ def _make_timeline(subject_id: int, *, length: int = 6) -> list[EventToken]:
             )
         )
     return timeline
+
+
+def _make_split_timeline() -> list[EventToken]:
+    start = datetime(2026, 3, 31, 8, 0, 0)
+    return [
+        EventToken(
+            value_id=1,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_window_type_id": 2,
+                "window_type_id": 2,
+                "transition_site_id": 101,
+                "window_site_id": 101,
+            },
+            num_attrs={},
+            raw_time=start,
+            window_hook="window_boundary",
+        ),
+        EventToken(
+            value_id=2,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
+            raw_time=start + timedelta(hours=1),
+            window_hook=None,
+        ),
+        EventToken(
+            value_id=3,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=10.0,
+            dt_from_prev_hours=9.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_current"],
+                "transition_discharge_like": 1,
+            },
+            num_attrs={},
+            raw_time=start + timedelta(hours=10),
+            window_hook="window_boundary",
+        ),
+        EventToken(
+            value_id=4,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=20.0,
+            dt_from_prev_hours=10.0,
+            cat_attrs={},
+            num_attrs={},
+            raw_time=start + timedelta(hours=20),
+            window_hook=None,
+        ),
+        EventToken(
+            value_id=5,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=900.0,
+            dt_from_prev_hours=880.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_window_type_id": 2,
+                "window_type_id": 2,
+                "transition_site_id": 202,
+                "window_site_id": 202,
+            },
+            num_attrs={},
+            raw_time=start + timedelta(hours=900),
+            window_hook="window_boundary",
+        ),
+        EventToken(
+            value_id=6,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=901.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
+            raw_time=start + timedelta(hours=901),
+            window_hook=None,
+        ),
+    ]
 
 
 def test_precompiled_dataset_filters_from_index_split_column(tmp_path: Path) -> None:
@@ -128,6 +212,42 @@ def test_write_precompiled_index_writes_manifest_and_split_counts(
     assert manifest["split_counts"] == {"train": 1, "tuning": 1}
 
 
+def test_write_precompiled_index_supports_duplicate_subject_rows_for_trajectories(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    def _fake_read_parquet(_: str) -> pd.DataFrame:
+        return pd.DataFrame([{"subject_id": 101, "split": "train"}])
+
+    monkeypatch.setattr(compile_mod.pd, "read_parquet", _fake_read_parquet)
+    manifest = compile_mod.write_precompiled_index(
+        output_dir=str(tmp_path),
+        splits_parquet=str(tmp_path / "splits.parquet"),
+        index_filename="trajectory_index.csv",
+        manifest_filename="trajectory_manifest.json",
+        records=[
+            {
+                "subject_id": 101,
+                "rel_path": "shards/000000.ptz",
+                "subject_idx": 0,
+                "trajectory_ord": 0,
+            },
+            {
+                "subject_id": 101,
+                "rel_path": "shards/000000.ptz",
+                "subject_idx": 0,
+                "trajectory_ord": 1,
+            },
+        ],
+        storage_format="packed_shard_v2",
+    )
+
+    index_df = pd.read_csv(tmp_path / "trajectory_index.csv")
+    assert index_df["trajectory_ord"].tolist() == [0, 1]
+    assert manifest["total_timelines"] == 2
+    assert manifest["split_counts"] == {"train": 2}
+
+
 def test_compact_timeline_roundtrip_preserves_event_fields() -> None:
     timeline = _make_timeline(101, length=8)
 
@@ -192,3 +312,66 @@ def test_packed_shard_is_smaller_than_legacy_subject_pickle(tmp_path: Path) -> N
     )
 
     assert shard_path.stat().st_size < legacy_path.stat().st_size
+
+
+def test_precompiled_dataset_loads_materialized_trajectory_rows_directly(tmp_path: Path) -> None:
+    trajectory = _make_timeline(404, length=4)
+    shard_path = tmp_path / "trajectory_shards" / "000000.ptz"
+    save_packed_shard(
+        shard_path,
+        subject_ids=[404],
+        serialized_timelines=[serialize_timeline_compact(trajectory)],
+    )
+    pd.DataFrame(
+        [
+            {
+                "subject_id": 404,
+                "rel_path": "trajectory_shards/000000.ptz",
+                "subject_idx": 0,
+                "trajectory_id": 0,
+                "trajectory_ord": 0,
+                "materialized_trajectory": 1,
+                "split": "train",
+            }
+        ]
+    ).to_csv(tmp_path / "trajectory_index.csv", index=False)
+    (tmp_path / "manifest.json").write_text(
+        '{"version": 2, "storage_format": "packed_shard_v2"}',
+        encoding="utf-8",
+    )
+
+    ds = dataset_mod.PrecompiledMEDSDataset(
+        str(tmp_path),
+        split="train",
+        index_filename="trajectory_index.csv",
+    )
+
+    assert len(ds) == 1
+    assert ds[0] == trajectory
+
+
+def test_build_trajectory_index_records_materializes_direct_trajectory_shards(tmp_path: Path) -> None:
+    full_timeline = _make_split_timeline()
+    save_packed_shard(
+        tmp_path / "shards" / "000000.ptz",
+        subject_ids=[101],
+        serialized_timelines=[serialize_timeline_compact(full_timeline)],
+    )
+
+    rows = compile_mod._build_trajectory_index_records(
+        output_dir=str(tmp_path),
+        records=[{"subject_id": 101, "rel_path": "shards/000000.ptz", "subject_idx": 0}],
+        segmentation_config=WindowSegmentationConfig(
+            unk_window_type_id=0,
+            post_discharge_window_type_id=5,
+        ),
+        trajectory_split_config=TrajectorySplitConfig(
+            mode="admission_chain",
+            post_discharge_cutoff_hours=31.0 * 24.0,
+        ),
+    )
+
+    assert len(rows) == 2
+    assert all(int(row["materialized_trajectory"]) == 1 for row in rows)
+    assert all(str(row["rel_path"]).startswith("trajectory_shards/") for row in rows)
+    assert (tmp_path / str(rows[0]["rel_path"])).exists()
