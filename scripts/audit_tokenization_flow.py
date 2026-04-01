@@ -77,6 +77,7 @@ from src.ehr_hier.tokenizers.vocab_contract import (
 )
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
+from src.ehr_hier.data.trajectory_splitting import TrajectorySplitConfig
 
 
 SPECIAL_ID2NAME = {
@@ -233,6 +234,30 @@ def _build_segmentation_config(
         propagate_prev_type_for_unknown_windows=bool(
             cfg.get("propagate_prev_type_for_unknown_windows", False)
         ),
+        preserve_same_site_within_window=bool(
+            cfg.get("preserve_same_site_within_window", True)
+        ),
+        site_change_starts_new_window=bool(
+            cfg.get("site_change_starts_new_window", True)
+        ),
+    )
+
+
+def _build_trajectory_split_config(
+    *,
+    mode: str,
+    post_discharge_cutoff_days: float,
+) -> TrajectorySplitConfig | None:
+    mode_norm = str(mode or "full_subject").strip().lower()
+    if mode_norm in {"", "none"}:
+        return None
+    if mode_norm not in {"full_subject", "admission_chain"}:
+        raise ValueError(
+            f"Unsupported trajectory split mode {mode!r}; expected one of ['full_subject', 'admission_chain', 'none']"
+        )
+    return TrajectorySplitConfig(
+        mode=mode_norm,
+        post_discharge_cutoff_hours=float(post_discharge_cutoff_days) * 24.0,
     )
 
 
