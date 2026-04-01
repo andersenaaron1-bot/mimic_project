@@ -1,6 +1,8 @@
 from __future__ import annotations
 from dataclasses import dataclass, field
+import re
 from typing import Any, Dict, Mapping, Optional, Set
+import zlib
 
 import yaml
 
@@ -63,6 +65,113 @@ ED_LOCATION_ALIASES = (
     "EMERGENCY DEPARTMENT",
     "EMERGENCY ROOM",
 )
+
+ICU_SITE_CANONICALS: Dict[str, tuple[str, ...]] = {
+    "MICU": ("MICU", "MEDICAL ICU"),
+    "SICU": ("SICU", "SURGICAL ICU"),
+    "TSICU": ("TSICU", "TRAUMA ICU", "TRAUMA SICU"),
+    "CCU": ("CCU", "CARDIAC CARE UNIT", "CORONARY CARE UNIT", "CICU"),
+    "CVICU": ("CVICU", "CARDIAC ICU"),
+    "CSRU": ("CSRU", "CARDIAC SURGERY RECOVERY UNIT"),
+    "NSICU": ("NSICU", "NEURO ICU", "NEUROLOGIC ICU"),
+    "PICU": ("PICU",),
+    "NICU": ("NICU",),
+}
+
+INPATIENT_SITE_CANONICALS: Dict[str, tuple[str, ...]] = {
+    "PACU": ("PACU", "POST ANESTHESIA CARE UNIT", "POST-ANESTHESIA CARE UNIT", "RECOVERY ROOM"),
+    "PREOP": ("PRE-OP", "PRE OP", "PREOP", "PRE-OP HOLDING"),
+    "POSTOP": ("POST-OP", "POST OP", "POSTOP"),
+}
+
+
+def _normalize_site_token(text: str) -> str:
+    upper = str(text).upper().strip()
+    upper = upper.replace("_", " ")
+    upper = re.sub(r"[^A-Z0-9]+", " ", upper)
+    return re.sub(r"\s+", " ", upper).strip()
+
+
+def _stable_site_id(name: str) -> int:
+    encoded = str(name).encode("utf-8", errors="ignore")
+    return 1 + (zlib.crc32(encoded) & 0x7FFFFFFF)
+
+
+def _match_site_canonical(normalized_text: str, canonicals: Mapping[str, tuple[str, ...]]) -> Optional[str]:
+    for canonical, aliases in canonicals.items():
+        if normalized_text == _normalize_site_token(canonical):
+            return str(canonical)
+        for alias in aliases:
+            alias_norm = _normalize_site_token(alias)
+            if alias_norm and alias_norm in normalized_text:
+                return str(canonical)
+    return None
+
+
+def _infer_macro_window_type_from_code(code_str: str) -> Optional[str]:
+    upper = str(code_str).upper()
+    prefix = upper.split("//", 1)[0]
+    if prefix == "ED_REGISTRATION" or looks_ed_location(upper):
+        return "ED_ADMISSION"
+    if prefix in {"ICU_ADMISSION", "ICU_DISCHARGE"} or looks_icu_location(upper):
+        return "ICU"
+    if prefix in {"STRUCT_START_OR", "STRUCT_END_OR"} or looks_or_location(upper):
+        return "OR"
+    if prefix in {"ADMISSION", "HOSPITAL_ADMISSION", "CAREUNIT_CHANGE", "TRANSFER_TO"}:
+        return "INPATIENT"
+    return None
+
+
+def _extract_transition_site_components(code_str: str) -> list[str]:
+    upper = str(code_str).strip()
+    if not upper:
+        return []
+    parts = [p.strip() for p in upper.split("//")]
+    prefix = parts[0].upper() if parts else ""
+    if prefix == "TRANSFER_TO":
+        return [p for p in parts[1:] if p]
+    if prefix == "ICU_ADMISSION":
+        return [p for p in parts[1:] if p] or ["ICU_ADMISSION"]
+    if prefix == "ED_REGISTRATION":
+        return [p for p in parts[1:] if p] or ["ED"]
+    if prefix in {"ADMISSION", "HOSPITAL_ADMISSION"}:
+        return [p for p in parts[1:] if p] or ["ADMISSION"]
+    return []
+
+
+def canonical_transition_site_name(*, code: str | None, macro_type: str | None) -> Optional[str]:
+    if code is None or macro_type is None:
+        return None
+    code_str = str(code)
+    components = _extract_transition_site_components(code_str)
+    if not components:
+        macro = str(macro_type).strip().upper()
+        if not macro:
+            return None
+        return f"{macro}::{macro}"
+
+    raw_suffix = " // ".join(str(part).strip() for part in components if str(part).strip())
+    normalized = _normalize_site_token(raw_suffix)
+    macro = str(macro_type).strip().upper()
+    if not normalized or not macro:
+        return None
+
+    if macro == "ICU":
+        canonical = _match_site_canonical(normalized, ICU_SITE_CANONICALS)
+        return f"{macro}::{canonical or normalized}"
+    if macro == "INPATIENT":
+        canonical = _match_site_canonical(normalized, INPATIENT_SITE_CANONICALS)
+        return f"{macro}::{canonical or normalized}"
+    if macro == "ED_ADMISSION":
+        return f"{macro}::ED"
+    if macro == "OR":
+        if normalized.startswith("OR ") or normalized == "OR":
+            suffix = normalized[3:].strip()
+            return f"{macro}::{suffix or 'OR'}"
+        return f"{macro}::{normalized}"
+    if macro == "POST_DISCHARGE":
+        return f"{macro}::POST_DISCHARGE"
+    return f"{macro}::{normalized}"
 
 
 def looks_icu_location(text: str) -> bool:
@@ -214,7 +323,7 @@ class StructuralCodebook:
                 return self.window_type_map[prefix]
             if prefix == "TRANSFER_TO":
                 if looks_ed_location(upper):
-                    return "ED"
+                    return "ED_ADMISSION"
                 if looks_icu_location(upper):
                     return "ICU"
                 if looks_or_location(upper):
@@ -222,7 +331,7 @@ class StructuralCodebook:
                 if prefix in self.window_type_map:
                     return self.window_type_map[prefix]
             if looks_ed_location(upper):
-                return "ED"
+                return "ED_ADMISSION"
             if looks_icu_location(upper):
                 return "ICU"
             if looks_or_location(upper):
@@ -238,7 +347,7 @@ class StructuralCodebook:
                 return "OR"
 
         if action == "suppress" and code_str == "MEDS_BIRTH":
-            return "PROLOGUE"
+            return self.window_type_map.get("MEDS_BIRTH")
         return None
 
     def window_type_id(
@@ -251,7 +360,39 @@ class StructuralCodebook:
         name = self.window_type_name(code=code, label=label, action=action)
         if name is None:
             return None
-        return self.window_type2id_map.get(name)
+        type_id = self.window_type2id_map.get(name)
+        if type_id is not None:
+            return type_id
+        if name == "ED_ADMISSION":
+            return self.window_type2id_map.get("ED")
+        if name == "ED":
+            return self.window_type2id_map.get("ED_ADMISSION")
+        return None
+
+    def transition_site_name(
+        self,
+        *,
+        code: str | None = None,
+        label: str | None = None,
+        action: str | None = None,
+    ) -> Optional[str]:
+        del label  # reserved for future explicit label-level site overrides
+        macro_type = self.window_type_name(code=code, action=action)
+        if macro_type is None and code is not None:
+            macro_type = _infer_macro_window_type_from_code(str(code))
+        return canonical_transition_site_name(code=code, macro_type=macro_type)
+
+    def transition_site_id(
+        self,
+        *,
+        code: str | None = None,
+        label: str | None = None,
+        action: str | None = None,
+    ) -> Optional[int]:
+        site_name = self.transition_site_name(code=code, label=label, action=action)
+        if site_name is None:
+            return None
+        return _stable_site_id(site_name)
 
     def __contains__(self, code: object) -> bool:
         return code is not None and str(code) in self.code2label

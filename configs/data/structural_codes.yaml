@@ -67,16 +67,14 @@ transition_map:
 
 window_types:
   "UNK": 0
-  "PROLOGUE": 1
-  "ED": 2
-  "INPATIENT": 3
-  "ICU": 4
-  "OR": 5
-  "POST_DISCHARGE": 6
+  "ED_ADMISSION": 1
+  "INPATIENT": 2
+  "ICU": 3
+  "OR": 4
+  "POST_DISCHARGE": 5
 
 window_type_map:
-  "MEDS_BIRTH": "PROLOGUE"
-  "ED_REGISTRATION": "ED"
+  "ED_REGISTRATION": "ED_ADMISSION"
   "ADMISSION": "INPATIENT"
   "HOSPITAL_ADMISSION": "INPATIENT"
   "CAREUNIT_CHANGE": "INPATIENT"

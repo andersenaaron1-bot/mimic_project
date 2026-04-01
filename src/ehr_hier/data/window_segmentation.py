@@ -40,6 +40,12 @@ class WindowSegmentationConfig:
     # Legacy compatibility knob; the v1 causal windowing path does not propagate
     # previous types into later untyped windows.
     propagate_prev_type_for_unknown_windows: bool = False
+    # When enabled, transitions that preserve both macro window type and canonical
+    # site are kept inside the same semantic window and only mark a local chunk break.
+    preserve_same_site_within_window: bool = True
+    # When enabled, transitions that change site within the same macro type still
+    # open a fresh semantic window.
+    site_change_starts_new_window: bool = True
 
 
 @dataclass
@@ -47,8 +53,13 @@ class SegmentedWindow:
     tokens: List[EventToken]
     window_type_id: int
     start_time_hours: float
+    window_site_id: int = 0
     opening_action: Optional[str] = None
     closing_action: Optional[str] = None
+    opening_time_hours: Optional[float] = None
+    closing_time_hours: Optional[float] = None
+    closing_discharge_like: bool = False
+    chunk_break_token_indices: List[int] = field(default_factory=list)
     chunks: List["SegmentedChunk"] = field(default_factory=list)
     truncated_chunks: int = 0
     truncated_tokens: int = 0
@@ -118,6 +129,25 @@ def _token_transition_type_id(tok: EventToken) -> Optional[int]:
     return None
 
 
+def _token_transition_site_id(tok: EventToken) -> Optional[int]:
+    for key in ("transition_site_id", "window_site_id"):
+        site_id = _cat_attr_int(tok, key)
+        if site_id is not None and site_id > 0:
+            return int(site_id)
+    return None
+
+
+def _window_site_id_from_tokens(window_tokens: List[EventToken]) -> int:
+    if not window_tokens:
+        return 0
+    for tok in window_tokens:
+        for key in ("window_site_id", "transition_site_id"):
+            site_id = _cat_attr_int(tok, key)
+            if site_id is not None and site_id > 0:
+                return int(site_id)
+    return 0
+
+
 def _infer_window_type_from_tokens(window_tokens: List[EventToken], *, unk_type_id: int) -> int:
     if not window_tokens:
         return int(unk_type_id)
@@ -173,6 +203,42 @@ def _resolve_opening_window_type(
     return int(config.unk_window_type_id)
 
 
+def _resolve_opening_window_site_id(opening_tokens: List[EventToken]) -> int:
+    if not opening_tokens:
+        return 0
+
+    specific_override_tokens = [
+        tok
+        for tok in opening_tokens
+        if not _token_has_flag(tok, "transition_transfer_like")
+        and (
+            _token_has_flag(tok, "transition_icu_like")
+            or _token_has_flag(tok, "transition_or_like")
+        )
+    ]
+    if specific_override_tokens:
+        source_tokens = [specific_override_tokens[0]]
+    else:
+        preferred_tokens = [
+            tok for tok in opening_tokens
+            if _token_has_flag(tok, "transition_transfer_like")
+        ]
+        if preferred_tokens:
+            source_tokens = [preferred_tokens[0]]
+        else:
+            source_tokens = [opening_tokens[0]]
+
+    explicit_ids = [
+        int(site_id)
+        for tok in source_tokens
+        for site_id in [_token_transition_site_id(tok)]
+        if site_id is not None and int(site_id) > 0
+    ]
+    if explicit_ids:
+        return int(explicit_ids[0])
+    return 0
+
+
 def _apply_window_type_fallbacks(
     windows: List[SegmentedWindow],
     *,
@@ -199,8 +265,13 @@ def _apply_window_type_fallbacks(
                 tokens=list(window.tokens),
                 window_type_id=int(w_type),
                 start_time_hours=float(window.start_time_hours),
+                window_site_id=int(window.window_site_id),
                 opening_action=window.opening_action,
                 closing_action=window.closing_action,
+                opening_time_hours=window.opening_time_hours,
+                closing_time_hours=window.closing_time_hours,
+                closing_discharge_like=bool(window.closing_discharge_like),
+                chunk_break_token_indices=list(window.chunk_break_token_indices),
                 chunks=list(window.chunks),
             )
         )
@@ -390,6 +461,22 @@ def _next_window_type_after_close(
     return int(config.unk_window_type_id)
 
 
+def _bundle_opening_context(
+    opening_items: List[EventToken],
+    *,
+    config: WindowSegmentationConfig,
+) -> tuple[int, int]:
+    type_id = _resolve_opening_window_type(opening_items, config=config)
+    site_id = _resolve_opening_window_site_id(opening_items)
+    return int(type_id), int(site_id)
+
+
+def _bundle_time_hours(tokens: List[EventToken]) -> Optional[float]:
+    if not tokens:
+        return None
+    return float(tokens[0].t_from_start_hours)
+
+
 def segment_event_tokens(
     events: List[EventToken],
     *,
@@ -407,6 +494,7 @@ def segment_event_tokens(
                     tokens=list(events),
                     window_type_id=_infer_window_type_from_tokens(list(events), unk_type_id=config.unk_window_type_id),
                     start_time_hours=float(events[0].t_from_start_hours),
+                    window_site_id=_window_site_id_from_tokens(list(events)),
                     opening_action=None,
                     closing_action=None,
                 )
@@ -417,7 +505,51 @@ def segment_event_tokens(
     windows: List[SegmentedWindow] = []
     current_tokens: List[EventToken] = []
     current_type_id = int(config.unk_window_type_id)
+    current_site_id = 0
     current_opening_action: Optional[str] = None
+    current_opening_time_hours: Optional[float] = None
+    current_chunk_breaks: List[int] = []
+
+    def _emit_current_window(
+        *,
+        closing_action: Optional[str],
+        closing_items: Optional[List[EventToken]] = None,
+        closing_time_hours: Optional[float] = None,
+    ) -> None:
+        if not current_tokens:
+            return
+        effective_type_id = (
+            int(current_type_id)
+            if int(current_type_id) != int(config.unk_window_type_id)
+            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+        )
+        effective_site_id = int(current_site_id) if int(current_site_id) > 0 else _window_site_id_from_tokens(current_tokens)
+        closing_items_local = list(closing_items or [])
+        if closing_time_hours is None and closing_items_local:
+            closing_time_hours_local = float(closing_items_local[-1].t_from_start_hours)
+        else:
+            closing_time_hours_local = closing_time_hours
+        windows.append(
+            SegmentedWindow(
+                tokens=list(current_tokens),
+                window_type_id=int(effective_type_id),
+                start_time_hours=float(current_tokens[0].t_from_start_hours),
+                window_site_id=int(effective_site_id),
+                opening_action=current_opening_action,
+                closing_action=closing_action,
+                opening_time_hours=current_opening_time_hours,
+                closing_time_hours=closing_time_hours_local,
+                closing_discharge_like=bool(
+                    closing_items_local
+                    and any(
+                        _token_has_flag(tok, "transition_discharge_like")
+                        or _token_has_flag(tok, "transition_death_like")
+                        for tok in closing_items_local
+                    )
+                ),
+                chunk_break_token_indices=list(current_chunk_breaks),
+            )
+        )
 
     cursor = 0
     for bundle in bundles:
@@ -432,72 +564,81 @@ def segment_event_tokens(
             list(bundle["candidate_indices"]),  # type: ignore[arg-type]
             bundle_start_idx=start_idx,
         )
+        opening_type_id, opening_site_id = _bundle_opening_context(opening_items, config=config)
+        preserve_in_window = bool(
+            config.preserve_same_site_within_window
+            and bundle_action in {"open_next", "close_open"}
+            and current_tokens
+            and int(opening_type_id) != int(config.unk_window_type_id)
+            and int(opening_type_id) == int(current_type_id)
+            and int(opening_site_id) > 0
+            and (
+                int(opening_site_id) == int(current_site_id)
+                or (
+                    not config.site_change_starts_new_window
+                    and int(current_site_id) > 0
+                )
+            )
+        )
+        if preserve_in_window:
+            break_idx = len(current_tokens) + len(closing_items)
+            if break_idx > 0:
+                current_chunk_breaks.append(int(break_idx))
+            current_tokens.extend(closing_items)
+            current_tokens.extend(opening_items)
+            if int(opening_site_id) > 0 and int(opening_site_id) != int(current_site_id):
+                current_site_id = int(opening_site_id)
+            cursor = end_idx + 1
+            continue
 
         if bundle_action == "close_current":
             current_tokens.extend(closing_items)
             if current_tokens:
-                windows.append(
-                    SegmentedWindow(
-                        tokens=list(current_tokens),
-                        window_type_id=(
-                            int(current_type_id)
-                            if int(current_type_id) != int(config.unk_window_type_id)
-                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
-                        ),
-                        start_time_hours=float(current_tokens[0].t_from_start_hours),
-                        opening_action=current_opening_action,
-                        closing_action=bundle_action,
-                    )
+                _emit_current_window(
+                    closing_action=bundle_action,
+                    closing_items=closing_items,
+                    closing_time_hours=_bundle_time_hours(closing_items),
                 )
             current_tokens = []
             current_type_id = _next_window_type_after_close(
                 closing_items,
                 config=config,
             )
+            current_site_id = 0
             current_opening_action = None
+            current_opening_time_hours = None
+            current_chunk_breaks = []
         elif bundle_action == "open_next":
             if current_tokens:
-                windows.append(
-                    SegmentedWindow(
-                        tokens=list(current_tokens),
-                        window_type_id=(
-                            int(current_type_id)
-                            if int(current_type_id) != int(config.unk_window_type_id)
-                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
-                        ),
-                        start_time_hours=float(current_tokens[0].t_from_start_hours),
-                        opening_action=current_opening_action,
-                        closing_action=None,
-                    )
-                )
+                _emit_current_window(closing_action=None)
             current_tokens = list(opening_items)
-            current_type_id = _resolve_opening_window_type(
-                opening_items,
-                config=config,
-            )
+            current_type_id = int(opening_type_id)
+            current_site_id = int(opening_site_id)
             current_opening_action = bundle_action
+            current_opening_time_hours = _bundle_time_hours(opening_items)
+            current_chunk_breaks = []
         elif bundle_action == "close_open":
-            current_tokens.extend(closing_items)
-            if current_tokens:
-                windows.append(
-                    SegmentedWindow(
-                        tokens=list(current_tokens),
-                        window_type_id=(
-                            int(current_type_id)
-                            if int(current_type_id) != int(config.unk_window_type_id)
-                            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
-                        ),
-                        start_time_hours=float(current_tokens[0].t_from_start_hours),
-                        opening_action=current_opening_action,
+            if not current_tokens and not closing_items:
+                current_tokens = list(opening_items)
+                current_type_id = int(opening_type_id)
+                current_site_id = int(opening_site_id)
+                current_opening_action = bundle_action
+                current_opening_time_hours = _bundle_time_hours(opening_items)
+                current_chunk_breaks = []
+            else:
+                current_tokens.extend(closing_items)
+                if current_tokens:
+                    _emit_current_window(
                         closing_action=bundle_action,
+                        closing_items=closing_items,
+                        closing_time_hours=_bundle_time_hours(closing_items),
                     )
-                )
-            current_tokens = list(opening_items)
-            current_type_id = _resolve_opening_window_type(
-                opening_items,
-                config=config,
-            )
-            current_opening_action = bundle_action
+                current_tokens = list(opening_items)
+                current_type_id = int(opening_type_id)
+                current_site_id = int(opening_site_id)
+                current_opening_action = bundle_action
+                current_opening_time_hours = _bundle_time_hours(opening_items)
+                current_chunk_breaks = []
         else:
             raise ValueError(f"Unsupported bundle action: {bundle_action}")
 
@@ -507,19 +648,7 @@ def segment_event_tokens(
         current_tokens.extend(events[cursor:])
 
     if current_tokens:
-        windows.append(
-            SegmentedWindow(
-                tokens=list(current_tokens),
-                window_type_id=(
-                    int(current_type_id)
-                    if int(current_type_id) != int(config.unk_window_type_id)
-                    else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
-                ),
-                start_time_hours=float(current_tokens[0].t_from_start_hours),
-                opening_action=current_opening_action,
-                closing_action=None,
-            )
-        )
+        _emit_current_window(closing_action=None)
 
     return _apply_window_type_fallbacks(windows, config=config)
 
@@ -587,8 +716,13 @@ def rebalance_segmented_windows(
                     tokens=list(chunk),
                     window_type_id=int(window.window_type_id),
                     start_time_hours=float(chunk[0].t_from_start_hours),
+                    window_site_id=int(window.window_site_id),
                     opening_action=window.opening_action if idx == 0 else None,
                     closing_action=window.closing_action if idx == len(chunks) - 1 else None,
+                    opening_time_hours=window.opening_time_hours if idx == 0 else None,
+                    closing_time_hours=window.closing_time_hours if idx == len(chunks) - 1 else None,
+                    closing_discharge_like=bool(window.closing_discharge_like and idx == len(chunks) - 1),
+                    chunk_break_token_indices=[],
                 )
             )
 
@@ -628,8 +762,13 @@ def chunk_segmented_windows(
                     tokens=[],
                     window_type_id=int(window.window_type_id),
                     start_time_hours=float(window.start_time_hours),
+                    window_site_id=int(window.window_site_id),
                     opening_action=window.opening_action,
                     closing_action=window.closing_action,
+                    opening_time_hours=window.opening_time_hours,
+                    closing_time_hours=window.closing_time_hours,
+                    closing_discharge_like=bool(window.closing_discharge_like),
+                    chunk_break_token_indices=list(window.chunk_break_token_indices),
                     chunks=[],
                     truncated_chunks=0,
                     truncated_tokens=0,
@@ -638,18 +777,40 @@ def chunk_segmented_windows(
             )
             continue
 
-        groups: List[List[EventToken]] = []
+        groups: List[tuple[int, List[EventToken]]] = []
+        local_break_starts = {
+            int(idx)
+            for idx in (window.chunk_break_token_indices or [])
+            if int(idx) > 0
+        }
+        tok_cursor = 0
         for group in _group_tokens_by_time(window.tokens):
-            groups.extend(_split_oversized_group(group, max_content_tokens=int(max_content_tokens)))
+            split_groups = _split_oversized_group(group, max_content_tokens=int(max_content_tokens))
+            split_cursor = 0
+            for split_group in split_groups:
+                groups.append((int(tok_cursor + split_cursor), list(split_group)))
+                split_cursor += len(split_group)
+            tok_cursor += len(group)
 
         raw_chunks: List[List[EventToken]] = []
+        raw_chunk_start_indices: List[int] = []
         current: List[EventToken] = []
         current_len = 0
-        for group in groups:
+        current_start_idx = 0
+        for group_start_idx, group in groups:
             g_len = len(group)
             if not current:
                 current = list(group)
                 current_len = g_len
+                current_start_idx = int(group_start_idx)
+                continue
+
+            if int(group_start_idx) in local_break_starts:
+                raw_chunks.append(list(current))
+                raw_chunk_start_indices.append(int(current_start_idx))
+                current = list(group)
+                current_len = g_len
+                current_start_idx = int(group_start_idx)
                 continue
 
             if current_len < min_tokens and current_len + g_len <= int(max_content_tokens):
@@ -663,16 +824,21 @@ def chunk_segmented_windows(
                 continue
 
             raw_chunks.append(list(current))
+            raw_chunk_start_indices.append(int(current_start_idx))
             current = list(group)
             current_len = g_len
+            current_start_idx = int(group_start_idx)
 
         if current:
             raw_chunks.append(list(current))
+            raw_chunk_start_indices.append(int(current_start_idx))
 
         if len(raw_chunks) >= 2 and len(raw_chunks[-1]) < tail_tokens:
-            if len(raw_chunks[-2]) + len(raw_chunks[-1]) <= int(max_content_tokens):
+            tail_chunk_forced_break = int(raw_chunk_start_indices[-1]) in local_break_starts
+            if not tail_chunk_forced_break and len(raw_chunks[-2]) + len(raw_chunks[-1]) <= int(max_content_tokens):
                 raw_chunks[-2].extend(raw_chunks[-1])
                 raw_chunks.pop()
+                raw_chunk_start_indices.pop()
 
         raw_chunk_count_before_cap = len(raw_chunks)
         raw_chunks_kept = raw_chunks[: int(max_chunks_per_window)]
@@ -705,8 +871,13 @@ def chunk_segmented_windows(
                 tokens=list(window.tokens),
                 window_type_id=int(window.window_type_id),
                 start_time_hours=float(window.start_time_hours),
+                window_site_id=int(window.window_site_id),
                 opening_action=window.opening_action,
                 closing_action=window.closing_action,
+                opening_time_hours=window.opening_time_hours,
+                closing_time_hours=window.closing_time_hours,
+                closing_discharge_like=bool(window.closing_discharge_like),
+                chunk_break_token_indices=list(window.chunk_break_token_indices),
                 chunks=chunks,
                 truncated_chunks=int(dropped_chunks),
                 truncated_tokens=int(dropped_tokens),

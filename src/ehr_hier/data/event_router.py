@@ -3,6 +3,69 @@ from typing import Optional
 from .token_types import TokenCategory
 
 
+_MEASUREMENT_OTHER_ALIASES = {
+    "BLOOD PRESSURE",
+}
+
+_DEMOGRAPHIC_OTHER_ALIASES = {
+    "BMI (KG/M2)",
+    "WEIGHT (LBS)",
+    "HEIGHT (INCHES)",
+}
+
+# Lightweight clinically informed signifiers to avoid dropping rare but
+# high-acuity transitions that often land in OTHER on raw MEDS exports.
+_RARE_CRITICAL_PATTERNS = (
+    "CARDIAC ARREST",
+    "CODE BLUE",
+    "CPR",
+    "DEFIB",
+    "ROSC",
+    "SEPSIS BUNDLE",
+    "MASSIVE TRANSFUSION",
+    "REINTUBATION",
+    "SEPTIC SHOCK",
+    "STROKE ALERT",
+)
+
+
+def _normalize_code(code: object) -> str:
+    return str(code).strip().upper()
+
+
+def _matches_alias(code_norm: str, aliases: set[str]) -> bool:
+    if code_norm in aliases:
+        return True
+    return any(code_norm.endswith(f"//{alias}") for alias in aliases)
+
+
+def is_rare_critical_other_code(code: Optional[str]) -> bool:
+    if code is None:
+        return False
+    code_norm = _normalize_code(code)
+    if not code_norm:
+        return False
+    # Do not reclassify explicitly modeled families.
+    explicit_prefixes = {
+        "LAB",
+        "VITAL",
+        "MEAS",
+        "OMR",
+        "MEDICATION",
+        "INFUSION_START",
+        "INFUSION_END",
+        "PROCEDURE",
+        "DIAGNOSIS",
+        "ICD",
+        "CPT",
+        "HCPCS",
+    }
+    prefix = code_norm.split("//", 1)[0]
+    if prefix in explicit_prefixes:
+        return False
+    return any(pattern in code_norm for pattern in _RARE_CRITICAL_PATTERNS)
+
+
 def classify_code_to_category(code: Optional[str]) -> TokenCategory:
     """
     Map a MEDS event `code` string to a coarse TokenCategory.
@@ -12,7 +75,19 @@ def classify_code_to_category(code: Optional[str]) -> TokenCategory:
     if code is None:
         return TokenCategory.OTHER
 
-    prefix = str(code).split("//", 1)[0].upper()
+    code_norm = _normalize_code(code)
+    if _matches_alias(code_norm, _MEASUREMENT_OTHER_ALIASES):
+        return TokenCategory.MEASUREMENT
+
+    # Keep these in OTHER so they can be injected as stable global demographics
+    # instead of high-frequency per-event timeline tokens.
+    if _matches_alias(code_norm, _DEMOGRAPHIC_OTHER_ALIASES):
+        return TokenCategory.OTHER
+
+    if is_rare_critical_other_code(code_norm):
+        return TokenCategory.STRUCTURAL
+
+    prefix = code_norm.split("//", 1)[0]
 
     measurement_prefixes = {
         "LAB",

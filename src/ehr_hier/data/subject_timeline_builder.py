@@ -232,6 +232,11 @@ def build_subject_timeline(
             label=label,
             action=transition_action,
         )
+        transition_site_id = structural_codebook.transition_site_id(
+            code=code_str,
+            label=label,
+            action=transition_action,
+        )
         attrs: Dict[str, int] = {}
         code_prefix = str(code_str).split("//", 1)[0].upper()
         if transition_action_id is not None:
@@ -240,6 +245,10 @@ def build_subject_timeline(
             attrs["transition_window_type_id"] = int(transition_window_type_id)
             if transition_action in {"open_next", "close_open"}:
                 attrs["window_type_id"] = int(transition_window_type_id)
+        if transition_site_id is not None:
+            attrs["transition_site_id"] = int(transition_site_id)
+            if transition_action in {"open_next", "close_open"}:
+                attrs["window_site_id"] = int(transition_site_id)
         if code_prefix in {
             "TRANSFER_TO",
             "HOSPITAL_ADMISSION",
@@ -264,7 +273,7 @@ def build_subject_timeline(
             attrs["transition_discharge_like"] = 1
         if code_prefix == "MEDS_DEATH":
             attrs["transition_death_like"] = 1
-        if transition_window_type_name == "ED":
+        if transition_window_type_name in {"ED", "ED_ADMISSION"}:
             attrs["transition_ed_like"] = 1
         if transition_window_type_name == "ICU":
             attrs["transition_icu_like"] = 1

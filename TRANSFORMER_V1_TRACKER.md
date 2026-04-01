@@ -33,6 +33,55 @@ Owner: `transformer-v1` branch
 - Never emit semantic boundary markers from chunk overflow alone.
 - `WIN_END` / `WIN_<NEXT_TYPE>` supervision is applied only at true semantic boundaries, not at mechanical chunk cuts.
 
+## LRZ Runtime Profiles (V1 Standard)
+
+Use these profiles to keep iteration practical and avoid VRAM blowups from full-head logits.
+
+### Profile D0: Functional Smoke (fast fail)
+- purpose: shape/routing/state-machine sanity
+- target device: any GPU (incl. V100)
+- recommended caps:
+  - `max_subjects=1`
+  - `max_windows=6`
+  - `max_chunks_per_window=2`
+  - `max_len_per_window=64`
+  - `d_model=128`, `num_heads=4`, `d_ff=256`, `num_local_layers=1`, `num_global_layers=1`, `num_chunk_layers=1`
+- expected: finite forward/backward, non-zero supervised boundary counts, no unrouted tokens
+
+### Profile D1: Stability Smoke (default debug)
+- purpose: finite-loss + grad stability with realistic chunk/window chains
+- target device: A100-80/H100-94 preferred
+- recommended caps:
+  - `max_subjects=2`
+  - `max_windows=8`
+  - `max_chunks_per_window=2`
+  - `max_len_per_window=64`
+  - same model dims as D0
+- expected: stable run in < 30 min; no OOM; reproducible logs
+
+### Profile D2: Pre-Train Budget Check
+- purpose: approximate training memory/runtime before long jobs
+- target device: A100-80/H100-94
+- recommended caps:
+  - `max_subjects=4`
+  - `max_windows=12`
+  - `max_chunks_per_window=3`
+  - `max_len_per_window=80`
+  - `d_model=128` first; scale only after passing
+- expected: pass without OOM twice in a row before launching long run
+
+### Profile T1: 2-Day Feasible Baseline
+- purpose: first long run that still allows iteration
+- target device: H100-94 preferred, A100-80 acceptable
+- policy:
+  - keep per-step token budget conservative
+  - scale throughput via grad accumulation, not giant local sequence caps
+  - checkpoint frequently and resume-friendly
+- acceptance gate before launch:
+  - D1 and D2 both pass
+  - finite metrics for at least two consecutive smoke runs
+  - no unknown window leakage, no unrouted tokens
+
 ## Ticket Backlog
 
 ## P0: Architecture Contract + Stability

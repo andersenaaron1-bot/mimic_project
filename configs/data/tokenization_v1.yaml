@@ -57,7 +57,7 @@ window_markers:
   enabled: true
   end_mode: end_token
   type_token_offset: 10
-  num_types: 7
+  num_types: 6
   unk_type_id: 0
   end_token_id: 17
   continue_token_id: 18
@@ -72,6 +72,7 @@ window_segmentation:
   rebalance_target_frac: 0.8
   rebalance_min_tokens: 32
   rebalance_tail_tokens: 16
-  default_first_window_type: PROLOGUE
   post_discharge_window_type: POST_DISCHARGE
   propagate_prev_type_for_unknown_windows: false
+  preserve_same_site_within_window: true
+  site_change_starts_new_window: true

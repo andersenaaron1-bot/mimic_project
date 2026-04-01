@@ -20,7 +20,5 @@
   "measurement_value": {"offset": 2100000},
   "structural": {"offset": 2200000},
   "observation_code": {"offset": 2300000},
-  "observation_value": {"offset": 2320000},
-  "structural_action": {"offset": 2400000},
-  "structural_entity": {"offset": 2420000}
+  "observation_value": {"offset": 2320000}
 }
