@@ -81,6 +81,82 @@ class TimeEmbedding(nn.Module):
         return emb
 
 
+class MultiScaleTimeEmbedding(nn.Module):
+    """
+    Additive time embedding over multiple clinical clocks.
+
+    Intended use:
+      - local hours within a chunk
+      - semantic hours within a window
+      - global hours within the full subject timeline
+
+    This keeps the hierarchy explicit: dense intra-stay timing and sparse lifetime
+    timing are both available to MLPs/heads, while cRoPE still controls attention.
+    """
+
+    def __init__(
+        self,
+        d_model: int,
+        *,
+        local_max_hours: float = 72.0,
+        semantic_max_hours: float = 31.0 * 24.0,
+        global_max_hours: float = 365.25 * 24.0 * 10.0,
+        dropout: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self.local_max_hours = float(local_max_hours)
+        self.semantic_max_hours = float(semantic_max_hours)
+        self.global_max_hours = float(global_max_hours)
+        self._local_denom = float(math.log1p(self.local_max_hours)) if self.local_max_hours > 0 else 1.0
+        self._semantic_denom = float(math.log1p(self.semantic_max_hours)) if self.semantic_max_hours > 0 else 1.0
+        self._global_denom = float(math.log1p(self.global_max_hours)) if self.global_max_hours > 0 else 1.0
+
+        self.mlp = nn.Sequential(
+            nn.Linear(3, d_model),
+            nn.GELU(),
+            nn.Linear(d_model, d_model),
+        )
+        self.dropout = nn.Dropout(float(dropout))
+
+    @staticmethod
+    def _coerce_float(t_hours: torch.Tensor) -> torch.Tensor:
+        if t_hours.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+            return t_hours.to(dtype=torch.float32)
+        return t_hours
+
+    @staticmethod
+    def _normalize_hours(t_hours: torch.Tensor, *, max_hours: float, denom: float) -> torch.Tensor:
+        t = MultiScaleTimeEmbedding._coerce_float(t_hours).clamp(min=0.0, max=float(max_hours))
+        return torch.log1p(t) / float(max(1e-6, denom))
+
+    def forward(
+        self,
+        *,
+        local_time_hours: torch.Tensor,
+        semantic_time_hours: torch.Tensor,
+        global_time_hours: torch.Tensor,
+    ) -> torch.Tensor:
+        local = self._normalize_hours(
+            local_time_hours,
+            max_hours=self.local_max_hours,
+            denom=self._local_denom,
+        )
+        semantic = self._normalize_hours(
+            semantic_time_hours,
+            max_hours=self.semantic_max_hours,
+            denom=self._semantic_denom,
+        )
+        global_t = self._normalize_hours(
+            global_time_hours,
+            max_hours=self.global_max_hours,
+            denom=self._global_denom,
+        )
+        features = torch.stack([local, semantic, global_t], dim=-1)
+        emb = self.mlp(features)
+        emb = self.dropout(emb)
+        return emb
+
+
 class AETEmbeddings(nn.Module):
     """
     The Input Adapter.
@@ -94,8 +170,11 @@ class AETEmbeddings(nn.Module):
         dropout: float = 0.1,
         *,
         num_window_types: int = 0,
+        num_token_types: int = 8,
         special_type_id: int = 0,
         exclude_special_from_window_type: bool = True,
+        condition_numeric_on_token_type: bool = True,
+        numeric_value_transform: str = "signed_log1p",
     ):
         super().__init__()
         self.token_embedding = nn.Embedding(vocab_size, d_model)
@@ -105,6 +184,11 @@ class AETEmbeddings(nn.Module):
         self.window_type_embedding = (
             nn.Embedding(int(num_window_types), d_model) if int(num_window_types) > 0 else None
         )
+        self.numeric_value_transform = str(numeric_value_transform).strip().lower() or "identity"
+        if self.numeric_value_transform not in {"identity", "signed_log1p"}:
+            raise ValueError(
+                f"Unsupported numeric_value_transform={self.numeric_value_transform!r}; expected identity|signed_log1p"
+            )
 
         # Side-Channel Encoder
         # Projects scalar "value" (e.g., log1p dosage) to vector space
@@ -112,9 +196,28 @@ class AETEmbeddings(nn.Module):
             nn.Linear(1, d_model),
             nn.Tanh()  # Tanh helps scale values to match embedding distribution
         )
+        self.condition_numeric_on_token_type = bool(condition_numeric_on_token_type)
+        self.num_token_types = max(0, int(num_token_types))
+        if self.condition_numeric_on_token_type and self.num_token_types > 0:
+            self.numeric_type_scale = nn.Embedding(self.num_token_types, d_model)
+            self.numeric_type_bias = nn.Embedding(self.num_token_types, d_model)
+            with torch.no_grad():
+                self.numeric_type_scale.weight.fill_(1.0)
+                self.numeric_type_bias.weight.zero_()
+        else:
+            self.numeric_type_scale = None
+            self.numeric_type_bias = None
 
         self.layer_norm = nn.LayerNorm(d_model)
         self.dropout = nn.Dropout(dropout)
+
+    def _transform_numeric_values(self, numeric_values: torch.Tensor) -> torch.Tensor:
+        if self.numeric_value_transform == "identity":
+            return numeric_values
+        values = numeric_values
+        if values.dtype not in (torch.float16, torch.float32, torch.float64, torch.bfloat16):
+            values = values.to(dtype=torch.float32)
+        return values.sign() * torch.log1p(values.abs())
 
     def forward(
         self,
@@ -140,11 +243,21 @@ class AETEmbeddings(nn.Module):
 
         # 2. Embed Value (Side Channel)
         # numeric_values is (..., 1)
-        val_emb = self.value_encoder(numeric_values)
+        transformed_numeric_values = self._transform_numeric_values(numeric_values)
+        val_emb = self.value_encoder(transformed_numeric_values)
         if numeric_mask is None:
             numeric_mask = numeric_values.ne(0).any(dim=-1)
         else:
             numeric_mask = numeric_mask.to(dtype=torch.bool)
+        if (
+            self.numeric_type_scale is not None
+            and self.numeric_type_bias is not None
+            and token_type_ids is not None
+        ):
+            safe_type_ids = token_type_ids.clamp(min=0, max=max(0, self.num_token_types - 1))
+            val_emb = (
+                val_emb * self.numeric_type_scale(safe_type_ids)
+            ) + self.numeric_type_bias(safe_type_ids)
         val_emb = val_emb * numeric_mask.unsqueeze(-1).to(dtype=val_emb.dtype)
 
         # 3. Fuse

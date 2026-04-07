@@ -91,7 +91,15 @@ class TrainModelConfig:
     dropout: float = 0.1
     special_type_id: int = 0
     enable_transition_bias: bool = True
-    enable_time_embedding: bool = False
+    enable_time_embedding: bool = True
+    time_embedding_max_hours: float = 31.0 * 24.0
+    local_time_embedding_max_hours: float = 72.0
+    global_time_embedding_max_hours: float = 365.25 * 24.0 * 10.0
+    enable_chunk_meta_sidechannel: bool = True
+    enable_window_sequence_meta: bool = True
+    num_token_types: int = 8
+    condition_numeric_on_token_type: bool = True
+    numeric_value_transform: str = "signed_log1p"
     global_fusion_mode: str = "add"
     exclude_special_from_global_fusion: bool = True
     use_unified_token_head: bool = True
@@ -365,6 +373,10 @@ def _run_model_and_loss(
             chunk_mask=tensor_batch.get("chunk_mask", None),
             chunk_start_offsets=tensor_batch.get("chunk_start_offsets", None),
             chunk_is_last=tensor_batch.get("chunk_is_last", None),
+            semantic_token_counts=tensor_batch.get("semantic_token_counts", None),
+            semantic_duration_hours=tensor_batch.get("semantic_duration_hours", None),
+            chunk_token_counts=tensor_batch.get("chunk_token_counts", None),
+            chunk_duration_hours=tensor_batch.get("chunk_duration_hours", None),
         )
         loss, logs = criterion(head_outputs, tensor_batch)
     if not torch.isfinite(loss):
@@ -518,9 +530,26 @@ def main() -> None:
     ap.add_argument("--num_global_layers", type=int, default=2)
     ap.add_argument("--num_chunk_layers", type=int, default=1)
     ap.add_argument("--dropout", type=float, default=0.1)
-    ap.add_argument("--enable_time_embedding", action="store_true")
+    ap.add_argument("--enable_time_embedding", dest="enable_time_embedding", action="store_true")
+    ap.add_argument("--disable_time_embedding", dest="enable_time_embedding", action="store_false")
+    ap.add_argument("--enable_chunk_meta_sidechannel", dest="enable_chunk_meta_sidechannel", action="store_true")
+    ap.add_argument("--disable_chunk_meta_sidechannel", dest="enable_chunk_meta_sidechannel", action="store_false")
+    ap.add_argument("--enable_window_sequence_meta", dest="enable_window_sequence_meta", action="store_true")
+    ap.add_argument("--disable_window_sequence_meta", dest="enable_window_sequence_meta", action="store_false")
+    ap.add_argument("--condition_numeric_on_token_type", dest="condition_numeric_on_token_type", action="store_true")
+    ap.add_argument("--disable_numeric_type_conditioning", dest="condition_numeric_on_token_type", action="store_false")
+    ap.add_argument("--numeric_value_transform", choices=["identity", "signed_log1p"], default="signed_log1p")
+    ap.add_argument("--time_embedding_max_hours", type=float, default=31.0 * 24.0)
+    ap.add_argument("--local_time_embedding_max_hours", type=float, default=72.0)
+    ap.add_argument("--global_time_embedding_max_hours", type=float, default=365.25 * 24.0 * 10.0)
     ap.add_argument("--disable_transition_bias", action="store_true")
     ap.add_argument("--emit_switched_heads", action="store_true")
+    ap.set_defaults(
+        enable_time_embedding=True,
+        enable_chunk_meta_sidechannel=True,
+        enable_window_sequence_meta=True,
+        condition_numeric_on_token_type=True,
+    )
 
     ap.add_argument("--token_loss_weight", type=float, default=1.0)
     ap.add_argument(
@@ -766,6 +795,13 @@ def main() -> None:
         num_chunk_layers=int(args.num_chunk_layers),
         dropout=float(args.dropout),
         enable_time_embedding=bool(args.enable_time_embedding),
+        time_embedding_max_hours=float(args.time_embedding_max_hours),
+        local_time_embedding_max_hours=float(args.local_time_embedding_max_hours),
+        global_time_embedding_max_hours=float(args.global_time_embedding_max_hours),
+        enable_chunk_meta_sidechannel=bool(args.enable_chunk_meta_sidechannel),
+        enable_window_sequence_meta=bool(args.enable_window_sequence_meta),
+        condition_numeric_on_token_type=bool(args.condition_numeric_on_token_type),
+        numeric_value_transform=str(args.numeric_value_transform),
         enable_transition_bias=not bool(args.disable_transition_bias),
         emit_switched_heads=bool(args.emit_switched_heads),
     )

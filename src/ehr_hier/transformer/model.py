@@ -3,7 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from .aggregator import AETGlobalAggregator, AETIntraWindowAggregator
-from .embeddings import AETEmbeddings, ContinuousRotaryPositionalEmbedding, TimeEmbedding
+from .embeddings import (
+    AETEmbeddings,
+    ContinuousRotaryPositionalEmbedding,
+    MultiScaleTimeEmbedding,
+)
 from .encoder import AETLocalEncoder
 from .heads import AETOutputHeads
 
@@ -46,18 +50,66 @@ class AdaptiveEpisodicTransformer(nn.Module):
             d_model=config.d_model,
             dropout=config.dropout,
             num_window_types=self.num_window_types,
+            num_token_types=int(getattr(config, "num_token_types", 8)),
             special_type_id=int(getattr(config, "special_type_id", 0)),
             exclude_special_from_window_type=True,
+            condition_numeric_on_token_type=bool(
+                getattr(config, "condition_numeric_on_token_type", True)
+            ),
+            numeric_value_transform=str(
+                getattr(config, "numeric_value_transform", "signed_log1p")
+            ),
         )
 
-        self.time_embedding: TimeEmbedding | None = None
+        self.time_embedding: MultiScaleTimeEmbedding | None = None
         self.time_embedding_scale: nn.Parameter | None = None
         if bool(getattr(config, "enable_time_embedding", False)):
-            max_hours = float(getattr(config, "time_embedding_max_hours", 28.0 * 24.0))
+            semantic_max_hours = float(getattr(config, "time_embedding_max_hours", 31.0 * 24.0))
+            local_max_hours = float(
+                getattr(config, "local_time_embedding_max_hours", 72.0)
+            )
+            global_max_hours = float(
+                getattr(config, "global_time_embedding_max_hours", 365.25 * 24.0 * 10.0)
+            )
             dropout = float(getattr(config, "time_embedding_dropout", 0.0))
             scale_init = float(getattr(config, "time_embedding_scale_init", 1.0))
-            self.time_embedding = TimeEmbedding(config.d_model, max_hours=max_hours, dropout=dropout)
+            self.time_embedding = MultiScaleTimeEmbedding(
+                config.d_model,
+                local_max_hours=local_max_hours,
+                semantic_max_hours=semantic_max_hours,
+                global_max_hours=global_max_hours,
+                dropout=dropout,
+            )
             self.time_embedding_scale = nn.Parameter(torch.tensor(scale_init))
+
+        self.chunk_meta_proj = (
+            nn.Sequential(
+                nn.Linear(3, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            if bool(getattr(config, "enable_chunk_meta_sidechannel", False))
+            else None
+        )
+        self.chunk_meta_scale = (
+            nn.Parameter(torch.tensor(1.0))
+            if self.chunk_meta_proj is not None
+            else None
+        )
+        self.window_sequence_meta_proj = (
+            nn.Sequential(
+                nn.Linear(4, config.d_model),
+                nn.GELU(),
+                nn.Linear(config.d_model, config.d_model),
+            )
+            if bool(getattr(config, "enable_window_sequence_meta", False))
+            else None
+        )
+        self.window_sequence_meta_scale = (
+            nn.Parameter(torch.tensor(1.0))
+            if self.window_sequence_meta_proj is not None
+            else None
+        )
 
         self.local_encoder = AETLocalEncoder(config, self.rope)
         self.chunk_aggregator = AETIntraWindowAggregator(config, self.rope)
@@ -259,6 +311,10 @@ class AdaptiveEpisodicTransformer(nn.Module):
         chunk_mask=None,
         chunk_start_offsets=None,
         chunk_is_last=None,
+        semantic_token_counts=None,
+        semantic_duration_hours=None,
+        chunk_token_counts=None,
+        chunk_duration_hours=None,
     ):
         squeeze_chunk_axis = False
         if input_ids.ndim == 3:
@@ -294,6 +350,9 @@ class AdaptiveEpisodicTransformer(nn.Module):
         if window_start_times is None:
             window_start_times = torch.zeros((B, W), device=time_ids.device, dtype=time_ids.dtype)
 
+        semantic_time_ids = time_ids.clamp(min=0.0) + chunk_start_offsets.unsqueeze(-1)
+        global_time_ids = semantic_time_ids + window_start_times.unsqueeze(-1).unsqueeze(-1)
+
         x = self.embeddings(
             input_ids,
             numeric_values,
@@ -302,10 +361,80 @@ class AdaptiveEpisodicTransformer(nn.Module):
             token_type_ids=token_type_ids,
         )
         if self.time_embedding is not None and self.time_embedding_scale is not None:
-            x = x + (self.time_embedding_scale * self.time_embedding(time_ids))
+            x = x + (
+                self.time_embedding_scale
+                * self.time_embedding(
+                    local_time_hours=time_ids,
+                    semantic_time_hours=semantic_time_ids,
+                    global_time_hours=global_time_ids,
+                )
+            )
 
         local_hidden, chunk_summaries = self.local_encoder(x, time_ids, attention_mask, token_type_ids=token_type_ids)
+        content_mask = attention_mask.to(dtype=torch.bool)
+        if token_type_ids is not None:
+            content_mask = content_mask & (token_type_ids != int(getattr(self.config, "special_type_id", 0)))
+
+        if chunk_token_counts is None:
+            chunk_token_counts = content_mask.to(dtype=torch.float32).sum(dim=-1)
+        if chunk_duration_hours is None:
+            neg_inf = torch.tensor(float("-inf"), device=time_ids.device, dtype=time_ids.dtype)
+            chunk_time_masked = torch.where(content_mask, time_ids, neg_inf)
+            chunk_duration_hours = chunk_time_masked.max(dim=-1).values
+            chunk_duration_hours = torch.where(
+                torch.isfinite(chunk_duration_hours),
+                chunk_duration_hours,
+                torch.zeros_like(chunk_duration_hours),
+            )
+            chunk_duration_hours = chunk_duration_hours.clamp(min=0.0)
+        if semantic_token_counts is None:
+            semantic_token_counts = chunk_token_counts.sum(dim=2)
+        if semantic_duration_hours is None:
+            neg_inf = torch.tensor(float("-inf"), device=semantic_time_ids.device, dtype=semantic_time_ids.dtype)
+            sem_time_masked = torch.where(content_mask, semantic_time_ids, neg_inf)
+            semantic_duration_hours = sem_time_masked.amax(dim=-1).amax(dim=-1)
+            semantic_duration_hours = torch.where(
+                torch.isfinite(semantic_duration_hours),
+                semantic_duration_hours,
+                torch.zeros_like(semantic_duration_hours),
+            )
+            semantic_duration_hours = semantic_duration_hours.clamp(min=0.0)
+
+        if self.chunk_meta_proj is not None and self.chunk_meta_scale is not None:
+            chunk_meta = torch.stack(
+                [
+                    torch.log1p(chunk_token_counts.to(dtype=x.dtype).clamp(min=0.0)),
+                    torch.log1p(chunk_duration_hours.to(dtype=x.dtype).clamp(min=0.0)),
+                    torch.log1p(chunk_start_offsets.to(dtype=x.dtype).clamp(min=0.0)),
+                ],
+                dim=-1,
+            )
+            chunk_meta_emb = self.chunk_meta_proj(chunk_meta) * self.chunk_meta_scale
+            chunk_summaries = chunk_summaries + (
+                chunk_meta_emb * chunk_mask.to(dtype=chunk_meta_emb.dtype).unsqueeze(-1)
+            )
+
         chunk_states, semantic_summaries = self.chunk_aggregator(chunk_summaries, chunk_start_offsets, chunk_mask)
+
+        if self.window_sequence_meta_proj is not None and self.window_sequence_meta_scale is not None:
+            prev_window_end = window_start_times + semantic_duration_hours.to(dtype=window_start_times.dtype)
+            prev_window_end_shift = torch.zeros_like(prev_window_end)
+            if W > 1:
+                prev_window_end_shift[:, 1:] = prev_window_end[:, :-1]
+            gap_prev_h = (window_start_times - prev_window_end_shift).clamp(min=0.0)
+            window_meta = torch.stack(
+                [
+                    torch.log1p(semantic_token_counts.to(dtype=x.dtype).clamp(min=0.0)),
+                    torch.log1p(semantic_duration_hours.to(dtype=x.dtype).clamp(min=0.0)),
+                    torch.log1p(window_start_times.to(dtype=x.dtype).clamp(min=0.0)),
+                    torch.log1p(gap_prev_h.to(dtype=x.dtype).clamp(min=0.0)),
+                ],
+                dim=-1,
+            )
+            window_meta_emb = self.window_sequence_meta_proj(window_meta) * self.window_sequence_meta_scale
+            semantic_summaries = semantic_summaries + (
+                window_meta_emb * window_mask.to(dtype=window_meta_emb.dtype).unsqueeze(-1)
+            )
 
         global_states = self.global_aggregator(
             semantic_summaries,

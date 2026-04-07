@@ -72,6 +72,7 @@ def test_numeric_value_projection_respects_explicit_mask() -> None:
         token_type_ids=token_type_ids,
     )
 
-    expected_numeric = torch.tanh(torch.tensor([2.25, 2.25, 2.25, 2.25]))
+    expected_value = torch.log1p(torch.tensor(2.0)) + 0.25
+    expected_numeric = torch.tanh(torch.full((4,), expected_value))
     assert torch.allclose(out[0, 0, 0], expected_numeric)
     assert torch.allclose(out[0, 0, 1], torch.zeros(4))

@@ -111,3 +111,68 @@ def test_model_accepts_chunked_semantic_windows() -> None:
     assert logits["logits_struct"].shape[:4] == (B, W, C, L)
     assert logits["logits_next_window_type"].shape == (B, W, _Cfg.num_window_types)
     assert final_state.shape == (B, _Cfg.d_model)
+
+
+def test_global_time_embedding_changes_full_timeline_representations() -> None:
+    from ehr_hier.transformer.model import AdaptiveEpisodicTransformer
+
+    class _Cfg:
+        d_model = 8
+        num_heads = 1
+        d_ff = 16
+        num_local_layers = 0
+        num_global_layers = 0
+        rope_max_period = 10000.0
+        dropout = 0.0
+        summary_pool_temperature = 1.0
+        summary_pool_dropout = 0.0
+        exclude_special_from_summary = True
+        special_type_id = 0
+        num_window_types = 3
+        enable_time_embedding = True
+        local_time_embedding_max_hours = 72.0
+        time_embedding_max_hours = 31.0 * 24.0
+        global_time_embedding_max_hours = 365.25 * 24.0 * 10.0
+        enable_chunk_meta_sidechannel = False
+        enable_window_sequence_meta = False
+        condition_numeric_on_token_type = False
+        numeric_value_transform = "identity"
+
+    vocab_config = {
+        "total_size": 128,
+        "size_special": 16,
+        "size_rvq": 8,
+        "size_meas_labels": 8,
+        "size_meds": 16,
+    }
+
+    torch.manual_seed(0)
+    model = AdaptiveEpisodicTransformer(_Cfg, vocab_config)
+
+    input_ids = torch.tensor([[[1, 2, 3, 4], [1, 2, 3, 4]]], dtype=torch.long)
+    time_ids = torch.tensor([[[0.0, 1.0, 2.0, 3.0], [0.0, 1.0, 2.0, 3.0]]], dtype=torch.float)
+    numeric_values = torch.zeros((1, 2, 4, 1), dtype=torch.float)
+    token_type_ids = torch.ones((1, 2, 4), dtype=torch.long)
+    attention_mask = torch.ones((1, 2, 4), dtype=torch.long)
+    window_mask = torch.ones((1, 2), dtype=torch.long)
+
+    _, final_state_near = model(
+        input_ids=input_ids,
+        time_ids=time_ids,
+        numeric_values=numeric_values,
+        token_type_ids=token_type_ids,
+        attention_mask=attention_mask,
+        window_start_times=torch.tensor([[0.0, 12.0]], dtype=torch.float),
+        window_mask=window_mask,
+    )
+    _, final_state_far = model(
+        input_ids=input_ids,
+        time_ids=time_ids,
+        numeric_values=numeric_values,
+        token_type_ids=token_type_ids,
+        attention_mask=attention_mask,
+        window_start_times=torch.tensor([[0.0, 24.0 * 365.0 * 2.0]], dtype=torch.float),
+        window_mask=window_mask,
+    )
+
+    assert not torch.allclose(final_state_near, final_state_far)

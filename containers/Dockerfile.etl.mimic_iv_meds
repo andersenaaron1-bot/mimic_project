@@ -1,0 +1,176 @@
+ARG PYTHON_VERSION=3.11
+FROM python:${PYTHON_VERSION}-slim
+
+ENV PIP_NO_CACHE_DIR=1 \
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PYTHONUNBUFFERED=1
+
+SHELL ["/bin/bash", "-lc"]
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      bash ca-certificates age zstd openssl procps \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG MIMIC_IV_MEDS_VERSION=
+# Keep local parallel launcher available for MEDS_extract-* multiruns.
+ARG MIMIC_IV_MEDS_EXTRAS=local-parallelism
+# Source for canonical MIMIC concept-map CSVs used by extract_code_metadata.
+# Pin to a commit/tag for strict reproducibility.
+ARG MEDS_ETL_CONCEPT_MAP_REF=main
+
+ENV MIMIC_IV_MEDS_AUTO_PREPARE_CONCEPT_MAP=1 \
+    MIMIC_IV_MEDS_CONCEPT_MAP_DIR=/opt/mimic_concept_map
+
+RUN python -m pip install --upgrade pip setuptools wheel && \
+    if [ -n "${MIMIC_IV_MEDS_EXTRAS}" ] && [ -n "${MIMIC_IV_MEDS_VERSION}" ]; then \
+      PKG="MIMIC_IV_MEDS[${MIMIC_IV_MEDS_EXTRAS}]==${MIMIC_IV_MEDS_VERSION}"; \
+    elif [ -n "${MIMIC_IV_MEDS_EXTRAS}" ]; then \
+      PKG="MIMIC_IV_MEDS[${MIMIC_IV_MEDS_EXTRAS}]"; \
+    elif [ -n "${MIMIC_IV_MEDS_VERSION}" ]; then \
+      PKG="MIMIC_IV_MEDS==${MIMIC_IV_MEDS_VERSION}"; \
+    else \
+      PKG="MIMIC_IV_MEDS"; \
+    fi; \
+    pip install "$PKG" psutil "meds_reader~=0.1.14" && \
+    python -c "import hydra_plugins.hydra_joblib_launcher" && \
+    MEDS_extract-MIMIC_IV --help >/dev/null && \
+    MEDS_extract-shard_events --help >/dev/null
+
+# Bundle canonical concept-map CSVs and mirror them into common package paths.
+RUN python - <<'PY'
+from __future__ import annotations
+import os
+import sysconfig
+import urllib.request
+from pathlib import Path
+
+ref = os.environ.get("MEDS_ETL_CONCEPT_MAP_REF", "main")
+base = (
+    "https://raw.githubusercontent.com/Medical-Event-Data-Standard/"
+    f"meds_etl/{ref}/src/meds_etl/mimic/concept_map"
+)
+files = [
+    "d_labitems_to_loinc.csv",
+    "inputevents_to_rxnorm.csv",
+    "meas_chartevents_main.csv",
+    "outputevents_to_loinc.csv",
+    "proc_datetimeevents.csv",
+    "proc_itemid.csv",
+]
+
+dst = Path("/opt/mimic_concept_map")
+dst.mkdir(parents=True, exist_ok=True)
+
+for name in files:
+    url = f"{base}/{name}"
+    with urllib.request.urlopen(url) as resp:  # nosec B310 - fixed GitHub URL
+        data = resp.read()
+    (dst / name).write_bytes(data)
+
+site = Path(sysconfig.get_paths()["purelib"])
+mirrors = [
+    site / "MIMIC_IV_MEDS" / "concept_map",
+    site / "MIMIC_IV_MEDS" / "configs" / "concept_map",
+    site / "meds_etl" / "mimic" / "concept_map",
+]
+for m in mirrors:
+    m.mkdir(parents=True, exist_ok=True)
+    for name in files:
+        (m / name).write_bytes((dst / name).read_bytes())
+PY
+
+# Helper to copy concept maps into pre_MEDS before ETL execution.
+RUN cat > /usr/local/bin/mimic_iv_meds_prepare_concept_map <<'SH' && chmod +x /usr/local/bin/mimic_iv_meds_prepare_concept_map
+#!/usr/bin/env bash
+set -euo pipefail
+
+pre_meds_dir="${1:-${PRE_MEDS_DIR:-/data/mimic/pre_MEDS}}"
+src_dir="${MIMIC_IV_MEDS_CONCEPT_MAP_DIR:-/opt/mimic_concept_map}"
+files=(
+  d_labitems_to_loinc.csv
+  inputevents_to_rxnorm.csv
+  meas_chartevents_main.csv
+  outputevents_to_loinc.csv
+  proc_datetimeevents.csv
+  proc_itemid.csv
+)
+
+mkdir -p "$pre_meds_dir"
+for f in "${files[@]}"; do
+  [[ -f "${src_dir%/}/$f" ]] || { echo "ERROR: missing concept map: ${src_dir%/}/$f" >&2; exit 1; }
+  cp -f "${src_dir%/}/$f" "${pre_meds_dir%/}/$f"
+done
+SH
+
+# Wrap MEDS_extract-MIMIC_IV to auto-seed concept maps unless disabled.
+RUN mv /usr/local/bin/MEDS_extract-MIMIC_IV /usr/local/bin/MEDS_extract-MIMIC_IV.real && \
+    cat > /usr/local/bin/MEDS_extract-MIMIC_IV <<'SH' && \
+    chmod +x /usr/local/bin/MEDS_extract-MIMIC_IV
+#!/usr/bin/env bash
+set -euo pipefail
+
+for arg in "$@"; do
+  case "$arg" in
+    -h|--help)
+      exec /usr/local/bin/MEDS_extract-MIMIC_IV.real "$@"
+      ;;
+  esac
+done
+
+if [[ "${MIMIC_IV_MEDS_AUTO_PREPARE_CONCEPT_MAP:-1}" != "0" ]]; then
+  pre_meds_dir="${PRE_MEDS_DIR:-/data/mimic/pre_MEDS}"
+  for arg in "$@"; do
+    case "$arg" in
+      pre_MEDS_dir=*|+pre_MEDS_dir=*|++pre_MEDS_dir=*)
+        pre_meds_dir="${arg#*=}"
+        ;;
+    esac
+  done
+  mimic_iv_meds_prepare_concept_map "$pre_meds_dir"
+fi
+
+exec /usr/local/bin/MEDS_extract-MIMIC_IV.real "$@"
+SH
+
+RUN mkdir -p /tmp/mimic-pre-meds-check && \
+    mimic_iv_meds_prepare_concept_map /tmp/mimic-pre-meds-check && \
+    test -f /tmp/mimic-pre-meds-check/proc_datetimeevents.csv && \
+    MEDS_extract-MIMIC_IV --help >/dev/null && \
+    meds_reader_convert --help >/dev/null
+
+# Work around MEDS_transforms lock cleanup races on shared filesystems:
+# tolerate missing '*.lock' files during unlink.
+RUN python - <<'PY'
+from pathlib import Path
+
+shim = """from __future__ import annotations
+import os
+import pathlib
+from typing import Any
+
+enabled = os.getenv("MEDS_LOCKFILE_UNLINK_TOLERATE_MISSING", "1").lower() not in {
+    "0",
+    "false",
+    "no",
+}
+if enabled:
+    _orig_unlink = pathlib.Path.unlink
+
+    def _safe_unlink(self: pathlib.Path, *args: Any, **kwargs: Any):
+        try:
+            return _orig_unlink(self, *args, **kwargs)
+        except FileNotFoundError:
+            if str(self).endswith(".lock"):
+                return None
+            raise
+
+    pathlib.Path.unlink = _safe_unlink  # type: ignore[assignment]
+"""
+
+sitecustomize = Path("/usr/local/lib/python3.11/site-packages/sitecustomize.py")
+sitecustomize.write_text(shim, encoding="utf-8")
+PY
+
+WORKDIR /workspace
+ENTRYPOINT []
+CMD ["bash"]

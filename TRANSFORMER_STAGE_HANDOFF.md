@@ -8,6 +8,18 @@ It is intentionally concrete and path-specific. Update it whenever the active LR
 - Preserve the current successful MEDS/meds_reader state on LRZ.
 - Use the measurement cVAE results as evidence for routing decisions, not as a reason to force all numeric-valued events through a single encoder.
 
+## Post-v1 roadmap
+- The persisted post-v1 research and implementation plan now lives in:
+  - `FOUNDATION_MODEL_V2_PLAN.md`
+- The detailed WP1 migration plan now lives in:
+  - `FOUNDATION_MODEL_V2_WP1_PLAN.md`
+- That document defines the target architecture after the v1 tokenization freeze:
+  - fused typed event representations
+  - modality-specific payload codecs behind one event algebra
+  - persistent latent health state plus sparse exact memory
+  - marked time-to-event as the primary objective
+- Until the v1 routing freeze is complete, treat the v2 plan as the next-stage roadmap rather than the current implementation contract.
+
 ## Pinned tokenization cleanup plan
 - The active ticket order is pinned in `MEDTOK_CODE_SYSTEM_CONTRACT.md`.
 - Current implementation focus:
@@ -128,6 +140,7 @@ It is intentionally concrete and path-specific. Update it whenever the active LR
 
 ## Recommended start files for the next stage
 - `SCHEMA_TOKENS.md`
+- `FOUNDATION_MODEL_V2_PLAN.md`
 - `configs/data/structural_codes.yaml`
 - `src/ehr_hier/data/subject_timeline_builder.py`
 - `src/ehr_hier/data/structural_codes.py`
