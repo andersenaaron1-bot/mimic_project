@@ -7,12 +7,13 @@ from typing import Any, Mapping, Sequence
 
 import torch
 
+from src.ehr_hier.data.event_frames import EventFrame, build_event_frame, ensure_event_frames, flatten_event_frames
 from src.ehr_hier.data.token_types import EventToken
 
-PRECOMPILED_STORAGE_FORMAT_LEGACY = "legacy_subject_pt"
-PRECOMPILED_STORAGE_FORMAT_PACKED_V2 = "packed_shard_v2"
+PRECOMPILED_STORAGE_FORMAT_PACKED_V3 = "packed_event_frames_v3"
+PRECOMPILED_STORAGE_FORMAT_PACKED_V2 = PRECOMPILED_STORAGE_FORMAT_PACKED_V3
 PRECOMPILED_SHARD_SUFFIX = ".ptz"
-PRECOMPILED_PAYLOAD_VERSION = 2
+PRECOMPILED_PAYLOAD_VERSION = 3
 
 _EPOCH = datetime(1970, 1, 1)
 _NONE_TIME_SENTINEL = -1
@@ -31,12 +32,8 @@ def _epoch_us_to_datetime(value: int) -> datetime | None:
     return _EPOCH + timedelta(microseconds=int(value))
 
 
-def serialize_timeline_compact(
-    timeline: Sequence[EventToken],
-    *,
-    metadata: Mapping[str, Any] | None = None,
-) -> dict[str, Any]:
-    token_count = int(len(timeline))
+def _serialize_token_array(tokens: Sequence[EventToken]) -> dict[str, Any]:
+    token_count = int(len(tokens))
     value_ids = torch.empty(token_count, dtype=torch.int32)
     category_ids = torch.empty(token_count, dtype=torch.int16)
     t_from_start_hours = torch.empty(token_count, dtype=torch.float64)
@@ -61,7 +58,7 @@ def serialize_timeline_compact(
 
     cat_pos = 0
     num_pos = 0
-    for idx, tok in enumerate(timeline):
+    for idx, tok in enumerate(tokens):
         value_ids[idx] = int(tok.value_id)
         category_ids[idx] = int(tok.category_id)
         t_from_start_hours[idx] = float(tok.t_from_start_hours)
@@ -103,11 +100,8 @@ def serialize_timeline_compact(
 
     cat_attr_offsets[token_count] = int(cat_pos)
     num_attr_offsets[token_count] = int(num_pos)
-
     return {
-        "version": PRECOMPILED_PAYLOAD_VERSION,
-        "token_count": token_count,
-        "metadata": dict(metadata or {}),
+        "token_count": int(token_count),
         "value_ids": value_ids,
         "category_ids": category_ids,
         "t_from_start_hours": t_from_start_hours,
@@ -126,7 +120,7 @@ def serialize_timeline_compact(
     }
 
 
-def deserialize_timeline_compact(payload: Mapping[str, Any]) -> list[EventToken]:
+def _deserialize_token_array(payload: Mapping[str, Any]) -> list[EventToken]:
     value_ids = payload["value_ids"].tolist()
     category_ids = payload["category_ids"].tolist()
     t_from_start_hours = payload["t_from_start_hours"].tolist()
@@ -180,6 +174,87 @@ def deserialize_timeline_compact(payload: Mapping[str, Any]) -> list[EventToken]
     return timeline
 
 
+def serialize_timeline_compact(
+    timeline: Sequence[EventFrame | EventToken],
+    *,
+    metadata: Mapping[str, Any] | None = None,
+) -> dict[str, Any]:
+    frames = ensure_event_frames(timeline)
+    tokens = flatten_event_frames(frames, clone=False)
+    frame_count = int(len(frames))
+    frame_token_offsets = torch.zeros(frame_count + 1, dtype=torch.int32)
+
+    payload_kind_vocab: list[str] = []
+    payload_kind_to_id: dict[str, int] = {}
+    payload_kind_ids = torch.zeros(frame_count, dtype=torch.int16)
+    source_codes: list[str | None] = []
+    concept_codes: list[str | None] = []
+    semantic_labels: list[str | None] = []
+
+    token_cursor = 0
+    for idx, frame in enumerate(frames):
+        frame_token_offsets[idx] = int(token_cursor)
+        token_cursor += int(frame.token_count)
+
+        kind = str(frame.payload_kind)
+        kind_id = payload_kind_to_id.get(kind)
+        if kind_id is None:
+            kind_id = len(payload_kind_vocab)
+            payload_kind_vocab.append(kind)
+            payload_kind_to_id[kind] = kind_id
+        payload_kind_ids[idx] = int(kind_id)
+        source_codes.append(None if frame.source_code is None else str(frame.source_code))
+        concept_codes.append(None if frame.concept_code is None else str(frame.concept_code))
+        semantic_labels.append(None if frame.semantic_label is None else str(frame.semantic_label))
+    frame_token_offsets[frame_count] = int(token_cursor)
+
+    token_payload = _serialize_token_array(tokens)
+    return {
+        "version": PRECOMPILED_PAYLOAD_VERSION,
+        "storage_format": PRECOMPILED_STORAGE_FORMAT_PACKED_V3,
+        "frame_count": int(frame_count),
+        "metadata": dict(metadata or {}),
+        "frame_token_offsets": frame_token_offsets,
+        "payload_kind_vocab": payload_kind_vocab,
+        "payload_kind_ids": payload_kind_ids,
+        "source_codes": source_codes,
+        "concept_codes": concept_codes,
+        "semantic_labels": semantic_labels,
+        **token_payload,
+    }
+
+
+def deserialize_timeline_compact(payload: Mapping[str, Any]) -> list[EventFrame]:
+    tokens = _deserialize_token_array(payload)
+    frame_offsets = payload["frame_token_offsets"].tolist()
+    frame_count = int(payload.get("frame_count", max(0, len(frame_offsets) - 1)))
+    payload_kind_vocab = [str(x) for x in payload.get("payload_kind_vocab", [])]
+    payload_kind_ids = payload.get("payload_kind_ids")
+    payload_kind_values = payload_kind_ids.tolist() if payload_kind_ids is not None else [0] * frame_count
+    source_codes = list(payload.get("source_codes", []))
+    concept_codes = list(payload.get("concept_codes", []))
+    semantic_labels = list(payload.get("semantic_labels", []))
+
+    frames: list[EventFrame] = []
+    for idx in range(frame_count):
+        start = int(frame_offsets[idx])
+        stop = int(frame_offsets[idx + 1])
+        bundle = tokens[start:stop]
+        if not bundle:
+            continue
+        kind = payload_kind_vocab[int(payload_kind_values[idx])] if payload_kind_vocab else None
+        frames.append(
+            build_event_frame(
+                bundle,
+                payload_kind=kind,
+                source_code=source_codes[idx] if idx < len(source_codes) else None,
+                concept_code=concept_codes[idx] if idx < len(concept_codes) else None,
+                semantic_label=semantic_labels[idx] if idx < len(semantic_labels) else None,
+            )
+        )
+    return frames
+
+
 def save_packed_shard(
     path: str | Path,
     *,
@@ -190,7 +265,7 @@ def save_packed_shard(
     out_path.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "version": PRECOMPILED_PAYLOAD_VERSION,
-        "storage_format": PRECOMPILED_STORAGE_FORMAT_PACKED_V2,
+        "storage_format": PRECOMPILED_STORAGE_FORMAT_PACKED_V3,
         "subject_ids": [int(sid) for sid in subject_ids],
         "timelines": list(serialized_timelines),
     }

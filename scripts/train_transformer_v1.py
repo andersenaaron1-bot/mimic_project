@@ -32,13 +32,19 @@ from scripts.audit_tokenization_flow import (  # noqa: E402
     _load_subject_ids,
     _load_tokenization_contract,
     _resolve_residual_policy,
+    _resolve_residual_tail_policies,
 )
 from src.ehr_hier.data.dataset import PrecompiledMEDSDataset  # noqa: E402
+from src.ehr_hier.data.event_frames import EventFrame  # noqa: E402
 from src.ehr_hier.data.structural_codes import structural_surface_vocab_codes  # noqa: E402
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline  # noqa: E402
-from src.ehr_hier.data.token_types import EventToken, TokenCategory  # noqa: E402
+from src.ehr_hier.data.token_types import TokenCategory  # noqa: E402
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders  # noqa: E402
 from src.ehr_hier.transformer.collator import AETHierarchicalCollator  # noqa: E402
+from src.ehr_hier.transformer.episodic_memory import (  # noqa: E402
+    EpisodicMemoryState,
+    PatientMemoryState,
+)
 from src.ehr_hier.transformer.loss import AETLossModule  # noqa: E402
 from src.ehr_hier.transformer.model import AdaptiveEpisodicTransformer  # noqa: E402
 from src.ehr_hier.transformer.vocab_runtime import (  # noqa: E402
@@ -102,8 +108,39 @@ class TrainModelConfig:
     numeric_value_transform: str = "signed_log1p"
     global_fusion_mode: str = "add"
     exclude_special_from_global_fusion: bool = True
+    global_context_mode: str = "latent_state"
     use_unified_token_head: bool = True
     emit_switched_heads: bool = False
+    use_event_composer: bool = True
+    enable_exact_memory: bool = True
+    enable_precedent_memory: bool = False
+    exact_memory_slots: int = 16
+    exact_memory_static_slots: int = 2
+    exact_memory_persistent_slots: int = 16
+    exact_memory_episodic_slots: int = 16
+    exact_memory_write_per_window: int = 2
+    exact_memory_retrieve_k: int = 4
+    exact_memory_static_retrieve_k: int = 2
+    exact_memory_persistent_retrieve_k: int = 4
+    exact_memory_episodic_retrieve_k: int = 4
+    exact_memory_static_feature_ids: str = "1,2"
+    exact_memory_max_same_group: int = 2
+    exact_memory_age_decay: float = 0.05
+    exact_memory_rule_write_scale: float = 1.0
+    exact_memory_rule_retrieval_scale: float = 0.25
+    exact_memory_learned_write_scale: float = 1.0
+    exact_memory_first_occurrence_bonus: float = 0.75
+    exact_memory_chronic_bonus: float = 1.5
+    precedent_retrieve_k: int = 4
+    precedent_strict_window_type_match: bool = True
+    precedent_support_overlap_bias: float = 0.25
+    precedent_score_temperature: float = 1.0
+    carry_state_across_segments: bool = True
+    event_bundle_slots: int = 32
+    enable_event_time_nll_head: bool = True
+    enable_next_window_gap_nll_head: bool = True
+    enable_next_window_duration_nll_head: bool = True
+    enable_next_window_support_head: bool = True
 
 
 def _reset_encoders(encoders: Dict[TokenCategory, Any]) -> None:
@@ -288,7 +325,7 @@ class OnTheFlyTimelineDataset(Dataset):
             self._db = mr.SubjectDatabase(self.db_path)
         return self._db
 
-    def __getitem__(self, idx: int) -> List[EventToken] | None:
+    def __getitem__(self, idx: int) -> Dict[str, Any] | None:
         sid = int(self.subject_ids[idx])
         db = self._ensure_db()
         _reset_encoders(self.encoders)
@@ -308,18 +345,24 @@ class OnTheFlyTimelineDataset(Dataset):
         timeline = build_subject_timeline(
             **{k: v for k, v in timeline_kwargs.items() if k in self._timeline_sig.parameters}
         )
-        return timeline if timeline else None
+        if not timeline:
+            return None
+        return {
+            "timeline": timeline,
+            "subject_id": int(sid),
+            "trajectory_ord": 0,
+        }
 
 
 class TimelineCollateAdapter:
     def __init__(self, collator: AETHierarchicalCollator) -> None:
         self.collator = collator
 
-    def __call__(self, batch: List[List[EventToken] | None]) -> Dict[str, Any]:
-        timelines = [timeline for timeline in batch if timeline]
-        if not timelines:
+    def __call__(self, batch: List[Dict[str, Any] | None]) -> Dict[str, Any]:
+        items = [item for item in batch if item]
+        if not items:
             raise ValueError("All timelines in batch were empty after on-the-fly building.")
-        return self.collator(timelines)
+        return self.collator(items)
 
 
 def _resolve_device(device_arg: str) -> torch.device:
@@ -330,6 +373,103 @@ def _resolve_device(device_arg: str) -> torch.device:
 
 def _move_batch_to_device(batch: Dict[str, Any], device: torch.device) -> Dict[str, Any]:
     return {k: v.to(device) for k, v in batch.items() if isinstance(v, torch.Tensor)}
+
+
+def _resolve_carry_inputs(
+    *,
+    tensor_batch: Dict[str, torch.Tensor],
+    model: AdaptiveEpisodicTransformer,
+    carry_cache: Dict[int, Dict[str, Any]] | None,
+) -> tuple[
+    torch.Tensor | None,
+    PatientMemoryState | EpisodicMemoryState | None,
+]:
+    if carry_cache is None:
+        return None, None
+    subject_ids = tensor_batch.get("subject_ids", None)
+    trajectory_ords = tensor_batch.get("trajectory_ords", None)
+    if subject_ids is None or trajectory_ords is None:
+        return None, None
+
+    B = int(subject_ids.shape[0])
+    device = tensor_batch["input_ids"].device
+    dtype = model.embeddings.token_embedding.weight.dtype
+    d_model = int(model.config.d_model)
+    static_slots = int(getattr(model.config, "exact_memory_static_slots", 0))
+    persistent_slots = int(getattr(model.config, "exact_memory_persistent_slots", 0))
+    episodic_slots = int(getattr(model.config, "exact_memory_episodic_slots", 0))
+
+    prev_global_rows: List[torch.Tensor | None] = []
+    prev_memory_rows: List[PatientMemoryState | EpisodicMemoryState | None] = []
+    any_global = False
+    any_memory = False
+
+    for idx in range(B):
+        sid = int(subject_ids[idx].detach().cpu().item())
+        trajectory_ord = int(trajectory_ords[idx].detach().cpu().item())
+        cached = carry_cache.get(sid) if sid >= 0 else None
+        if cached is not None and int(cached.get("next_trajectory_ord", -1)) == trajectory_ord:
+            global_state = cached.get("global_state", None)
+            memory_state = cached.get("memory_state", None)
+            prev_global_rows.append(global_state)
+            prev_memory_rows.append(memory_state)
+            any_global = any_global or global_state is not None
+            any_memory = any_memory or memory_state is not None
+        else:
+            prev_global_rows.append(None)
+            prev_memory_rows.append(None)
+
+    prev_global_state = None
+    if any_global:
+        prev_global_state = torch.zeros((B, d_model), device=device, dtype=dtype)
+        for idx, row in enumerate(prev_global_rows):
+            if row is None:
+                continue
+            prev_global_state[idx] = row.to(device=device, dtype=dtype)
+
+    prev_memory_state = None
+    if any_memory and (static_slots > 0 or persistent_slots > 0 or episodic_slots > 0):
+        prev_memory_state = PatientMemoryState.stack(
+            prev_memory_rows,
+            static_slots=static_slots,
+            persistent_slots=persistent_slots,
+            episodic_slots=episodic_slots,
+            d_model=d_model,
+            device=device,
+            dtype=dtype,
+        )
+
+    return prev_global_state, prev_memory_state
+
+
+def _update_carry_cache(
+    *,
+    tensor_batch: Dict[str, torch.Tensor],
+    aux_state: Dict[str, Any] | None,
+    carry_cache: Dict[int, Dict[str, Any]] | None,
+) -> None:
+    if carry_cache is None or not aux_state:
+        return
+    subject_ids = tensor_batch.get("subject_ids", None)
+    trajectory_ords = tensor_batch.get("trajectory_ords", None)
+    if subject_ids is None or trajectory_ords is None:
+        return
+
+    global_state = aux_state.get("global_state", None)
+    memory_state = aux_state.get("memory_state", None)
+
+    B = int(subject_ids.shape[0])
+    for idx in range(B):
+        sid = int(subject_ids[idx].detach().cpu().item())
+        trajectory_ord = int(trajectory_ords[idx].detach().cpu().item())
+        if sid < 0 or trajectory_ord < 0:
+            continue
+        entry: Dict[str, Any] = {"next_trajectory_ord": int(trajectory_ord + 1)}
+        if global_state is not None:
+            entry["global_state"] = global_state[idx].detach().cpu()
+        if memory_state is not None:
+            entry["memory_state"] = memory_state.select(idx).detach().to("cpu")
+        carry_cache[sid] = entry
 
 
 def _accumulate_logs(acc: Dict[str, float], logs: Dict[str, float]) -> None:
@@ -354,19 +494,24 @@ def _run_model_and_loss(
     device: torch.device,
     autocast_enabled: bool,
     autocast_dtype: torch.dtype,
-) -> tuple[torch.Tensor, Dict[str, float], Dict[str, Any]]:
+    prev_global_state: torch.Tensor | None = None,
+    prev_memory_state: PatientMemoryState | EpisodicMemoryState | None = None,
+    return_aux_state: bool = False,
+) -> tuple[torch.Tensor, Dict[str, float], Dict[str, Any], Dict[str, Any] | None]:
     with torch.autocast(
         device_type=device.type,
         dtype=autocast_dtype,
         enabled=bool(autocast_enabled),
     ):
-        head_outputs, _ = model(
+        head_outputs, final_state = model(
             input_ids=tensor_batch["input_ids"],
             time_ids=tensor_batch["time_ids"],
             numeric_values=tensor_batch["numeric_values"],
             token_type_ids=tensor_batch["token_type_ids"],
             attention_mask=tensor_batch["attention_mask"],
             numeric_mask=tensor_batch.get("numeric_mask", None),
+            prev_global_state=prev_global_state,
+            prev_memory_state=prev_memory_state,
             window_start_times=tensor_batch.get("window_start_times", None),
             window_mask=tensor_batch.get("window_mask", None),
             window_type_ids=tensor_batch.get("window_type_ids", None),
@@ -377,11 +522,29 @@ def _run_model_and_loss(
             semantic_duration_hours=tensor_batch.get("semantic_duration_hours", None),
             chunk_token_counts=tensor_batch.get("chunk_token_counts", None),
             chunk_duration_hours=tensor_batch.get("chunk_duration_hours", None),
+            token_event_index=tensor_batch.get("token_event_index", None),
+            token_event_slot_ids=tensor_batch.get("token_event_slot_ids", None),
+            event_input_ids=tensor_batch.get("event_input_ids", None),
+            event_time_ids=tensor_batch.get("event_time_ids", None),
+            event_numeric_values=tensor_batch.get("event_numeric_values", None),
+            event_numeric_mask=tensor_batch.get("event_numeric_mask", None),
+            event_type_ids=tensor_batch.get("event_type_ids", None),
+            event_payload_ids=tensor_batch.get("event_payload_ids", None),
+            event_demographic_feature_ids=tensor_batch.get("event_demographic_feature_ids", None),
+            event_attention_mask=tensor_batch.get("event_attention_mask", None),
+            event_memory_rule_scores=tensor_batch.get("event_memory_rule_scores", None),
+            event_memory_group_ids=tensor_batch.get("event_memory_group_ids", None),
+            event_memory_first_flags=tensor_batch.get("event_memory_first_flags", None),
+            event_memory_chronic_flags=tensor_batch.get("event_memory_chronic_flags", None),
+            subject_ids=tensor_batch.get("subject_ids", None),
+            trajectory_ords=tensor_batch.get("trajectory_ords", None),
+            return_aux_state=bool(return_aux_state),
         )
         loss, logs = criterion(head_outputs, tensor_batch)
     if not torch.isfinite(loss):
         raise FloatingPointError(f"Non-finite training loss: {float(loss.detach().cpu().item())}")
-    return loss, {k: float(v) for k, v in logs.items()}, head_outputs
+    aux_state = final_state if isinstance(final_state, dict) else None
+    return loss, {k: float(v) for k, v in logs.items()}, head_outputs, aux_state
 
 
 def evaluate(
@@ -393,23 +556,38 @@ def evaluate(
     autocast_enabled: bool,
     autocast_dtype: torch.dtype,
     max_batches: int | None = None,
+    carry_across_segments: bool = False,
 ) -> Dict[str, float]:
     model.eval()
     total_loss = 0.0
     n_batches = 0
     log_acc: Dict[str, float] = {}
+    carry_cache: Dict[int, Dict[str, Any]] = {}
     with torch.no_grad():
         for batch_idx, batch in enumerate(dataloader):
             if max_batches is not None and batch_idx >= int(max_batches):
                 break
             tensor_batch = _move_batch_to_device(batch, device)
-            loss, logs, _ = _run_model_and_loss(
+            prev_global_state, prev_memory_state = _resolve_carry_inputs(
+                tensor_batch=tensor_batch,
+                model=model,
+                carry_cache=carry_cache if carry_across_segments else None,
+            )
+            loss, logs, _, aux_state = _run_model_and_loss(
                 model=model,
                 criterion=criterion,
                 tensor_batch=tensor_batch,
                 device=device,
                 autocast_enabled=autocast_enabled,
                 autocast_dtype=autocast_dtype,
+                prev_global_state=prev_global_state,
+                prev_memory_state=prev_memory_state,
+                return_aux_state=bool(carry_across_segments),
+            )
+            _update_carry_cache(
+                tensor_batch=tensor_batch,
+                aux_state=aux_state,
+                carry_cache=carry_cache if carry_across_segments else None,
             )
             total_loss += float(loss.detach().cpu().item())
             _accumulate_logs(log_acc, logs)
@@ -544,14 +722,90 @@ def main() -> None:
     ap.add_argument("--global_time_embedding_max_hours", type=float, default=365.25 * 24.0 * 10.0)
     ap.add_argument("--disable_transition_bias", action="store_true")
     ap.add_argument("--emit_switched_heads", action="store_true")
+    ap.add_argument("--global_context_mode", choices=["transformer", "latent_state"], default="latent_state")
+    ap.add_argument("--carry_state_across_segments", dest="carry_state_across_segments", action="store_true")
+    ap.add_argument("--disable_carry_state_across_segments", dest="carry_state_across_segments", action="store_false")
+    ap.add_argument("--enable_exact_memory", dest="enable_exact_memory", action="store_true")
+    ap.add_argument("--disable_exact_memory", dest="enable_exact_memory", action="store_false")
+    ap.add_argument("--enable_precedent_memory", dest="enable_precedent_memory", action="store_true")
+    ap.add_argument("--disable_precedent_memory", dest="enable_precedent_memory", action="store_false")
+    ap.add_argument("--precedent_index_path", default=None)
+    ap.add_argument("--precedent_retrieve_k", type=int, default=4)
+    ap.add_argument(
+        "--precedent_strict_window_type_match",
+        dest="precedent_strict_window_type_match",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--disable_precedent_strict_window_type_match",
+        dest="precedent_strict_window_type_match",
+        action="store_false",
+    )
+    ap.add_argument("--precedent_support_overlap_bias", type=float, default=0.25)
+    ap.add_argument("--precedent_score_temperature", type=float, default=1.0)
+    ap.add_argument("--exact_memory_slots", type=int, default=16)
+    ap.add_argument("--exact_memory_static_slots", type=int, default=2)
+    ap.add_argument("--exact_memory_persistent_slots", type=int, default=16)
+    ap.add_argument("--exact_memory_episodic_slots", type=int, default=16)
+    ap.add_argument("--exact_memory_write_per_window", type=int, default=2)
+    ap.add_argument("--exact_memory_retrieve_k", type=int, default=4)
+    ap.add_argument("--exact_memory_static_retrieve_k", type=int, default=2)
+    ap.add_argument("--exact_memory_persistent_retrieve_k", type=int, default=4)
+    ap.add_argument("--exact_memory_episodic_retrieve_k", type=int, default=4)
+    ap.add_argument("--exact_memory_static_feature_ids", type=str, default="1,2")
+    ap.add_argument("--exact_memory_max_same_group", type=int, default=2)
+    ap.add_argument("--exact_memory_age_decay", type=float, default=0.05)
+    ap.add_argument("--exact_memory_rule_write_scale", type=float, default=1.0)
+    ap.add_argument("--exact_memory_rule_retrieval_scale", type=float, default=0.25)
+    ap.add_argument("--exact_memory_learned_write_scale", type=float, default=1.0)
+    ap.add_argument("--exact_memory_first_occurrence_bonus", type=float, default=0.75)
+    ap.add_argument("--exact_memory_chronic_bonus", type=float, default=1.5)
+    ap.add_argument("--enable_event_time_nll_head", dest="enable_event_time_nll_head", action="store_true")
+    ap.add_argument("--disable_event_time_nll_head", dest="enable_event_time_nll_head", action="store_false")
+    ap.add_argument("--enable_next_window_gap_nll_head", dest="enable_next_window_gap_nll_head", action="store_true")
+    ap.add_argument("--disable_next_window_gap_nll_head", dest="enable_next_window_gap_nll_head", action="store_false")
+    ap.add_argument(
+        "--enable_next_window_duration_nll_head",
+        dest="enable_next_window_duration_nll_head",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--disable_next_window_duration_nll_head",
+        dest="enable_next_window_duration_nll_head",
+        action="store_false",
+    )
+    ap.add_argument(
+        "--enable_next_window_support_head",
+        dest="enable_next_window_support_head",
+        action="store_true",
+    )
+    ap.add_argument(
+        "--disable_next_window_support_head",
+        dest="enable_next_window_support_head",
+        action="store_false",
+    )
     ap.set_defaults(
         enable_time_embedding=True,
         enable_chunk_meta_sidechannel=True,
         enable_window_sequence_meta=True,
         condition_numeric_on_token_type=True,
+        carry_state_across_segments=True,
+        enable_exact_memory=True,
+        enable_precedent_memory=False,
+        precedent_strict_window_type_match=True,
+        enable_event_time_nll_head=True,
+        enable_next_window_gap_nll_head=True,
+        enable_next_window_duration_nll_head=True,
+        enable_next_window_support_head=True,
     )
 
     ap.add_argument("--token_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_token_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_family_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_payload_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_concept_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_dt_loss_weight", type=float, default=1.0)
+    ap.add_argument("--event_value_loss_weight", type=float, default=1.0)
     ap.add_argument(
         "--token_family_weight_preset",
         choices=sorted(TOKEN_FAMILY_WEIGHT_PRESETS.keys()),
@@ -571,6 +825,12 @@ def main() -> None:
     ap.add_argument("--chunk_loss_weight", type=float, default=0.0)
     ap.add_argument("--time_loss_weight", type=float, default=0.0)
     ap.add_argument("--dt_loss_weight", type=float, default=0.0)
+    ap.add_argument("--next_window_gap_loss_weight", type=float, default=1.0)
+    ap.add_argument("--next_window_duration_loss_weight", type=float, default=1.0)
+    ap.add_argument("--next_window_support_loss_weight", type=float, default=0.5)
+    ap.add_argument("--precedent_future_loss_weight", type=float, default=1.0)
+    ap.add_argument("--precedent_contrast_loss_weight", type=float, default=1.0)
+    ap.add_argument("--precedent_anchor_loss_weight", type=float, default=0.25)
 
     ap.add_argument("--disable_residual_fallback", action="store_true")
     ap.add_argument("--residual_fallback_buckets", type=int, default=39999)
@@ -654,6 +914,7 @@ def main() -> None:
             index_filename=("trajectory_index.csv" if str(args.trajectory_mode) == "admission_chain" else "index.csv"),
             segmentation_config=segmentation_cfg,
             trajectory_split_config=trajectory_split_cfg,
+            return_metadata=True,
         )
         train_loader = DataLoader(
             train_ds,
@@ -667,6 +928,7 @@ def main() -> None:
             "train_root": str(precompiled_train_root),
             "eval_root": str(precompiled_eval_root or precompiled_train_root),
             "trajectory_mode": str(args.trajectory_mode),
+            "carry_state_across_segments": bool(args.carry_state_across_segments),
             "resolved_num_workers": int(train_loader_kwargs["num_workers"]),
             "prefetch_factor": int(train_loader_kwargs.get("prefetch_factor", 0)),
             "persistent_workers": bool(train_loader_kwargs.get("persistent_workers", False)),
@@ -687,6 +949,7 @@ def main() -> None:
                 index_filename=("trajectory_index.csv" if str(args.trajectory_mode) == "admission_chain" else "index.csv"),
                 segmentation_config=segmentation_cfg,
                 trajectory_split_config=trajectory_split_cfg,
+                return_metadata=True,
             )
             eval_loader = DataLoader(
                 eval_ds,
@@ -707,6 +970,9 @@ def main() -> None:
             )
         residual_enabled, residual_buckets, residual_offsets = _resolve_residual_policy(
             args,
+            tokenization_contract=tokenization_contract,
+        )
+        residual_tail_policies = _resolve_residual_tail_policies(
             tokenization_contract=tokenization_contract,
         )
         struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
@@ -730,6 +996,7 @@ def main() -> None:
             enable_residual_fallback=bool(residual_enabled),
             residual_fallback_buckets=int(residual_buckets),
             residual_fallback_offsets=dict(residual_offsets),
+            residual_tail_policies=residual_tail_policies,
         )
         train_subject_ids = _load_subject_ids(
             str(args.splits_parquet),
@@ -757,6 +1024,7 @@ def main() -> None:
         pipeline_summary = {
             "mode": "on_the_fly",
             "trajectory_mode": "full_subject",
+            "carry_state_across_segments": bool(args.carry_state_across_segments),
             "resolved_num_workers": 0,
             "train_subject_count": int(len(train_ds)),
         }
@@ -802,8 +1070,37 @@ def main() -> None:
         enable_window_sequence_meta=bool(args.enable_window_sequence_meta),
         condition_numeric_on_token_type=bool(args.condition_numeric_on_token_type),
         numeric_value_transform=str(args.numeric_value_transform),
+        global_context_mode=str(args.global_context_mode),
         enable_transition_bias=not bool(args.disable_transition_bias),
         emit_switched_heads=bool(args.emit_switched_heads),
+        carry_state_across_segments=bool(args.carry_state_across_segments),
+        enable_exact_memory=bool(args.enable_exact_memory),
+        enable_precedent_memory=bool(args.enable_precedent_memory or args.precedent_index_path),
+        exact_memory_slots=int(args.exact_memory_slots),
+        exact_memory_static_slots=int(args.exact_memory_static_slots),
+        exact_memory_persistent_slots=int(args.exact_memory_persistent_slots),
+        exact_memory_episodic_slots=int(args.exact_memory_episodic_slots),
+        exact_memory_write_per_window=int(args.exact_memory_write_per_window),
+        exact_memory_retrieve_k=int(args.exact_memory_retrieve_k),
+        exact_memory_static_retrieve_k=int(args.exact_memory_static_retrieve_k),
+        exact_memory_persistent_retrieve_k=int(args.exact_memory_persistent_retrieve_k),
+        exact_memory_episodic_retrieve_k=int(args.exact_memory_episodic_retrieve_k),
+        exact_memory_static_feature_ids=str(args.exact_memory_static_feature_ids),
+        exact_memory_max_same_group=int(args.exact_memory_max_same_group),
+        exact_memory_age_decay=float(args.exact_memory_age_decay),
+        exact_memory_rule_write_scale=float(args.exact_memory_rule_write_scale),
+        exact_memory_rule_retrieval_scale=float(args.exact_memory_rule_retrieval_scale),
+        exact_memory_learned_write_scale=float(args.exact_memory_learned_write_scale),
+        exact_memory_first_occurrence_bonus=float(args.exact_memory_first_occurrence_bonus),
+        exact_memory_chronic_bonus=float(args.exact_memory_chronic_bonus),
+        precedent_retrieve_k=int(args.precedent_retrieve_k),
+        precedent_strict_window_type_match=bool(args.precedent_strict_window_type_match),
+        precedent_support_overlap_bias=float(args.precedent_support_overlap_bias),
+        precedent_score_temperature=float(args.precedent_score_temperature),
+        enable_event_time_nll_head=bool(args.enable_event_time_nll_head),
+        enable_next_window_gap_nll_head=bool(args.enable_next_window_gap_nll_head),
+        enable_next_window_duration_nll_head=bool(args.enable_next_window_duration_nll_head),
+        enable_next_window_support_head=bool(args.enable_next_window_support_head),
     )
     token_family_weights = resolve_token_family_weights(
         preset=str(args.token_family_weight_preset),
@@ -816,6 +1113,12 @@ def main() -> None:
         strict_routing=True,
         weights={
             "token": float(args.token_loss_weight),
+            "event_token": float(args.event_token_loss_weight),
+            "event_family": float(args.event_family_loss_weight),
+            "event_payload": float(args.event_payload_loss_weight),
+            "event_concept": float(args.event_concept_loss_weight),
+            "event_dt": float(args.event_dt_loss_weight),
+            "event_value": float(args.event_value_loss_weight),
             "val": float(args.value_loss_weight),
             "transition": float(args.transition_loss_weight),
             "win_boundary": float(args.win_boundary_loss_weight),
@@ -824,6 +1127,12 @@ def main() -> None:
             "chunk": float(args.chunk_loss_weight),
             "time": float(args.time_loss_weight),
             "dt": float(args.dt_loss_weight),
+            "next_window_gap": float(args.next_window_gap_loss_weight),
+            "next_window_duration": float(args.next_window_duration_loss_weight),
+            "next_window_support": float(args.next_window_support_loss_weight),
+            "precedent_future": float(args.precedent_future_loss_weight),
+            "precedent_contrast": float(args.precedent_contrast_loss_weight),
+            "precedent_anchor": float(args.precedent_anchor_loss_weight),
         },
     ).to(device)
     optimizer = torch.optim.AdamW(
@@ -855,6 +1164,8 @@ def main() -> None:
         start_epoch = int(ckpt.get("epoch", 0)) + 1
         global_step = int(ckpt.get("global_step", 0))
         best_val_loss = ckpt.get("best_val_loss", None)
+    if args.precedent_index_path:
+        model.load_precedent_index(args.precedent_index_path, map_location="cpu")
 
     run_meta = {
         "args": vars(args),
@@ -884,6 +1195,7 @@ def main() -> None:
             autocast_enabled=autocast_enabled,
             autocast_dtype=autocast_dtype,
             max_batches=args.max_eval_batches,
+            carry_across_segments=bool(args.carry_state_across_segments),
         )
         eval_payload = {
             "event": "eval_only",
@@ -914,16 +1226,30 @@ def main() -> None:
         epoch_log_acc: Dict[str, float] = {}
         epoch_batches = 0
         stopped_on_max_steps = False
+        carry_cache: Dict[int, Dict[str, Any]] = {}
         pbar = tqdm(train_loader, desc=f"train epoch {epoch}")
         for batch_idx, batch in enumerate(pbar, start=1):
             tensor_batch = _move_batch_to_device(batch, device)
-            loss, logs, _ = _run_model_and_loss(
+            prev_global_state, prev_memory_state = _resolve_carry_inputs(
+                tensor_batch=tensor_batch,
+                model=model,
+                carry_cache=carry_cache if bool(args.carry_state_across_segments) else None,
+            )
+            loss, logs, _, aux_state = _run_model_and_loss(
                 model=model,
                 criterion=criterion,
                 tensor_batch=tensor_batch,
                 device=device,
                 autocast_enabled=autocast_enabled,
                 autocast_dtype=autocast_dtype,
+                prev_global_state=prev_global_state,
+                prev_memory_state=prev_memory_state,
+                return_aux_state=bool(args.carry_state_across_segments),
+            )
+            _update_carry_cache(
+                tensor_batch=tensor_batch,
+                aux_state=aux_state,
+                carry_cache=carry_cache if bool(args.carry_state_across_segments) else None,
             )
             scaler.scale(loss / float(grad_accum_steps)).backward()
 
@@ -974,6 +1300,7 @@ def main() -> None:
                     autocast_enabled=autocast_enabled,
                     autocast_dtype=autocast_dtype,
                     max_batches=args.max_eval_batches,
+                    carry_across_segments=bool(args.carry_state_across_segments),
                 )
                 val_loss = float(latest_val_metrics.get("loss", float("inf")))
                 if best_val_loss is None or val_loss < float(best_val_loss):
@@ -1031,6 +1358,7 @@ def main() -> None:
                 autocast_enabled=autocast_enabled,
                 autocast_dtype=autocast_dtype,
                 max_batches=args.max_eval_batches,
+                carry_across_segments=bool(args.carry_state_across_segments),
             )
             val_loss = float(latest_val_metrics.get("loss", float("inf")))
             if best_val_loss is None or val_loss < float(best_val_loss):

@@ -1,16 +1,29 @@
 from typing import Dict, List, Optional, Set
 from datetime import datetime
 import math
-import zlib
 
 import meds_reader as mr   # pip install meds_reader
 
+from .event_frames import EventFrame, EventPayloadKind, build_event_frame, ensure_event_frames
 from .token_types import EventToken, TokenCategory
 from .event_router import classify_code_to_category
-from .observation_vocab import OBS_RESERVED_VALUE_IDS, observation_surfaces
-from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
+from src.ehr_hier.tokenizers.codecs.qualitative_observation import QualitativeObservationFrameCodec
+from src.ehr_hier.tokenizers.codecs.structural import (
+    emit_process_transition_frame,
+    parse_process_transition,
+)
+from src.ehr_hier.tokenizers.interfaces import EventFrameEncoder
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
-from src.ehr_hier.data.structural_codes import StructuralCodebook, structural_surface_code
+from src.ehr_hier.data.structural_codes import (
+    DEFAULT_WINDOW_TYPE2ID_MAP,
+    StructuralCodebook,
+    TRANSITION_ACTION_TO_ID,
+    infer_transition_action_from_code,
+    infer_transition_site_id_from_code,
+    infer_transition_window_type_name_from_code,
+    infer_transition_window_type_id_from_code,
+    structural_surface_code,
+)
 from src.ehr_hier.data.demographics import (
     age_years_from_timestamps,
     infer_subject_sex,
@@ -37,18 +50,6 @@ class _EventWithDemographics:
 
 
 ACTIVE_TRANSITION_ACTIONS = {"open_next", "close_current", "close_open"}
-
-PROCESS_ACTION_TO_ID = {"START": 1, "END": 2, "STOP": 3}
-PROCESS_DOMAIN_TO_ID = {"MEDICATION": 1, "PROCEDURE": 2, "INFUSION": 3}
-OBS_SPECIAL_VALUE_IDS = {
-    "UNK": int(OBS_RESERVED_VALUE_IDS["UNK"]),
-    "N/A": int(OBS_RESERVED_VALUE_IDS["N/A"]),
-    "NA": int(OBS_RESERVED_VALUE_IDS["N/A"]),
-    "NONE": int(OBS_RESERVED_VALUE_IDS["NONE"]),
-    "NULL": int(OBS_RESERVED_VALUE_IDS["NONE"]),
-    "": int(OBS_RESERVED_VALUE_IDS[""]),
-}
-
 GLOBAL_DEMOGRAPHIC_TOKEN_IDS = {
     "SEX_F": 30,
     "SEX_M": 31,
@@ -93,8 +94,8 @@ LEGACY_STRUCTURAL_BOUNDARY_PREFIXES = {
 def build_subject_timeline(
     db: mr.SubjectDatabase,
     subject_id: int,
-    encoders: Dict[TokenCategory, EventTokenEncoder],
-    add_summary_tokens: Optional[List[EventToken]] = None,
+    encoders: Dict[TokenCategory, EventFrameEncoder],
+    add_summary_tokens: Optional[List[EventFrame | EventToken]] = None,
     structural_event_map: Optional[Dict[str, float]] = None,
     window_hook_label: str = "window_boundary",
     attach_med_numeric: bool = True,
@@ -111,12 +112,13 @@ def build_subject_timeline(
     drop_original_process_marker_tokens: bool = False,
     emit_global_demographic_tokens: bool = True,
     special_token_offset: int = 0,
-) -> List[EventToken]:
+) -> List[EventFrame]:
     """
-    Build a flat token timeline for a single subject using rich EventToken bundles.
-    This function emits only semantic tokens; special CLS/SEP markers are added later
-    during batching/windowing. Any metadata emitted by encoders (cat_attrs/num_attrs)
-    is preserved on the returned EventToken objects for collation-time projection.
+    Build a semantic event-frame timeline for a single subject.
+
+    Event codecs still emit atomic `EventToken` bundles internally, but the public
+    timeline object is now `EventFrame`: one semantic event with one or more internal
+    token atoms. Special CLS/SEP markers remain a collation concern.
 
     Steps:
       1. Reset encoder state (per subject).
@@ -151,8 +153,8 @@ def build_subject_timeline(
 
     Returns
     -------
-    tokens : List[EventToken]
-        Event-level tokens ready for downstream windowing/collation.
+    frames : List[EventFrame]
+        Semantic event frames ready for downstream collation.
     """
     subj = db[int(subject_id)]
     events = list(subj.events)  # already time-sorted per MEDS spec
@@ -198,7 +200,7 @@ def build_subject_timeline(
         if hasattr(enc, "reset_state"):
             enc.reset_state()
 
-    tokens: List[EventToken] = []
+    frames: List[EventFrame] = []
     if structural_event_map is None:
         structural_codes = set()
     elif hasattr(structural_event_map, "codes"):
@@ -216,27 +218,51 @@ def build_subject_timeline(
         struct_label2id = structural_codebook.label2id()
         struct_only = structural_codebook.structural_only
         struct_keep_orig = structural_codebook.keep_original
+    qual_obs_codec = QualitativeObservationFrameCodec(
+        code_offset=int(qual_obs_code_offset),
+        value_offset=int(qual_obs_value_offset),
+        value_vocab_size=int(qual_obs_value_vocab_size),
+        code_vocab=qual_obs_code_vocab,
+        value_vocab=qual_obs_value_vocab,
+        tail_policy=str(qual_obs_tail_policy),
+    )
+    meas_codec = encoders.get(TokenCategory.MEASUREMENT)
+    if meas_codec is not None and hasattr(meas_codec, "obs_codec"):
+        setattr(meas_codec, "obs_codec", qual_obs_codec)
 
     def _transition_attrs_for_event(*, code_str: Optional[str], label: Optional[str]) -> tuple[Dict[str, int], Optional[str]]:
-        if structural_codebook is None or code_str is None:
+        if code_str is None:
             return {}, None
-        transition_action = structural_codebook.transition_action(code=code_str, label=label)
-        transition_window_type_name = structural_codebook.window_type_name(
-            code=code_str,
-            label=label,
-            action=transition_action,
-        )
-        transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
-        transition_window_type_id = structural_codebook.window_type_id(
-            code=code_str,
-            label=label,
-            action=transition_action,
-        )
-        transition_site_id = structural_codebook.transition_site_id(
-            code=code_str,
-            label=label,
-            action=transition_action,
-        )
+        transition_window_type_name: Optional[str] = None
+        if structural_codebook is not None:
+            transition_action = structural_codebook.transition_action(code=code_str, label=label)
+            transition_window_type_name = structural_codebook.window_type_name(
+                code=code_str,
+                label=label,
+                action=transition_action,
+            )
+            transition_action_id = structural_codebook.transition_action_id(code=code_str, label=label)
+            transition_window_type_id = structural_codebook.window_type_id(
+                code=code_str,
+                label=label,
+                action=transition_action,
+            )
+            transition_site_id = structural_codebook.transition_site_id(
+                code=code_str,
+                label=label,
+                action=transition_action,
+            )
+        else:
+            transition_action = infer_transition_action_from_code(code_str)
+            transition_window_type_name = infer_transition_window_type_name_from_code(code_str)
+            transition_action_id = (
+                None if transition_action is None else TRANSITION_ACTION_TO_ID.get(transition_action)
+            )
+            transition_window_type_id = infer_transition_window_type_id_from_code(
+                code_str,
+                window_type2id_map=DEFAULT_WINDOW_TYPE2ID_MAP,
+            )
+            transition_site_id = infer_transition_site_id_from_code(code_str)
         attrs: Dict[str, int] = {}
         code_prefix = str(code_str).split("//", 1)[0].upper()
         if transition_action_id is not None:
@@ -369,168 +395,6 @@ def build_subject_timeline(
         if timeline_start is None or not isinstance(t, datetime):
             return 0.0
         return max(0.0, (t - timeline_start).total_seconds() / 3600.0)
-
-    def _stable_local_id(raw: str, *, modulo: int = 900_000) -> int:
-        data = str(raw).encode("utf-8", errors="ignore")
-        mod = max(1, int(modulo))
-        return 1 + (zlib.crc32(data) % mod)
-
-    def _emit_qual_obs_tokens(
-        *,
-        code_value: Optional[str],
-        t_value: Optional[datetime],
-        dt_value: float,
-    ) -> List[EventToken]:
-        if code_value is None:
-            return []
-        surfaces = observation_surfaces(ev_view, code_value=code_value)
-        if surfaces is None:
-            return []
-
-        obs_code_lane = max(16, int(qual_obs_value_offset) - int(qual_obs_code_offset) - 1)
-        obs_value_lane = max(16, int(qual_obs_value_vocab_size))
-
-        code_exact = False
-        obs_code_gid: Optional[int] = None
-        local_code_id: Optional[int] = None
-        if qual_obs_code_vocab is not None:
-            obs_code_gid = qual_obs_code_vocab.maybe_encode(surfaces.code_surface)
-            if obs_code_gid is not None:
-                local_code_id = int(obs_code_gid) - int(qual_obs_code_vocab.offset)
-                code_exact = True
-            elif str(qual_obs_tail_policy).lower() == "drop":
-                return []
-        if obs_code_gid is None:
-            local_code_id = _stable_local_id(surfaces.code_surface, modulo=obs_code_lane)
-            obs_code_gid = int(qual_obs_code_offset) + int(local_code_id)
-
-        value_exact = False
-        obs_val_text = surfaces.value_surface
-        obs_val_gid: Optional[int] = None
-        obs_val_local: Optional[int] = None
-        if qual_obs_value_vocab is not None:
-            obs_val_gid = qual_obs_value_vocab.maybe_encode(obs_val_text)
-            if obs_val_gid is not None:
-                obs_val_local = int(obs_val_gid) - int(qual_obs_value_vocab.offset)
-                value_exact = True
-            elif str(qual_obs_tail_policy).lower() == "drop":
-                return []
-        if obs_val_gid is None:
-            obs_val_upper = obs_val_text.upper()
-            special_local = OBS_SPECIAL_VALUE_IDS.get(obs_val_upper)
-            if special_local is not None and int(special_local) <= int(obs_value_lane):
-                obs_val_local = int(special_local)
-            else:
-                obs_val_local = _stable_local_id(f"OBS_VAL::{obs_val_text}", modulo=obs_value_lane)
-            obs_val_gid = int(qual_obs_value_offset) + int(obs_val_local)
-
-        if local_code_id is None or obs_val_local is None:
-            return []
-        obs_stage_exact = int(code_exact and value_exact)
-        obs_stage_hash = int(not code_exact and not value_exact)
-        t_from_start = _t_from_start_hours(t_value) if isinstance(t_value, datetime) else 0.0
-
-        return [
-            EventToken(
-                value_id=int(obs_code_gid),
-                category_id=int(TokenCategory.MEASUREMENT),
-                t_from_start_hours=t_from_start,
-                dt_from_prev_hours=float(dt_value),
-                cat_attrs={
-                    "obs_bundle_pos": 1,
-                    "obs_code_local_id": int(local_code_id),
-                    "obs_code_exact": int(code_exact),
-                    "obs_stage_exact": obs_stage_exact,
-                    "obs_stage_hash": obs_stage_hash,
-                },
-                num_attrs={},
-                raw_time=t_value if isinstance(t_value, datetime) else None,
-                window_hook=None,
-            ),
-            EventToken(
-                value_id=int(obs_val_gid),
-                category_id=int(TokenCategory.MEASUREMENT),
-                t_from_start_hours=t_from_start,
-                dt_from_prev_hours=0.0,
-                cat_attrs={
-                    "obs_bundle_pos": 2,
-                    "obs_value_local_id": int(obs_val_local),
-                    "obs_value_exact": int(value_exact),
-                    "obs_stage_exact": obs_stage_exact,
-                    "obs_stage_hash": obs_stage_hash,
-                },
-                num_attrs={},
-                raw_time=t_value if isinstance(t_value, datetime) else None,
-                window_hook=None,
-            ),
-        ]
-
-    def _parse_process_transition(code_value: Optional[str]) -> Optional[tuple[str, str, str]]:
-        if code_value is None:
-            return None
-        code_norm = str(code_value).strip()
-        if not code_norm:
-            return None
-        upper = code_norm.upper()
-        if upper.startswith("INFUSION_START//"):
-            return ("START", "INFUSION", code_norm.split("//", 1)[1])
-        if upper.startswith("INFUSION_END//"):
-            return ("END", "INFUSION", code_norm.split("//", 1)[1])
-
-        parts = [p.strip() for p in str(code_norm).split("//")]
-        if len(parts) >= 3 and parts[0].upper() in {"MEDICATION", "PROCEDURE"}:
-            marker = parts[1].upper()
-            if marker in {"START", "END", "STOP"}:
-                entity = "//".join(parts[2:]).strip()
-                if entity:
-                    return (marker, parts[0].upper(), entity)
-        return None
-
-    def _emit_process_struct_tokens(
-        *,
-        transition: tuple[str, str, str],
-        t_value: Optional[datetime],
-        dt_value: float,
-    ) -> List[EventToken]:
-        action, domain, entity = transition
-        action_id = PROCESS_ACTION_TO_ID.get(action.upper(), 0)
-        domain_id = PROCESS_DOMAIN_TO_ID.get(domain.upper(), 0)
-        if action_id <= 0 or domain_id <= 0:
-            return []
-        entity_local: int
-        if entity.isdigit():
-            entity_local = int(entity)
-        else:
-            entity_local = _stable_local_id(f"{domain.upper()}::{entity}")
-        t_from_start = _t_from_start_hours(t_value) if isinstance(t_value, datetime) else 0.0
-        return [
-            EventToken(
-                value_id=int(struct_action_offset) + int(action_id),
-                category_id=int(TokenCategory.STRUCTURAL),
-                t_from_start_hours=t_from_start,
-                dt_from_prev_hours=float(dt_value),
-                cat_attrs={
-                    "struct_process_action_id": int(action_id),
-                    "struct_process_domain_id": int(domain_id),
-                },
-                num_attrs={},
-                raw_time=t_value if isinstance(t_value, datetime) else None,
-                window_hook=None,
-            ),
-            EventToken(
-                value_id=int(struct_entity_offset) + int(entity_local),
-                category_id=int(TokenCategory.STRUCTURAL),
-                t_from_start_hours=t_from_start,
-                dt_from_prev_hours=0.0,
-                cat_attrs={
-                    "struct_process_action_id": int(action_id),
-                    "struct_process_domain_id": int(domain_id),
-                },
-                num_attrs={},
-                raw_time=t_value if isinstance(t_value, datetime) else None,
-                window_hook=None,
-            ),
-        ]
 
     def _normalize_code(code_value: Optional[str]) -> str:
         if code_value is None:
@@ -735,24 +599,82 @@ def build_subject_timeline(
 
         return out
 
-    # 2) Optional global summary/window-0 tokens (coerced to EventToken, t=0)
-    if add_summary_tokens:
-        for tok in add_summary_tokens:
-            tokens.append(
+    def _coerce_prefix_frame(frame: EventFrame, *, payload_kind: EventPayloadKind | str) -> EventFrame:
+        coerced_tokens = [
+            EventToken(
+                value_id=int(tok.value_id),
+                category_id=int(tok.category_id),
+                t_from_start_hours=0.0,
+                dt_from_prev_hours=0.0,
+                cat_attrs=dict(tok.cat_attrs or {}),
+                num_attrs=dict(tok.num_attrs or {}),
+                raw_time=None,
+                window_hook=None,
+            )
+            for tok in frame.token_bundle
+        ]
+        return build_event_frame(
+            coerced_tokens,
+            payload_kind=payload_kind,
+            source_code=frame.source_code,
+            concept_code=frame.concept_code,
+            semantic_label=frame.semantic_label,
+        )
+
+    def _materialize_codec_frame(
+        frame: EventFrame,
+        *,
+        category: TokenCategory,
+        t_value: Optional[datetime],
+        t_from_start: float,
+        dt_budget: float,
+        routed_transition_attrs: Dict[str, int],
+        should_hook: bool,
+        med_numeric_value: Optional[float],
+    ) -> EventFrame:
+        adjusted_tokens: List[EventToken] = []
+        for idx, tok in enumerate(frame.token_bundle):
+            cat_attrs = dict(tok.cat_attrs or {})
+            if idx == 0 and routed_transition_attrs:
+                cat_attrs.update(routed_transition_attrs)
+            num_attrs = dict(tok.num_attrs or {})
+            if category == TokenCategory.MEDICATION and attach_med_numeric:
+                if "numeric_value" not in num_attrs or num_attrs.get("numeric_value") is None:
+                    num_attrs["numeric_value"] = med_numeric_value
+            adjusted_tokens.append(
                 EventToken(
                     value_id=int(tok.value_id),
-                    category_id=int(getattr(tok, "category_id", TokenCategory.SPECIAL)),
-                    t_from_start_hours=0.0,
-                    dt_from_prev_hours=0.0,
-                    cat_attrs=dict(tok.cat_attrs),
-                    num_attrs=dict(tok.num_attrs),
-                    raw_time=None,
-                    window_hook=None,
+                    category_id=int(category),
+                    t_from_start_hours=float(t_from_start),
+                    dt_from_prev_hours=float(dt_budget) if idx == 0 else 0.0,
+                    cat_attrs=cat_attrs,
+                    num_attrs=num_attrs,
+                    raw_time=t_value if isinstance(t_value, datetime) else tok.raw_time,
+                    window_hook=window_hook_label if should_hook else tok.window_hook,
                 )
             )
-    tokens.extend(_build_global_demographic_tokens())
+        return build_event_frame(
+            adjusted_tokens,
+            payload_kind=frame.payload_kind,
+            source_code=frame.source_code,
+            concept_code=frame.concept_code,
+            semantic_label=frame.semantic_label,
+        )
 
-    # 3) Timeline tokens from events
+    # 2) Optional global summary/window-0 frames (coerced to t=0 special context)
+    if add_summary_tokens:
+        for frame in ensure_event_frames(add_summary_tokens, payload_kind=EventPayloadKind.SPECIAL):
+            frames.append(_coerce_prefix_frame(frame, payload_kind=EventPayloadKind.SPECIAL))
+    for tok in _build_global_demographic_tokens():
+        frames.append(
+            build_event_frame(
+                [tok],
+                payload_kind=EventPayloadKind.DEMOGRAPHIC,
+                semantic_label="global_demographic",
+            )
+        )
+
+    # 3) Timeline frames from events
     last_emitted_time: Optional[datetime] = None
 
     for ev in events:
@@ -772,18 +694,30 @@ def build_subject_timeline(
             dt_hours = max(0.0, (t - last_emitted_time).total_seconds() / 3600.0)
 
         # Structural codebook: emit structural token regardless of routing
-        emitted_for_event: List[EventToken] = []
+        emitted_for_event: List[EventFrame] = []
         process_transition = (
-            _parse_process_transition(code_str) if emit_process_struct_tokens else None
+            parse_process_transition(code_str) if emit_process_struct_tokens else None
         )
         if process_transition is not None:
-            emitted_for_event.extend(
-                _emit_process_struct_tokens(
-                    transition=process_transition,
-                    t_value=t if isinstance(t, datetime) else None,
-                    dt_value=dt_hours,
-                )
+            process_frame = emit_process_transition_frame(
+                transition=process_transition,
+                struct_action_offset=int(struct_action_offset),
+                struct_entity_offset=int(struct_entity_offset),
+                raw_time=t if isinstance(t, datetime) else None,
             )
+            if process_frame is not None:
+                emitted_for_event.append(
+                    _materialize_codec_frame(
+                        process_frame,
+                        category=TokenCategory.STRUCTURAL,
+                        t_value=t if isinstance(t, datetime) else None,
+                        t_from_start=_t_from_start_hours(t) if isinstance(t, datetime) else 0.0,
+                        dt_budget=float(dt_hours),
+                        routed_transition_attrs={},
+                        should_hook=False,
+                        med_numeric_value=None,
+                    )
+                )
         struct_hit = structural_codebook is not None and code_str in structural_codebook.code2label
         routed_transition_attrs: Dict[str, int] = {}
         routed_transition_action: Optional[str] = None
@@ -801,47 +735,66 @@ def build_subject_timeline(
                 label=struct_label,
                 t_value=t if isinstance(t, datetime) else None,
                 dt_value=dt_hours,
-                prior_tokens=emitted_for_event,
+                prior_tokens=[
+                    tok
+                    for frame in emitted_for_event
+                    for tok in frame.token_bundle
+                ],
                 routed_transition_action=routed_transition_action,
             )
             if struct_tok is not None:
-                emitted_for_event.append(struct_tok)
+                emitted_for_event.append(
+                    build_event_frame(
+                        [struct_tok],
+                        payload_kind=EventPayloadKind.STRUCTURAL,
+                        source_code=code_str,
+                        semantic_label=struct_label,
+                    )
+                )
 
         # Skip original token if structural-only, or if the routed category is already
         # STRUCTURAL.
         if category == TokenCategory.STRUCTURAL and emitted_for_event:
-            tokens.extend(emitted_for_event)
+            frames.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
                 last_emitted_time = t
             continue
         if struct_hit and code_str not in struct_keep_orig and code_str in struct_only:
             # nothing else; record timestamp advance
-            tokens.extend(emitted_for_event)
+            frames.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
                 last_emitted_time = t
             continue
 
         if process_transition is not None and drop_original_process_marker_tokens:
-            tokens.extend(emitted_for_event)
+            frames.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
                 last_emitted_time = t
             continue
 
         if encoder is None:
             # unsupported category -> only structural tokens (if any)
-            tokens.extend(emitted_for_event)
+            frames.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
                 last_emitted_time = t
             continue
 
-        # Encoders may return multiple tokens for a single event (e.g., MEDTOK)
-        event_tokens = encoder.encode_event(ev_view, dt_hours=dt_hours)
-        if not event_tokens and category == TokenCategory.MEASUREMENT:
-            event_tokens = _emit_qual_obs_tokens(
-                code_value=code_str,
-                t_value=t if isinstance(t, datetime) else None,
-                dt_value=dt_hours if not emitted_for_event else 0.0,
-            )
+        codec_frames: List[EventFrame] = []
+        encode_frame = getattr(encoder, "encode_frame", None)
+        if callable(encode_frame):
+            codec_frames = list(encode_frame(ev_view, dt_hours=dt_hours))
+        else:
+            event_tokens = encoder.encode_event(ev_view, dt_hours=dt_hours)
+            if event_tokens:
+                codec_frames = [
+                    build_event_frame(
+                        event_tokens,
+                        source_code=code_str,
+                        concept_code=code_str,
+                    )
+                ]
+            elif category == TokenCategory.MEASUREMENT:
+                codec_frames = list(qual_obs_codec.encode_frame(ev_view, dt_hours=dt_hours))
         should_hook = False
         if bool(window_hook_label) and code_str is not None and not (structural_codebook is not None and struct_hit):
             if structural_codebook is not None:
@@ -863,60 +816,55 @@ def build_subject_timeline(
                 )
 
         # Guarantee boundary presence if map says so (fallback to UNK)
-        if not event_tokens and should_hook:
+        if not codec_frames and should_hook:
             fallback_id = 0
             base_vocab = getattr(encoder, "base_vocab", None)
             if base_vocab is not None:
                 fallback_id = base_vocab.offset + base_vocab.unk_id
-            event_tokens = [
-                EventToken(
-                    value_id=int(fallback_id),
-                    category_id=int(category),
-                    t_from_start_hours=0.0,
-                    dt_from_prev_hours=float(dt_hours),
-                    cat_attrs={},
-                    num_attrs={},
+            codec_frames = [
+                build_event_frame(
+                    [
+                        EventToken(
+                            value_id=int(fallback_id),
+                            category_id=int(category),
+                            t_from_start_hours=0.0,
+                            dt_from_prev_hours=float(dt_hours),
+                            cat_attrs={},
+                            num_attrs={},
+                        )
+                    ],
+                    source_code=code_str,
+                    concept_code=code_str,
                 )
             ]
-        if not event_tokens:
+        if not codec_frames:
             # still may have structural tokens
-            tokens.extend(emitted_for_event)
+            frames.extend(emitted_for_event)
             if emitted_for_event and isinstance(t, datetime):
                 last_emitted_time = t
             continue
 
         t_from_start = _t_from_start_hours(t) if isinstance(t, datetime) else 0.0
 
-        # First token in this event gets dt_hours; subsequent get 0
-        dt_budget = dt_hours
-        if emitted_for_event:
-            dt_budget = 0.0  # structural token already consumed dt
-
-        for idx, tok in enumerate(event_tokens):
-            cat_attrs = dict(tok.cat_attrs)
-            if idx == 0 and routed_transition_attrs:
-                cat_attrs.update(routed_transition_attrs)
-            emitted = EventToken(
-                value_id=int(tok.value_id),
-                category_id=int(category),
-                t_from_start_hours=t_from_start,
-                dt_from_prev_hours=dt_budget if idx == 0 else 0.0,
-                cat_attrs=cat_attrs,
-                num_attrs=dict(tok.num_attrs),
-                raw_time=t if isinstance(t, datetime) else tok.raw_time,
-                window_hook=window_hook_label if should_hook else tok.window_hook,
+        dt_budget = 0.0 if emitted_for_event else float(dt_hours)
+        med_numeric_value = _extract_med_numeric(ev) if category == TokenCategory.MEDICATION else None
+        for frame_idx, frame in enumerate(codec_frames):
+            emitted_for_event.append(
+                _materialize_codec_frame(
+                    frame,
+                    category=category,
+                    t_value=t if isinstance(t, datetime) else None,
+                    t_from_start=float(t_from_start),
+                    dt_budget=(float(dt_budget) if frame_idx == 0 else 0.0),
+                    routed_transition_attrs=routed_transition_attrs,
+                    should_hook=should_hook,
+                    med_numeric_value=med_numeric_value,
+                )
             )
-            if category == TokenCategory.MEDICATION and attach_med_numeric:
-                med_val = _extract_med_numeric(ev)
-                # preserve encoder-provided value unless missing; attach None explicitly
-                if "numeric_value" not in emitted.num_attrs or emitted.num_attrs.get("numeric_value") is None:
-                    emitted.num_attrs["numeric_value"] = med_val
 
-            emitted_for_event.append(emitted)
-
-        tokens.extend(emitted_for_event)
+        frames.extend(emitted_for_event)
 
         if emitted_for_event and isinstance(t, datetime):
             last_emitted_time = t
 
-    return tokens
+    return frames

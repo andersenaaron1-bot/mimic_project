@@ -27,6 +27,7 @@ from scripts.audit_tokenization_flow import (
     _load_subject_ids,
     _load_tokenization_contract,
     _resolve_residual_policy,
+    _resolve_residual_tail_policies,
 )
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.structural_codes import structural_surface_vocab_codes
@@ -97,6 +98,9 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         worker_args,
         tokenization_contract=tokenization_contract,
     )
+    residual_tail_policies = _resolve_residual_tail_policies(
+        tokenization_contract=tokenization_contract,
+    )
 
     struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
@@ -119,6 +123,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),
+        residual_tail_policies=residual_tail_policies,
     )
 
     sig = inspect.signature(build_subject_timeline)

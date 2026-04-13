@@ -48,10 +48,21 @@ frozen_ranges:
 residual_fallback:
   enabled: true
   buckets: 39999
+  tail_policy: drop
   offsets:
     diagnosis: 1160000
     procedure: 1360000
     medication: 1800000
+  families:
+    diagnosis:
+      tail_policy: drop
+    procedure:
+      tail_policy: drop
+    medication:
+      tail_policy: drop
+
+qualitative_observation:
+  tail_policy: drop
 
 window_markers:
   enabled: true

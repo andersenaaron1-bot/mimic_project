@@ -100,3 +100,53 @@ def test_loss_adds_event_dt_nll_term_across_chunk_boundaries() -> None:
 
     assert loss.item() < 1e-6
     assert logs["loss_dt_nll"] < 1e-6
+
+
+def test_loss_adds_event_dt_nll_term_on_event_lane() -> None:
+    from ehr_hier.transformer.loss import AETLossModule
+
+    vocab_config = {
+        "size_special": 10,
+        "size_rvq": 20,
+        "size_meas_labels": 30,
+        "size_meds": 40,
+        "offsets": {
+            "SPECIAL": 0,
+            "RVQ": 100,
+            "MEAS": 200,
+            "MED": 1000,
+        },
+    }
+
+    B, W, C, E = 1, 1, 1, 4
+    event_input_ids = torch.tensor([[[[1, 200, 201, 2]]]], dtype=torch.long)
+    event_attention_mask = torch.ones((B, W, C, E), dtype=torch.long)
+    event_type_ids = torch.tensor([[[[0, 1, 1, 0]]]], dtype=torch.long)
+    event_time_ids = torch.tensor([[[[0.0, 1.0, 3.0, 3.0]]]], dtype=torch.float)
+
+    mu = torch.log1p(torch.tensor([[[[0.0, 2.0, 0.0, 0.0]]]], dtype=torch.float))
+    sigma = torch.ones_like(mu)
+
+    head_outputs = {
+        "pred_event_dt_next_mu": mu,
+        "pred_event_dt_next_sigma": sigma,
+    }
+    targets = {
+        "input_ids": event_input_ids,
+        "attention_mask": event_attention_mask,
+        "token_type_ids": event_type_ids,
+        "event_input_ids": event_input_ids,
+        "event_attention_mask": event_attention_mask,
+        "event_type_ids": event_type_ids,
+        "event_time_ids": event_time_ids,
+    }
+
+    criterion = AETLossModule(
+        vocab_config=vocab_config,
+        weights={"event_dt": 1.0},
+        strict_routing=False,
+    )
+    loss, logs = criterion(head_outputs, targets)
+
+    assert loss.item() < 1e-6
+    assert logs["loss_event_dt_nll"] < 1e-6

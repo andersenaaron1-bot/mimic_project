@@ -31,7 +31,7 @@ class SpecialToken(IntEnum):
 @dataclass
 class EventToken:
     """
-    Rich per-token bundle for transformer batching.
+    Internal token atom used by codecs, serialization, and token-level runtime paths.
 
     Fields
     ------

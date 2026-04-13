@@ -303,6 +303,15 @@ def main() -> None:
         chunk_mask=tensor_batch.get("chunk_mask", None),
         chunk_start_offsets=tensor_batch.get("chunk_start_offsets", None),
         chunk_is_last=tensor_batch.get("chunk_is_last", None),
+        token_event_index=tensor_batch.get("token_event_index", None),
+        token_event_slot_ids=tensor_batch.get("token_event_slot_ids", None),
+        event_input_ids=tensor_batch.get("event_input_ids", None),
+        event_time_ids=tensor_batch.get("event_time_ids", None),
+        event_numeric_values=tensor_batch.get("event_numeric_values", None),
+        event_numeric_mask=tensor_batch.get("event_numeric_mask", None),
+        event_type_ids=tensor_batch.get("event_type_ids", None),
+        event_payload_ids=tensor_batch.get("event_payload_ids", None),
+        event_attention_mask=tensor_batch.get("event_attention_mask", None),
     )
     loss, logs = criterion(head_outputs, tensor_batch)
     if not torch.isfinite(loss):

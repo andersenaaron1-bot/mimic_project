@@ -16,7 +16,7 @@ class WindowSegmentationConfig:
     Runtime segmentation policy used by the collator and any future generation code.
 
     The policy intentionally mirrors the bundle-based audit path:
-      1. detect transition candidates from explicit transition metadata or legacy hooks
+      1. detect transition candidates from explicit transition metadata
       2. group nearby candidates into local bundles
       3. merge sparse administrative transition chains
       4. split the linear sequence with directional actions
@@ -116,7 +116,8 @@ def _token_transition_action(tok: EventToken) -> Optional[str]:
     if action_id is not None and action_id in TRANSITION_ACTION_FROM_ID:
         return TRANSITION_ACTION_FROM_ID[action_id]
     if tok.window_hook is not None:
-        # Backward-compatible fallback for older timelines/tests.
+        # Fallback for older artifacts and narrow tests; the canonical v2 builder
+        # now emits explicit transition metadata on boundary events.
         return "open_next"
     return None
 

@@ -5,6 +5,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from src.ehr_hier.data.event_frames import EVENT_PAYLOAD_KIND_TO_ID
+from src.ehr_hier.transformer.precedent_memory import build_window_support_flags
+from src.ehr_hier.transformer.world_model_contract import NUM_SUPPORT_FLAGS
+
 
 class AETLossModule(nn.Module):
     """
@@ -36,6 +40,14 @@ class AETLossModule(nn.Module):
         "special_marker",
         "unk",
     )
+    EVENT_CONCEPT_FAMILY_ORDER: Tuple[str, ...] = (
+        "special",
+        "measurement",
+        "diagnosis",
+        "procedure",
+        "medication",
+        "structural",
+    )
 
     def __init__(
         self,
@@ -56,6 +68,12 @@ class AETLossModule(nn.Module):
         self.special_type_id = int(special_type_id)
         self.weights = weights or {
             "token": 1.0,
+            "event_token": 1.0,
+            "event_family": 1.0,
+            "event_payload": 1.0,
+            "event_concept": 1.0,
+            "event_dt": 1.0,
+            "event_value": 1.0,
             "struct": 5.0,
             "rvq": 1.0,
             "meas": 1.0,
@@ -68,11 +86,15 @@ class AETLossModule(nn.Module):
             "chunk": 0.0,
             "time": 0.0,
             "dt": 0.0,
+            "next_window_gap": 1.0,
+            "next_window_duration": 1.0,
+            "next_window_support": 0.5,
         }
 
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
         self.mse_loss = nn.MSELoss(reduction="none")
         self.routing = self._build_routing(self.vocab_config)
+        self.event_concept_routing = self._build_event_concept_routing(self.vocab_config)
         self._marker_info = self._build_marker_info(self.vocab_config)
         token_family_names, token_family_ids = self._build_token_family_group_ids(self.vocab_config)
         self._token_family_group_names = token_family_names
@@ -133,6 +155,46 @@ class AETLossModule(nn.Module):
             "logits_meas": [{"offset": _need("MEAS"), "size": size_meas, "name": "MEAS"}],
             "logits_medtok": [{"offset": _need("MED"), "size": size_med, "name": "MED"}],
         }
+
+    @classmethod
+    def _build_event_concept_routing(cls, vocab_config: dict) -> dict[str, list[dict]]:
+        dense_blocks = vocab_config.get("dense_blocks", [])
+        event_routing = {
+            family_name: [] for family_name in cls.EVENT_CONCEPT_FAMILY_ORDER
+        }
+        if not isinstance(dense_blocks, list):
+            return event_routing
+
+        block_to_family = {
+            "special": "special",
+            "measurement_code": "measurement",
+            "observation_code": "measurement",
+            "diagnosis": "diagnosis",
+            "diagnosis_residual": "diagnosis",
+            "procedure": "procedure",
+            "procedure_residual": "procedure",
+            "medication": "medication",
+            "medication_residual": "medication",
+            "structural": "structural",
+        }
+        for block in dense_blocks:
+            if not isinstance(block, dict):
+                continue
+            block_name = str(block.get("name", ""))
+            family_name = block_to_family.get(block_name, None)
+            if family_name is None:
+                continue
+            size = int(block.get("dense_size", 0))
+            if size <= 0:
+                continue
+            event_routing[family_name].append(
+                {
+                    "offset": int(block.get("dense_offset", 0)),
+                    "size": size,
+                    "name": block_name,
+                }
+            )
+        return event_routing
 
     @classmethod
     def _build_token_family_group_ids(cls, vocab_config: dict) -> tuple[Tuple[str, ...], torch.Tensor]:
@@ -395,6 +457,7 @@ class AETLossModule(nn.Module):
         target_ids: torch.Tensor,
         attention_mask: torch.Tensor | None,
         token_type_ids: torch.Tensor | None,
+        marker_ids: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Dict[str, int]]:
         if target_ids.ndim not in {3, 4}:
             raise ValueError(
@@ -415,7 +478,14 @@ class AETLossModule(nn.Module):
             if attention_mask is not None
             else torch.ones_like(ar_targets, dtype=torch.bool)
         )
-        type_mask, end_mask, continue_mask = self._marker_masks(ar_targets)
+        marker_source = marker_ids if marker_ids is not None else target_ids
+        if marker_source.shape != target_ids.shape:
+            raise ValueError(
+                "marker_ids must match target_ids when provided; "
+                f"got {tuple(marker_source.shape)} vs {tuple(target_ids.shape)}"
+            )
+        marker_targets = marker_source[..., 1:].to(dtype=torch.long)
+        type_mask, end_mask, continue_mask = self._marker_masks(marker_targets)
         marker_mask = type_mask | end_mask | continue_mask
 
         ignored_special = torch.zeros_like(ar_valid)
@@ -457,10 +527,11 @@ class AETLossModule(nn.Module):
         valid_targets: torch.Tensor,
         valid_preds: torch.Tensor,
         logs: Dict[str, float],
+        prefix: str = "token",
     ) -> None:
         group_names = self._token_family_group_names
         for group_name in group_names:
-            logs[f"n_token_family_{group_name}"] = 0
+            logs[f"n_{prefix}_family_{group_name}"] = 0
 
         if valid_targets.numel() == 0:
             return
@@ -470,13 +541,13 @@ class AETLossModule(nn.Module):
         for group_idx, group_name in enumerate(group_names):
             group_mask = target_groups == int(group_idx)
             count = int(group_mask.sum().item())
-            logs[f"n_token_family_{group_name}"] = count
+            logs[f"n_{prefix}_family_{group_name}"] = count
             if count <= 0:
                 continue
             group_loss = self.ce_loss(valid_logits[group_mask], valid_targets[group_mask]).mean()
             group_acc = (valid_preds[group_mask] == valid_targets[group_mask]).to(dtype=torch.float32).mean()
-            logs[f"loss_token_family_{group_name}"] = float(group_loss.item())
-            logs[f"acc_token_family_{group_name}"] = float(group_acc.item())
+            logs[f"loss_{prefix}_family_{group_name}"] = float(group_loss.item())
+            logs[f"acc_{prefix}_family_{group_name}"] = float(group_acc.item())
 
     @classmethod
     def _window_targets(
@@ -579,6 +650,747 @@ class AETLossModule(nn.Module):
         B, W, C, L = time_ids.shape
         return time_ids.reshape(B * W, C * L), content_mask.reshape(B * W, C * L)
 
+    @staticmethod
+    def _flatten_sequence_feature(feature: torch.Tensor) -> torch.Tensor:
+        if feature.ndim == 3:
+            B, W, L = feature.shape
+            return feature.reshape(B * W, L)
+        if feature.ndim == 4:
+            B, W, C, L = feature.shape
+            return feature.reshape(B * W, C * L)
+        raise ValueError(f"feature must be 3D or 4D, got shape {tuple(feature.shape)}")
+
+    def _compute_autoregressive_ce_lane(
+        self,
+        *,
+        logits: torch.Tensor | None,
+        target_ids: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+        marker_ids: torch.Tensor | None,
+        weight_key: str,
+        log_prefix: str,
+        apply_token_family_weights: bool = False,
+        emit_token_family_metrics: bool = False,
+    ) -> tuple[torch.Tensor, Dict[str, float], Dict[str, int]]:
+        lane_logs: Dict[str, float] = {}
+        if target_ids is not None:
+            zero = target_ids.new_zeros((), dtype=torch.float32)
+        elif logits is not None:
+            zero = logits.new_zeros((), dtype=torch.float32)
+        else:
+            zero = torch.zeros((), dtype=torch.float32)
+        empty_stats = {
+            "candidate_targets": 0,
+            "candidate_nonmarker_special_targets": 0,
+            "ignored_nonmarker_special_targets": 0,
+        }
+
+        if (
+            logits is None
+            or target_ids is None
+            or attention_mask is None
+            or float(self.weights.get(weight_key, 0.0)) <= 0.0
+        ):
+            lane_logs[f"n_{log_prefix}_supervised"] = 0
+            if emit_token_family_metrics and logits is not None:
+                self._log_token_family_metrics(
+                    valid_logits=logits.new_zeros((0, logits.shape[-1])),
+                    valid_targets=logits.new_zeros((0,), dtype=torch.long),
+                    valid_preds=logits.new_zeros((0,), dtype=torch.long),
+                    logs=lane_logs,
+                    prefix=log_prefix,
+                )
+            return zero, lane_logs, empty_stats
+
+        logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+        if logits.shape[:-1] != target_ids.shape:
+            raise ValueError(
+                f"{log_prefix} logits must align with targets on all non-vocab dims; "
+                f"got {tuple(logits.shape)} vs {tuple(target_ids.shape)}"
+            )
+
+        ar_targets, ar_valid, _, ar_stats = self._autoregressive_targets(
+            target_ids=target_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            marker_ids=marker_ids,
+        )
+        ar_logits = logits[..., :-1, :]
+        if ar_logits.shape[:-1] != ar_targets.shape:
+            raise ValueError(
+                f"{log_prefix} autoregressive logits/targets mismatch after shift; "
+                f"got {tuple(ar_logits.shape[:-1])} vs {tuple(ar_targets.shape)}"
+            )
+
+        if ar_valid.any():
+            pred_next = ar_logits.argmax(dim=-1)
+            valid_logits = ar_logits[ar_valid]
+            valid_targets = ar_targets[ar_valid]
+            valid_preds = pred_next[ar_valid]
+            lane_losses = self.ce_loss(valid_logits, valid_targets)
+            loss_unweighted = lane_losses.mean()
+
+            if apply_token_family_weights:
+                target_groups = self._target_groups_for_valid_targets(valid_targets)
+                loss_weights = torch.ones_like(lane_losses)
+                if self._token_family_loss_weights.numel() > 0:
+                    in_groups = target_groups >= 0
+                    if in_groups.any():
+                        loss_weights[in_groups] = self._token_family_loss_weights[
+                            target_groups[in_groups]
+                        ].to(dtype=lane_losses.dtype, device=lane_losses.device)
+                loss_weighted = (lane_losses * loss_weights).sum() / loss_weights.sum().clamp(min=1.0)
+                if not torch.allclose(loss_weights, torch.ones_like(loss_weights)):
+                    lane_logs[f"loss_{log_prefix}_weighted"] = float(loss_weighted.item())
+            else:
+                loss_weighted = loss_unweighted
+
+            total_contrib = float(self.weights.get(weight_key, 1.0)) * loss_weighted
+            lane_logs[f"loss_{log_prefix}"] = float(loss_unweighted.item())
+            lane_logs[f"acc_{log_prefix}"] = float(
+                (valid_preds == valid_targets).to(dtype=torch.float32).mean().item()
+            )
+            lane_logs[f"n_{log_prefix}_supervised"] = int(ar_valid.sum().item())
+            if emit_token_family_metrics:
+                self._log_token_family_metrics(
+                    valid_logits=valid_logits,
+                    valid_targets=valid_targets,
+                    valid_preds=valid_preds,
+                    logs=lane_logs,
+                    prefix=log_prefix,
+                )
+            return total_contrib, lane_logs, ar_stats
+
+        lane_logs[f"n_{log_prefix}_supervised"] = 0
+        if emit_token_family_metrics:
+            self._log_token_family_metrics(
+                valid_logits=ar_logits.new_zeros((0, ar_logits.shape[-1])),
+                valid_targets=ar_targets.new_zeros((0,), dtype=torch.long),
+                valid_preds=ar_targets.new_zeros((0,), dtype=torch.long),
+                logs=lane_logs,
+                prefix=log_prefix,
+            )
+        return zero, lane_logs, ar_stats
+
+    def _compute_autoregressive_routed_ce_lane(
+        self,
+        *,
+        head_outputs: dict,
+        target_ids: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+        marker_ids: torch.Tensor | None,
+        routing: dict[str, list[dict]],
+        head_key_prefix: str,
+        weight_key: str,
+        log_prefix: str,
+    ) -> tuple[torch.Tensor, Dict[str, float], Dict[str, int]]:
+        lane_logs: Dict[str, float] = {}
+        if target_ids is not None:
+            zero = target_ids.new_zeros((), dtype=torch.float32)
+        else:
+            zero = torch.zeros((), dtype=torch.float32)
+        empty_stats = {
+            "candidate_targets": 0,
+            "candidate_nonmarker_special_targets": 0,
+            "ignored_nonmarker_special_targets": 0,
+        }
+        if (
+            target_ids is None
+            or attention_mask is None
+            or token_type_ids is None
+            or float(self.weights.get(weight_key, 0.0)) <= 0.0
+        ):
+            lane_logs[f"n_{log_prefix}_supervised"] = 0
+            lane_logs[f"frac_{log_prefix}_unrouted"] = 0.0
+            return zero, lane_logs, empty_stats
+
+        ar_targets, ar_valid, _, ar_stats = self._autoregressive_targets(
+            target_ids=target_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            marker_ids=marker_ids,
+        )
+        if ar_targets.numel() == 0:
+            lane_logs[f"n_{log_prefix}_supervised"] = 0
+            lane_logs[f"frac_{log_prefix}_unrouted"] = 0.0
+            return zero, lane_logs, ar_stats
+
+        routed = torch.zeros_like(ar_valid, dtype=torch.bool)
+        weighted_loss_sum = zero.clone()
+        total_count = 0
+        for family_name, blocks in routing.items():
+            if not isinstance(blocks, list) or not blocks:
+                continue
+            head_key = f"{head_key_prefix}{family_name}"
+            logits = head_outputs.get(head_key, None)
+            if logits is None:
+                continue
+            logits = torch.nan_to_num(logits, nan=0.0, posinf=0.0, neginf=0.0)
+            if logits.shape[:-1] != target_ids.shape:
+                raise ValueError(
+                    f"{head_key} logits must align with target_ids before shift; "
+                    f"got {tuple(logits.shape)} vs {tuple(target_ids.shape)}"
+                )
+            ar_logits = logits[..., :-1, :]
+            if ar_logits.shape[:-1] != ar_targets.shape:
+                raise ValueError(
+                    f"{head_key} autoregressive logits mismatch after shift; "
+                    f"got {tuple(ar_logits.shape[:-1])} vs {tuple(ar_targets.shape)}"
+                )
+
+            local_targets = torch.full_like(ar_targets, fill_value=-1, dtype=torch.long)
+            mask_family = torch.zeros_like(ar_valid, dtype=torch.bool)
+            head_vocab_size = 0
+            for block in blocks:
+                if not isinstance(block, dict):
+                    raise TypeError(f"event concept routing[{family_name}] blocks must be dicts")
+                offset = int(block.get("offset", 0))
+                size = int(block.get("size", 0))
+                if size <= 0:
+                    continue
+                mask_block = ar_valid & (ar_targets >= offset) & (ar_targets < offset + size)
+                if mask_block.any():
+                    local_targets[mask_block] = (ar_targets[mask_block] - offset + head_vocab_size).to(torch.long)
+                mask_family |= mask_block
+                head_vocab_size += size
+
+            if head_vocab_size <= 0:
+                continue
+            if int(ar_logits.shape[-1]) != int(head_vocab_size):
+                raise ValueError(
+                    f"{head_key} expects vocab_size={head_vocab_size} from event routing, "
+                    f"but logits last dim is {int(ar_logits.shape[-1])}"
+                )
+            if mask_family.any():
+                losses = self.ce_loss(ar_logits[mask_family], local_targets[mask_family])
+                weighted_loss_sum = weighted_loss_sum + losses.sum()
+                count = int(mask_family.sum().item())
+                total_count += count
+                lane_logs[f"loss_{log_prefix}_{family_name}"] = float(losses.mean().item())
+                lane_logs[f"n_{log_prefix}_{family_name}"] = count
+            else:
+                lane_logs[f"n_{log_prefix}_{family_name}"] = 0
+            routed |= mask_family
+
+        unrouted = ar_valid & ~routed
+        total_valid = int(ar_valid.sum().item())
+        lane_logs[f"frac_{log_prefix}_unrouted"] = (
+            float(unrouted.sum().item()) / float(total_valid) if total_valid > 0 else 0.0
+        )
+        if self.strict_routing and unrouted.any():
+            sample = ar_targets[unrouted].detach().flatten()[:8].tolist()
+            raise ValueError(
+                f"Unrouted {log_prefix} targets encountered (n={int(unrouted.sum())}); sample={sample}."
+            )
+
+        lane_logs[f"n_{log_prefix}_supervised"] = int(total_count)
+        if total_count <= 0:
+            return zero, lane_logs, ar_stats
+
+        loss = weighted_loss_sum / float(total_count)
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[f"loss_{log_prefix}"] = float(loss.item())
+        return total_contrib, lane_logs, ar_stats
+
+    def _compute_dt_nll_lane(
+        self,
+        *,
+        pred_mu: torch.Tensor | None,
+        pred_sigma: torch.Tensor | None,
+        time_ids: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+        chunk_start_offsets: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if pred_mu is None or pred_sigma is None or time_ids is None or attention_mask is None or token_type_ids is None:
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return time_ids.new_zeros((), dtype=torch.float32), lane_logs
+
+        pred_mu = torch.nan_to_num(pred_mu, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_sigma = torch.nan_to_num(pred_sigma, nan=1.0, posinf=1e6, neginf=1.0)
+        if pred_mu.shape != time_ids.shape or pred_sigma.shape != time_ids.shape:
+            raise ValueError(
+                f"{log_key} predictions must match time_ids shape; "
+                f"got {tuple(pred_mu.shape)} / {tuple(pred_sigma.shape)} vs {tuple(time_ids.shape)}"
+            )
+
+        content_mask = attention_mask.to(dtype=torch.bool) & (token_type_ids != 0)
+        t_flat, m_flat = self._flatten_local_sequences(
+            time_ids,
+            content_mask,
+            chunk_start_offsets=chunk_start_offsets,
+        )
+        N, S = t_flat.shape
+        next_t = torch.zeros_like(t_flat)
+        next_exists = torch.zeros((N, S), device=t_flat.device, dtype=torch.bool)
+        last_t = torch.zeros((N,), device=t_flat.device, dtype=t_flat.dtype)
+        has = torch.zeros((N,), device=t_flat.device, dtype=torch.bool)
+        for i in range(S - 1, -1, -1):
+            next_t[:, i] = last_t
+            next_exists[:, i] = has
+            cur = m_flat[:, i]
+            last_t = torch.where(cur, t_flat[:, i], last_t)
+            has = has | cur
+
+        dt_h_flat = (next_t - t_flat).clamp(min=0.0)
+        mask_flat = m_flat & next_exists & (dt_h_flat > 0.0)
+        dt_h = dt_h_flat.view_as(time_ids)
+        mask = mask_flat.view_as(time_ids)
+        if not mask.any():
+            return time_ids.new_zeros((), dtype=torch.float32), lane_logs
+
+        y_true = torch.log1p(dt_h.clamp(max=28.0 * 24.0))
+        mu = pred_mu.to(dtype=y_true.dtype)
+        sigma = pred_sigma.to(dtype=y_true.dtype).clamp(min=1e-4)
+        nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
+        loss = nll[mask].mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_event_numeric_value_nll_lane(
+        self,
+        *,
+        pred_mu: torch.Tensor | None,
+        pred_sigma: torch.Tensor | None,
+        event_numeric_values: torch.Tensor | None,
+        event_numeric_mask: torch.Tensor | None,
+        event_payload_ids: torch.Tensor | None,
+        attention_mask: torch.Tensor | None,
+        token_type_ids: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if (
+            pred_mu is None
+            or pred_sigma is None
+            or event_numeric_values is None
+            or event_numeric_mask is None
+            or event_payload_ids is None
+            or attention_mask is None
+            or token_type_ids is None
+        ):
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        pred_mu = torch.nan_to_num(pred_mu, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_sigma = torch.nan_to_num(pred_sigma, nan=1.0, posinf=1e6, neginf=1.0)
+        target_values = event_numeric_values.squeeze(-1) if event_numeric_values.ndim == pred_mu.ndim + 1 else event_numeric_values
+        if pred_mu.shape != pred_sigma.shape or pred_mu.shape != target_values.shape:
+            raise ValueError(
+                f"{log_key} predictions must match event numeric target shape; "
+                f"got {tuple(pred_mu.shape)} / {tuple(pred_sigma.shape)} vs {tuple(target_values.shape)}"
+            )
+        if (
+            event_numeric_mask.shape != pred_mu.shape
+            or event_payload_ids.shape != pred_mu.shape
+            or attention_mask.shape != pred_mu.shape
+            or token_type_ids.shape != pred_mu.shape
+        ):
+            raise ValueError(
+                f"{log_key} masks and ids must match prediction shape {tuple(pred_mu.shape)}"
+            )
+
+        content_mask = attention_mask.to(dtype=torch.bool) & (token_type_ids != int(self.special_type_id))
+        numeric_payload_id = int(EVENT_PAYLOAD_KIND_TO_ID["numeric_measurement"])
+        target_numeric_mask = (
+            event_numeric_mask.to(dtype=torch.bool)
+            & attention_mask.to(dtype=torch.bool)
+            & (event_payload_ids == numeric_payload_id)
+        )
+
+        value_flat = self._flatten_sequence_feature(target_values)
+        content_mask_flat = self._flatten_sequence_feature(content_mask)
+        target_numeric_mask_flat = self._flatten_sequence_feature(target_numeric_mask)
+        mu_flat = self._flatten_sequence_feature(pred_mu)
+        sigma_flat = self._flatten_sequence_feature(pred_sigma).clamp(min=1e-4)
+
+        N, S = value_flat.shape
+        next_value = torch.zeros_like(value_flat)
+        next_is_numeric = torch.zeros((N, S), device=value_flat.device, dtype=torch.bool)
+        next_exists = torch.zeros((N, S), device=value_flat.device, dtype=torch.bool)
+        last_value = torch.zeros((N,), device=value_flat.device, dtype=value_flat.dtype)
+        last_is_numeric = torch.zeros((N,), device=value_flat.device, dtype=torch.bool)
+        has = torch.zeros((N,), device=value_flat.device, dtype=torch.bool)
+        for i in range(S - 1, -1, -1):
+            next_value[:, i] = last_value
+            next_is_numeric[:, i] = last_is_numeric
+            next_exists[:, i] = has
+            cur = content_mask_flat[:, i]
+            last_value = torch.where(cur, value_flat[:, i], last_value)
+            last_is_numeric = torch.where(cur, target_numeric_mask_flat[:, i], last_is_numeric)
+            has = has | cur
+
+        supervise_mask = content_mask_flat & next_exists & next_is_numeric
+        if not supervise_mask.any():
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        y_true = next_value.to(dtype=mu_flat.dtype)
+        nll = 0.5 * ((y_true - mu_flat) / sigma_flat).square() + torch.log(sigma_flat)
+        loss = nll[supervise_mask].mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_next_window_gap_nll_lane(
+        self,
+        *,
+        pred_mu: torch.Tensor | None,
+        pred_sigma: torch.Tensor | None,
+        targets_dict: dict,
+        window_mask: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        window_start_times = targets_dict.get("window_start_times", None)
+        if pred_mu is None or pred_sigma is None or window_start_times is None:
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        pred_mu = torch.nan_to_num(pred_mu, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_sigma = torch.nan_to_num(pred_sigma, nan=1.0, posinf=1e6, neginf=1.0)
+        if pred_mu.shape != pred_sigma.shape or pred_mu.shape != window_start_times.shape:
+            raise ValueError(
+                f"{log_key} predictions must match window_start_times shape; "
+                f"got {tuple(pred_mu.shape)} / {tuple(pred_sigma.shape)} vs {tuple(window_start_times.shape)}"
+            )
+
+        win_mask, _, true_dur_h = self._window_targets(targets_dict, window_mask=window_mask)
+        if true_dur_h.shape != pred_mu.shape:
+            raise ValueError(
+                f"{log_key} derived window durations must match prediction shape; "
+                f"got {tuple(true_dur_h.shape)} vs {tuple(pred_mu.shape)}"
+            )
+        if pred_mu.shape[1] < 2:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        next_gap_h = (
+            window_start_times[:, 1:].to(dtype=true_dur_h.dtype)
+            - (
+                window_start_times[:, :-1].to(dtype=true_dur_h.dtype)
+                + true_dur_h[:, :-1]
+            )
+        ).clamp(min=0.0)
+        supervise_mask = win_mask[:, :-1] & win_mask[:, 1:]
+        if not supervise_mask.any():
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        max_gap_hours = 365.25 * 24.0 * 10.0
+        y_true = torch.log1p(next_gap_h.clamp(max=max_gap_hours))
+        mu = pred_mu[:, :-1].to(dtype=y_true.dtype)
+        sigma = pred_sigma[:, :-1].to(dtype=y_true.dtype).clamp(min=1e-4)
+        nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
+        loss = nll[supervise_mask].mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_next_window_duration_nll_lane(
+        self,
+        *,
+        pred_mu: torch.Tensor | None,
+        pred_sigma: torch.Tensor | None,
+        targets_dict: dict,
+        window_mask: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if pred_mu is None or pred_sigma is None:
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        pred_mu = torch.nan_to_num(pred_mu, nan=0.0, posinf=0.0, neginf=0.0)
+        pred_sigma = torch.nan_to_num(pred_sigma, nan=1.0, posinf=1e6, neginf=1.0)
+
+        win_mask, _, true_dur_h = self._window_targets(targets_dict, window_mask=window_mask)
+        if pred_mu.shape != pred_sigma.shape or pred_mu.shape != true_dur_h.shape:
+            raise ValueError(
+                f"{log_key} predictions must match semantic duration targets; "
+                f"got {tuple(pred_mu.shape)} / {tuple(pred_sigma.shape)} vs {tuple(true_dur_h.shape)}"
+            )
+        if pred_mu.shape[1] < 2:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        supervise_mask = win_mask[:, :-1] & win_mask[:, 1:]
+        if not supervise_mask.any():
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+
+        max_duration_hours = 28.0 * 24.0
+        y_true = torch.log1p(true_dur_h[:, 1:].clamp(max=max_duration_hours))
+        mu = pred_mu[:, :-1].to(dtype=y_true.dtype)
+        sigma = pred_sigma[:, :-1].to(dtype=y_true.dtype).clamp(min=1e-4)
+        nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
+        loss = nll[supervise_mask].mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_next_window_support_bce_lane(
+        self,
+        *,
+        pred_logits: torch.Tensor | None,
+        targets_dict: dict,
+        window_mask: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        event_type_ids = targets_dict.get("event_type_ids", None)
+        event_attention_mask = targets_dict.get("event_attention_mask", None)
+        if pred_logits is None or event_type_ids is None or event_attention_mask is None:
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+
+        pred_logits = torch.nan_to_num(pred_logits, nan=0.0, posinf=0.0, neginf=0.0)
+        if pred_logits.ndim != 3 or pred_logits.shape[-1] != int(NUM_SUPPORT_FLAGS):
+            raise ValueError(
+                f"{log_key} logits must be (B,W,{int(NUM_SUPPORT_FLAGS)}), got shape {tuple(pred_logits.shape)}"
+            )
+
+        if window_mask is None:
+            window_mask = torch.ones(pred_logits.shape[:2], device=pred_logits.device, dtype=torch.long)
+        if tuple(window_mask.shape) != tuple(pred_logits.shape[:2]):
+            raise ValueError(
+                f"{log_key} window_mask must match logits (B,W), got {tuple(window_mask.shape)} vs {tuple(pred_logits.shape[:2])}"
+            )
+        if pred_logits.shape[1] < 2:
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+
+        support_flags = build_window_support_flags(
+            event_type_ids=event_type_ids,
+            event_attention_mask=event_attention_mask,
+            event_memory_chronic_flags=targets_dict.get("event_memory_chronic_flags", None),
+            event_numeric_values=targets_dict.get("event_numeric_values", None),
+            event_numeric_mask=targets_dict.get("event_numeric_mask", None),
+        ).to(device=pred_logits.device, dtype=pred_logits.dtype)
+        if tuple(support_flags.shape) != tuple(pred_logits.shape):
+            raise ValueError(
+                f"{log_key} derived support flags must match logits shape; "
+                f"got {tuple(support_flags.shape)} vs {tuple(pred_logits.shape)}"
+            )
+
+        supervise_mask = window_mask[:, :-1].to(dtype=torch.bool) & window_mask[:, 1:].to(dtype=torch.bool)
+        if not supervise_mask.any():
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+
+        target_support = support_flags[:, 1:, :]
+        logits = pred_logits[:, :-1, :]
+        expanded_mask = supervise_mask.unsqueeze(-1).expand_as(logits)
+        raw_loss = F.binary_cross_entropy_with_logits(
+            logits[expanded_mask],
+            target_support[expanded_mask],
+            reduction="mean",
+        )
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * raw_loss
+        lane_logs[log_key] = float(raw_loss.item())
+        pred_binary = (logits > 0.0).to(dtype=target_support.dtype)
+        acc = (pred_binary[expanded_mask] == target_support[expanded_mask]).to(dtype=torch.float32).mean()
+        lane_logs["acc_next_window_support"] = float(acc.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_precedent_phase4_losses(
+        self,
+        *,
+        head_outputs: dict,
+    ) -> tuple[torch.Tensor, dict[str, float]]:
+        precedent_future_summary = head_outputs.get("precedent_future_summary", None)
+        precedent_future_embedding = head_outputs.get("precedent_future_embedding", None)
+        precedent_query_embedding = head_outputs.get("precedent_query_embedding", None)
+        precedent_retrieval_scores = head_outputs.get("precedent_retrieval_scores", None)
+        precedent_candidate_future_summaries = head_outputs.get("precedent_candidate_future_summaries", None)
+        precedent_candidate_future_embeddings = head_outputs.get("precedent_candidate_future_embeddings", None)
+        precedent_matched_item_ids = head_outputs.get("precedent_matched_item_ids", None)
+        precedent_target_future_summary = head_outputs.get("precedent_target_future_summary", None)
+        precedent_target_future_embedding = head_outputs.get("precedent_target_future_embedding", None)
+        precedent_target_future_mask = head_outputs.get("precedent_target_future_mask", None)
+        precedent_anchor_item_ids = head_outputs.get("precedent_anchor_item_ids", None)
+
+        base = None
+        for tensor in (
+            precedent_future_summary,
+            precedent_future_embedding,
+            precedent_query_embedding,
+            precedent_retrieval_scores,
+            precedent_target_future_summary,
+        ):
+            if torch.is_tensor(tensor):
+                base = tensor
+                break
+        if base is None:
+            return torch.zeros((), dtype=torch.float32), {}
+
+        total = base.new_zeros((), dtype=torch.float32)
+        logs: dict[str, float] = {}
+
+        if (
+            precedent_future_summary is not None
+            and precedent_target_future_summary is not None
+            and precedent_target_future_mask is not None
+        ):
+            future_mask = precedent_target_future_mask.to(dtype=torch.bool)
+            if future_mask.any():
+                pred_summary = torch.nan_to_num(
+                    precedent_future_summary,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).to(dtype=torch.float32)
+                target_summary = torch.nan_to_num(
+                    precedent_target_future_summary,
+                    nan=0.0,
+                    posinf=0.0,
+                    neginf=0.0,
+                ).to(dtype=torch.float32)
+                expanded_mask = future_mask.unsqueeze(-1).expand_as(pred_summary)
+                raw_loss = F.smooth_l1_loss(
+                    pred_summary[expanded_mask],
+                    target_summary[expanded_mask],
+                    reduction="mean",
+                )
+                future_loss = raw_loss
+                logs["loss_precedent_future_summary"] = float(raw_loss.item())
+
+                if (
+                    precedent_future_embedding is not None
+                    and precedent_target_future_embedding is not None
+                ):
+                    pred_emb = torch.nan_to_num(
+                        precedent_future_embedding,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).to(dtype=torch.float32)
+                    target_emb = torch.nan_to_num(
+                        precedent_target_future_embedding,
+                        nan=0.0,
+                        posinf=0.0,
+                        neginf=0.0,
+                    ).to(dtype=torch.float32)
+                    cos_loss = (
+                        1.0
+                        - F.cosine_similarity(
+                            pred_emb[future_mask],
+                            target_emb[future_mask],
+                            dim=-1,
+                            eps=1e-6,
+                        )
+                    ).mean()
+                    future_loss = 0.5 * (future_loss + cos_loss)
+                    logs["loss_precedent_future_embedding"] = float(cos_loss.item())
+
+                total = total + float(self.weights.get("precedent_future", 0.0)) * future_loss
+                logs["loss_precedent_future"] = float(future_loss.item())
+                logs["n_precedent_future_supervised"] = int(future_mask.sum().item())
+
+        if (
+            precedent_retrieval_scores is not None
+            and precedent_candidate_future_summaries is not None
+            and precedent_target_future_summary is not None
+            and precedent_target_future_mask is not None
+        ):
+            retrieval_scores = torch.nan_to_num(
+                precedent_retrieval_scores,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).to(dtype=torch.float32)
+            candidate_summaries = torch.nan_to_num(
+                precedent_candidate_future_summaries,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).to(dtype=torch.float32)
+            target_summary = torch.nan_to_num(
+                precedent_target_future_summary,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).to(dtype=torch.float32)
+            future_mask = precedent_target_future_mask.to(dtype=torch.bool)
+            if precedent_matched_item_ids is not None:
+                candidate_valid = precedent_matched_item_ids >= 0
+            else:
+                candidate_valid = torch.ones_like(retrieval_scores, dtype=torch.bool)
+            positive_mask = future_mask & candidate_valid.any(dim=-1)
+            if positive_mask.any():
+                target_summary_exp = target_summary.unsqueeze(-2).expand_as(candidate_summaries)
+                candidate_sim = F.cosine_similarity(
+                    candidate_summaries,
+                    target_summary_exp,
+                    dim=-1,
+                    eps=1e-6,
+                )
+                candidate_sim = candidate_sim.masked_fill(~candidate_valid, float("-inf"))
+                positive_idx = candidate_sim.argmax(dim=-1)
+                contrast_loss = F.cross_entropy(
+                    retrieval_scores[positive_mask],
+                    positive_idx[positive_mask].to(dtype=torch.long),
+                    reduction="mean",
+                )
+                total = total + float(self.weights.get("precedent_contrast", 0.0)) * contrast_loss
+                logs["loss_precedent_contrast"] = float(contrast_loss.item())
+                pred_idx = retrieval_scores.argmax(dim=-1)
+                contrast_acc = (
+                    pred_idx[positive_mask] == positive_idx[positive_mask]
+                ).to(dtype=torch.float32).mean()
+                logs["acc_precedent_contrast"] = float(contrast_acc.item())
+                logs["n_precedent_contrast_supervised"] = int(positive_mask.sum().item())
+
+        if (
+            precedent_retrieval_scores is not None
+            and precedent_matched_item_ids is not None
+            and precedent_anchor_item_ids is not None
+        ):
+            retrieval_scores = torch.nan_to_num(
+                precedent_retrieval_scores,
+                nan=0.0,
+                posinf=0.0,
+                neginf=0.0,
+            ).to(dtype=torch.float32)
+            anchor_ids = precedent_anchor_item_ids.to(dtype=torch.long)
+            candidate_match = precedent_matched_item_ids.to(dtype=torch.long) == anchor_ids.unsqueeze(-1)
+            anchor_mask = (anchor_ids >= 0) & candidate_match.any(dim=-1)
+            if anchor_mask.any():
+                anchor_idx = candidate_match.to(dtype=torch.long).argmax(dim=-1)
+                anchor_loss = F.cross_entropy(
+                    retrieval_scores[anchor_mask],
+                    anchor_idx[anchor_mask],
+                    reduction="mean",
+                )
+                total = total + float(self.weights.get("precedent_anchor", 0.0)) * anchor_loss
+                logs["loss_precedent_anchor"] = float(anchor_loss.item())
+                pred_idx = retrieval_scores.argmax(dim=-1)
+                anchor_acc = (
+                    pred_idx[anchor_mask] == anchor_idx[anchor_mask]
+                ).to(dtype=torch.float32).mean()
+                logs["acc_precedent_anchor"] = float(anchor_acc.item())
+                logs["n_precedent_anchor_supervised"] = int(anchor_mask.sum().item())
+
+        return total, logs
+
     def forward(self, head_outputs, targets_dict):
         target_ids = targets_dict["input_ids"]
         attention_mask = targets_dict.get("attention_mask", None)
@@ -599,63 +1411,110 @@ class AETLossModule(nn.Module):
         marker_any_mask_all = marker_type_mask_all | marker_end_mask_all | marker_continue_mask_all
 
         if using_unified_token_loss:
-            logits_token = torch.nan_to_num(logits_token, nan=0.0, posinf=0.0, neginf=0.0)
-            if logits_token.shape[:-1] != target_ids.shape:
-                raise ValueError(
-                    "logits_token must align with input_ids on all non-vocab dims; "
-                    f"got {tuple(logits_token.shape)} vs {tuple(target_ids.shape)}"
-                )
-            ar_targets, ar_valid, _, ar_stats = self._autoregressive_targets(
+            token_loss, token_logs, ar_stats = self._compute_autoregressive_ce_lane(
+                logits=logits_token,
                 target_ids=target_ids,
                 attention_mask=attention_mask,
                 token_type_ids=token_type_ids,
+                marker_ids=None,
+                weight_key="token",
+                log_prefix="token",
+                apply_token_family_weights=True,
+                emit_token_family_metrics=True,
             )
-            ar_logits = logits_token[..., :-1, :]
-            if ar_logits.shape[:-1] != ar_targets.shape:
-                raise ValueError(
-                    "autoregressive logits/targets mismatch after shift; "
-                    f"got {tuple(ar_logits.shape[:-1])} vs {tuple(ar_targets.shape)}"
-                )
-            if ar_valid.any():
-                pred_next = ar_logits.argmax(dim=-1)
-                valid_logits = ar_logits[ar_valid]
-                valid_targets = ar_targets[ar_valid]
-                valid_preds = pred_next[ar_valid]
-                token_losses = self.ce_loss(valid_logits, valid_targets)
-                loss_token_unweighted = token_losses.mean()
-                target_groups = self._target_groups_for_valid_targets(valid_targets)
-                loss_weights = torch.ones_like(token_losses)
-                if self._token_family_loss_weights.numel() > 0:
-                    in_groups = target_groups >= 0
-                    if in_groups.any():
-                        loss_weights[in_groups] = self._token_family_loss_weights[
-                            target_groups[in_groups]
-                        ].to(dtype=token_losses.dtype, device=token_losses.device)
-                loss_token_weighted = (token_losses * loss_weights).sum() / loss_weights.sum().clamp(min=1.0)
-                total_loss = total_loss + float(self.weights.get("token", 1.0)) * loss_token_weighted
-                logs["loss_token"] = float(loss_token_unweighted.item())
-                if not torch.allclose(loss_weights, torch.ones_like(loss_weights)):
-                    logs["loss_token_weighted"] = float(loss_token_weighted.item())
-                acc_token = (valid_preds == valid_targets).to(dtype=torch.float32).mean()
-                logs["acc_token"] = float(acc_token.item())
-                logs["n_token_supervised"] = int(ar_valid.sum().item())
-                self._log_token_family_metrics(
-                    valid_logits=valid_logits,
-                    valid_targets=valid_targets,
-                    valid_preds=valid_preds,
-                    logs=logs,
-                )
-            else:
-                logs["n_token_supervised"] = 0
-                self._log_token_family_metrics(
-                    valid_logits=ar_logits.new_zeros((0, ar_logits.shape[-1])),
-                    valid_targets=ar_targets.new_zeros((0,), dtype=torch.long),
-                    valid_preds=ar_targets.new_zeros((0,), dtype=torch.long),
-                    logs=logs,
-                )
+            total_loss = total_loss + token_loss
+            logs.update(token_logs)
             logs["candidate_nonmarker_special_targets"] = int(ar_stats["candidate_nonmarker_special_targets"])
             logs["ignored_nonmarker_special_targets"] = int(ar_stats["ignored_nonmarker_special_targets"])
             logs["frac_unrouted"] = 0.0
+
+        event_target_ids = targets_dict.get("event_input_ids", None)
+        event_attention_mask = targets_dict.get("event_attention_mask", None)
+        event_token_type_ids = targets_dict.get("event_type_ids", None)
+        event_payload_ids = targets_dict.get("event_payload_ids", None)
+        event_time_ids = targets_dict.get("event_time_ids", None)
+        event_numeric_values = targets_dict.get("event_numeric_values", None)
+        event_numeric_mask = targets_dict.get("event_numeric_mask", None)
+        if (
+            event_target_ids is not None
+            and event_attention_mask is not None
+            and event_token_type_ids is not None
+        ):
+            event_token_loss, event_token_logs, event_stats = self._compute_autoregressive_ce_lane(
+                logits=head_outputs.get("logits_event_token", None),
+                target_ids=event_target_ids,
+                attention_mask=event_attention_mask,
+                token_type_ids=event_token_type_ids,
+                marker_ids=event_target_ids,
+                weight_key="event_token",
+                log_prefix="event_token",
+                apply_token_family_weights=True,
+                emit_token_family_metrics=True,
+            )
+            total_loss = total_loss + event_token_loss
+            logs.update(event_token_logs)
+            logs["candidate_nonmarker_special_event_targets"] = int(
+                event_stats["candidate_nonmarker_special_targets"]
+            )
+            logs["ignored_nonmarker_special_event_targets"] = int(
+                event_stats["ignored_nonmarker_special_targets"]
+            )
+
+            event_family_loss, event_family_logs, event_family_stats = self._compute_autoregressive_ce_lane(
+                logits=head_outputs.get("logits_event_family", None),
+                target_ids=event_token_type_ids,
+                attention_mask=event_attention_mask,
+                token_type_ids=event_token_type_ids,
+                marker_ids=event_target_ids,
+                weight_key="event_family",
+                log_prefix="event_family",
+            )
+            total_loss = total_loss + event_family_loss
+            logs.update(event_family_logs)
+            logs["candidate_nonmarker_special_event_family_targets"] = int(
+                event_family_stats["candidate_nonmarker_special_targets"]
+            )
+            logs["ignored_nonmarker_special_event_family_targets"] = int(
+                event_family_stats["ignored_nonmarker_special_targets"]
+            )
+
+            event_payload_loss, event_payload_logs, event_payload_stats = self._compute_autoregressive_ce_lane(
+                logits=head_outputs.get("logits_event_payload", None),
+                target_ids=event_payload_ids,
+                attention_mask=event_attention_mask,
+                token_type_ids=event_token_type_ids,
+                marker_ids=event_target_ids,
+                weight_key="event_payload",
+                log_prefix="event_payload",
+            )
+            total_loss = total_loss + event_payload_loss
+            logs.update(event_payload_logs)
+            logs["candidate_nonmarker_special_event_payload_targets"] = int(
+                event_payload_stats["candidate_nonmarker_special_targets"]
+            )
+            logs["ignored_nonmarker_special_event_payload_targets"] = int(
+                event_payload_stats["ignored_nonmarker_special_targets"]
+            )
+
+            event_concept_loss, event_concept_logs, event_concept_stats = self._compute_autoregressive_routed_ce_lane(
+                head_outputs=head_outputs,
+                target_ids=event_target_ids,
+                attention_mask=event_attention_mask,
+                token_type_ids=event_token_type_ids,
+                marker_ids=event_target_ids,
+                routing=self.event_concept_routing,
+                head_key_prefix="logits_event_concept_",
+                weight_key="event_concept",
+                log_prefix="event_concept",
+            )
+            total_loss = total_loss + event_concept_loss
+            logs.update(event_concept_logs)
+            logs["candidate_nonmarker_special_event_concept_targets"] = int(
+                event_concept_stats["candidate_nonmarker_special_targets"]
+            )
+            logs["ignored_nonmarker_special_event_concept_targets"] = int(
+                event_concept_stats["ignored_nonmarker_special_targets"]
+            )
 
         head_to_weight = {
             "logits_struct": "struct",
@@ -986,54 +1845,91 @@ class AETLossModule(nn.Module):
                 total_loss = total_loss + float(self.weights.get("chunk", 0.0)) * loss_chunk
                 logs["loss_chunk_len"] = float(loss_chunk.item())
 
-        pred_dt_mu = head_outputs.get("pred_dt_next_mu", None)
-        pred_dt_sigma = head_outputs.get("pred_dt_next_sigma", None)
-        if pred_dt_mu is not None and pred_dt_sigma is not None:
-            pred_dt_mu = torch.nan_to_num(pred_dt_mu, nan=0.0, posinf=0.0, neginf=0.0)
-            pred_dt_sigma = torch.nan_to_num(pred_dt_sigma, nan=1.0, posinf=1e6, neginf=1.0)
-            time_ids = targets_dict.get("time_ids", None)
-            attention_mask = targets_dict.get("attention_mask", None)
-            token_type_ids = targets_dict.get("token_type_ids", None)
-            chunk_start_offsets = targets_dict.get("chunk_start_offsets", None)
-            if time_ids is not None and attention_mask is not None and token_type_ids is not None:
-                if pred_dt_mu.shape != time_ids.shape or pred_dt_sigma.shape != time_ids.shape:
-                    raise ValueError(
-                        "pred_dt_next_* must match time_ids shape; "
-                        f"got {tuple(pred_dt_mu.shape)} / {tuple(pred_dt_sigma.shape)} vs {tuple(time_ids.shape)}"
-                    )
-                content_mask = attention_mask.to(dtype=torch.bool) & (token_type_ids != 0)
-                t_flat, m_flat = self._flatten_local_sequences(time_ids, content_mask, chunk_start_offsets=chunk_start_offsets)
-                B, W = t_flat.shape[0], 1  # placeholder for reshape only
-                N, S = t_flat.shape
+        time_ids = targets_dict.get("time_ids", None)
+        chunk_start_offsets = targets_dict.get("chunk_start_offsets", None)
+        dt_loss, dt_logs = self._compute_dt_nll_lane(
+            pred_mu=head_outputs.get("pred_dt_next_mu", None),
+            pred_sigma=head_outputs.get("pred_dt_next_sigma", None),
+            time_ids=time_ids,
+            attention_mask=attention_mask,
+            token_type_ids=token_type_ids,
+            chunk_start_offsets=chunk_start_offsets,
+            weight_key="dt",
+            log_key="loss_dt_nll",
+            count_key="n_dt_supervised",
+        )
+        total_loss = total_loss + dt_loss.to(device=total_loss.device)
+        logs.update(dt_logs)
 
-                next_t = torch.zeros_like(t_flat)
-                next_exists = torch.zeros((N, S), device=t_flat.device, dtype=torch.bool)
-                last_t = torch.zeros((N,), device=t_flat.device, dtype=t_flat.dtype)
-                has = torch.zeros((N,), device=t_flat.device, dtype=torch.bool)
-                for i in range(S - 1, -1, -1):
-                    next_t[:, i] = last_t
-                    next_exists[:, i] = has
-                    cur = m_flat[:, i]
-                    last_t = torch.where(cur, t_flat[:, i], last_t)
-                    has = has | cur
+        event_dt_loss, event_dt_logs = self._compute_dt_nll_lane(
+            pred_mu=head_outputs.get("pred_event_dt_next_mu", None),
+            pred_sigma=head_outputs.get("pred_event_dt_next_sigma", None),
+            time_ids=event_time_ids,
+            attention_mask=event_attention_mask,
+            token_type_ids=event_token_type_ids,
+            chunk_start_offsets=chunk_start_offsets,
+            weight_key="event_dt",
+            log_key="loss_event_dt_nll",
+            count_key="n_event_dt_supervised",
+        )
+        total_loss = total_loss + event_dt_loss.to(device=total_loss.device)
+        logs.update(event_dt_logs)
 
-                dt_h_flat = (next_t - t_flat).clamp(min=0.0)
-                mask_flat = m_flat & next_exists & (dt_h_flat > 0.0)
-                if time_ids.ndim == 3:
-                    dt_h = dt_h_flat.view_as(time_ids)
-                    mask = mask_flat.view_as(time_ids)
-                else:
-                    dt_h = dt_h_flat.view_as(time_ids)
-                    mask = mask_flat.view_as(time_ids)
+        event_value_loss, event_value_logs = self._compute_event_numeric_value_nll_lane(
+            pred_mu=head_outputs.get("pred_event_value_mu", None),
+            pred_sigma=head_outputs.get("pred_event_value_sigma", None),
+            event_numeric_values=event_numeric_values,
+            event_numeric_mask=event_numeric_mask,
+            event_payload_ids=event_payload_ids,
+            attention_mask=event_attention_mask,
+            token_type_ids=event_token_type_ids,
+            weight_key="event_value",
+            log_key="loss_event_value_nll",
+            count_key="n_event_value_supervised",
+        )
+        total_loss = total_loss + event_value_loss.to(device=total_loss.device)
+        logs.update(event_value_logs)
 
-                if mask.any():
-                    y_true = torch.log1p(dt_h.clamp(max=28.0 * 24.0))
-                    mu = pred_dt_mu.to(dtype=y_true.dtype)
-                    sigma = pred_dt_sigma.to(dtype=y_true.dtype).clamp(min=1e-4)
-                    nll = 0.5 * ((y_true - mu) / sigma).square() + torch.log(sigma)
-                    loss_dt = nll[mask].mean()
-                    total_loss = total_loss + float(self.weights.get("dt", 0.0)) * loss_dt
-                    logs["loss_dt_nll"] = float(loss_dt.item())
+        next_window_gap_loss, next_window_gap_logs = self._compute_next_window_gap_nll_lane(
+            pred_mu=head_outputs.get("pred_next_window_gap_mu", None),
+            pred_sigma=head_outputs.get("pred_next_window_gap_sigma", None),
+            targets_dict=targets_dict,
+            window_mask=window_mask,
+            weight_key="next_window_gap",
+            log_key="loss_next_window_gap_nll",
+            count_key="n_next_window_gap_supervised",
+        )
+        total_loss = total_loss + next_window_gap_loss.to(device=total_loss.device)
+        logs.update(next_window_gap_logs)
+
+        next_window_duration_loss, next_window_duration_logs = self._compute_next_window_duration_nll_lane(
+            pred_mu=head_outputs.get("pred_next_window_duration_mu", None),
+            pred_sigma=head_outputs.get("pred_next_window_duration_sigma", None),
+            targets_dict=targets_dict,
+            window_mask=window_mask,
+            weight_key="next_window_duration",
+            log_key="loss_next_window_duration_nll",
+            count_key="n_next_window_duration_supervised",
+        )
+        total_loss = total_loss + next_window_duration_loss.to(device=total_loss.device)
+        logs.update(next_window_duration_logs)
+
+        next_window_support_loss, next_window_support_logs = self._compute_next_window_support_bce_lane(
+            pred_logits=head_outputs.get("logits_next_window_support", None),
+            targets_dict=targets_dict,
+            window_mask=window_mask,
+            weight_key="next_window_support",
+            log_key="loss_next_window_support_bce",
+            count_key="n_next_window_support_supervised",
+        )
+        total_loss = total_loss + next_window_support_loss.to(device=total_loss.device)
+        logs.update(next_window_support_logs)
+
+        precedent_loss, precedent_logs = self._compute_precedent_phase4_losses(
+            head_outputs=head_outputs,
+        )
+        total_loss = total_loss + precedent_loss.to(device=total_loss.device)
+        logs.update(precedent_logs)
 
         if not torch.isfinite(total_loss):
             logs["non_finite_total_loss"] = 1.0

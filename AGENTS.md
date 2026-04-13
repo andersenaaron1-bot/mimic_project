@@ -1,224 +1,1098 @@
-# Repository Guidelines
+# Repository Charter
 
-## Project charter (what we're building)
-An EHR foundation model that learns patient trajectories from heterogeneous clinical tokens.
+## Mission
 
-Core ideas:
-- **Measurements**: numeric measurement events are encoded via a conditional VAE (cVAE) into a latent `z`,
-  then discretized with a CODA-inspired residual VQ (RVQ) that uses an attention shortlist per level.
-  This yields compact value tokens that can condition downstream dynamics.
-- **Clinical semantics (Dx/Proc/Meds)**: diagnoses, procedures, and medications are mapped through MedTok
-  vocabularies (ontology/graph-informed codes) with robust canonicalization and UNK fallbacks.
-- **Structural signifiers (central contribution)**: explicit tokens that represent patient movement and
-  care context (admission, care unit changes, OR phases, discharge, etc.), plus overlay signifiers for
-  critical sub-episodes (MV, shock, RRT, sepsis bundle, CPR, etc.).
-- **Windows of care**: timelines are segmented into windows using a structural codebook YAML. The model
-  is trained to predict **window marker tokens** (end-of-window and optionally next-window type). A global
-  trajectory model can bias these marker logits based on window progress/density and prior window history.
-- **Time-awareness**: continuous-time RoPE (cRoPE) in attention with an optional ALiBi-hours bias, plus an
-  optional additive time embedding. Time is handled both within windows and across windows.
+This repo is the v2 line for a **dual-memory patient world model** over
+heterogeneous longitudinal EHR.
 
-Key contracts (keep these consistent as the dataset evolves):
-- `SCHEMA_TOKENS.md` (token families + vocabulary routing)
-- `TIME_MODEL.md` (time tensors + how attention uses them)
-- `configs/data/structural_codes.yaml` (window boundaries + overlay signifiers)
-- `TRANSFORMER_STAGE_HANDOFF.md` (current LRZ state, active artifact paths, cVAE findings, and next-step priorities)
+The goal is not a better flat sequence encoder. The goal is a generative model
+that separates:
 
-## Project structure & module organization
-- `src/ehr_hier/data/`: MEDS routing, demographics helpers, structural codebook loader, and
-  `build_subject_timeline()` which emits `EventToken` bundles.
-- `src/ehr_hier/tokenizers/`: measurement encoder (cVAE -> RVQ), MedTok encoders, and simple fallbacks.
-- `src/ehr_hier/models/value_encoders/`: cVAE + RVQ + attention shortlist (CODA-inspired).
-- `src/ehr_hier/transformer/`: AET collator (windowing + markers), local encoder, global aggregator,
-  embeddings (cRoPE + time), switched heads, and loss/routing.
-- `configs/`: Hydra configs (some are legacy; prefer the AET codepath under `src/ehr_hier/transformer/`).
-- `artifacts/`: MedTok files and `vocab_manifest.json` (offsets for token families).
-- `tests/`: pytest suite (unit + optional integration tests).
+- **local attention** for within-window event binding
+- **global latent state** for compressive current condition and transition hazard
+- **patient-internal memory** for exact personalized facts that must not be compressed away
+- **cohort-external precedent memory** for analogous prior states and their observed futures
 
-## Build, test, and development commands
-- Install deps: `python -m venv .venv; .venv\\Scripts\\activate; pip install -r requirements.txt`
-- Run tests: `pytest -q`
+The intended outcome is a model that can do more than next-event prediction:
 
-Value tokenization artifacts (examples; paths depend on your environment):
-- Compute measurement mapping/stats:
-  `python scripts/compute_meas_stats.py --meds_reader_db <db> --splits_parquet <splits.parquet> --split train --code2id_pt data/code2id.pt --stats_pt data/stats.pt`
-- Train value cVAE:
-  `python scripts/train_value_cvae.py --meds_reader_db <db> --code2id_pt data/code2id.pt --splits_parquet <splits.parquet> --out cvae_ckpt.pt`
-- Train value tokenizer (RVQ):
-  `python scripts/train_value_tokenizer.py --meds_reader_db <db> --code2id_pt data/code2id.pt --cvae_ckpt cvae_ckpt.pt --splits_parquet <splits.parquet> --out value_tokenizer.pt`
+- generate plausible future event streams across semantic care windows
+- adapt online to new patient-specific evidence through memory without weight updates
+- retrieve analogous clinical states rather than only similar token prefixes
+- support intervention-conditioned prospective rollout
 
-Timeline compilation (optional fast-path):
-- Use `src/ehr_hier/data/compile_dataset.py` as a library entrypoint to materialize timelines.
+This is a **world-model** framing. It is not a claim of unrestricted causal
+counterfactual reasoning. Any counterfactual language in the paper must stay
+conditional on explicit causal assumptions.
 
-## Current LRZ state
-- Treat this section as the canonical handoff snapshot for the current LRZ work. Update it whenever the active dataset, DB, or training artifacts move.
-- Active DSS base:
+## Canonical Metadata
+
+The only canonical metadata files in this repo are:
+
+- `AGENTS.md`
+- `paper/foundation_model_v2_outline.tex`
+- `paper/foundation_model_v2_refs.bib`
+
+All other prior planning or contract markdown files have been retired to avoid
+split design centers.
+
+## Core Representation Contract
+
+- `EventFrame` is the public semantic timeline unit.
+- Family-specific codecs stay behind one shared event algebra.
+- Numeric measurements use cVAE plus RVQ.
+- Diagnoses, procedures, medications, and structural/process events remain
+  typed symbolic events with canonical routing.
+- Structural transitions and overlays define explicit care-regime windows.
+
+The model objective remains explicitly marked and typed:
+
+- discrete marks use family-, payload-, and family-conditioned concept CE
+- numeric measurement marks use continuous likelihood on the event lane
+- event timing and inter-window gap timing use continuous-time NLL terms
+- dense token CE remains only as an auxiliary stabilization path
+
+## Target Architecture
+
+### 1. Local event model
+
+Local attention operates over typed fused events inside semantic care windows.
+Its job is:
+
+- content binding
+- short-range physiological and intervention reasoning
+- extraction of compact state evidence
+- proposal of exact memory writes
+
+### 2. Global latent health state
+
+The global latent is a **belief state**, not a patient file.
+
+Its job is to represent:
+
+- current disease burden
+- support intensity and instability
+- unresolved burden carried across windows
+- transition hazard across care regimes
+- tempo across long irregular gaps
+
+It should not be relied on to preserve exact rare facts.
+
+The latent contract is now frozen at the semantic/interface level:
+
+- it is a **window-boundary belief state**
+- it updates primarily by **jump updates at semantic-window boundaries**
+- it must be explicitly **gap-sensitive** across irregular time
+- it is the compressive state used for:
+  - precedent-query construction
+  - global-to-local conditioning
+  - transition and timing heads
+- it is not the primary store of exact history
+
+The target latent family is also now frozen at the family-class level:
+
+- a **multi-slot hybrid jump-plus-drift latent**
+
+The intended slot semantics are:
+
+- `g_regime`:
+  care setting, transition readiness, discharge/readmission hazard
+- `g_acute`:
+  current instability, support intensity, short-horizon deterioration
+- `g_burden`:
+  unresolved disease burden carried across windows
+- `g_long`:
+  slower residual risk and chronic consequence state
+
+This freezes the final architectural goal without forcing the exact mechanism
+today. The current implementation in `global_state.py` remains an adapter
+baseline until the final latent mechanism is chosen.
+
+### 3. Patient-internal memory
+
+This is an exact, personalized memory bank. Its job is to retain facts that
+should survive compression:
+
+- static baseline facts available at timeline start
+- durable chronic or historical facts
+- sparse acute high-value events
+
+Conceptually the internal bank is split into:
+
+- `static`
+- `persistent`
+- `episodic`
+
+### 4. Cohort-external precedent memory
+
+This is the second memory and the main research direction.
+
+The model should retrieve **similar prior patient states with observed futures**,
+not merely similar token prefixes. Retrieval is meant to capture predictive
+state similarity:
+
+- different histories may map to similar current condition
+- similar current condition should imply similar short- and medium-horizon
+  future distributions under comparable intervention context
+
+This memory is what turns the model from a long-context predictor into a
+patient simulator with analogical future support.
+
+### 5. Predictive-state principle
+
+The theoretical framing for precedent memory is closest to a
+**predictive state representation**:
+
+- a boundary state should be judged by what it predicts about the future
+- two histories may look very different in token space and still be retrieval
+  neighbors if they imply similar future window dynamics
+- similarity should therefore be shaped by future agreement rather than lexical
+  overlap or raw token-prefix similarity
+
+For this repo, the practical implication is:
+
+- precedent retrieval should happen at semantic-window boundaries
+- the retrieval key should encode current predictive clinical state
+- the retrieved value should encode what happened next after similar states
+
+## Frozen Latent Contract
+
+The repo should now treat the latent as **frozen in role and interface**, even
+though the exact update mechanism is still provisional.
+
+What is frozen now:
+
+- the latent is a **window-stepped belief state**
+- the latent is updated from the canonical `WindowStatePacket`
+- the latent is explicitly **gap-aware**
+- the latent should support retrieval and conditioning through dedicated
+  readouts rather than by serving as raw memory
+- the latent should stay focused on **current condition and transition hazard**
+
+What is not frozen yet:
+
+- the exact recurrent/selective/continuous-time mechanism
+- the exact internal slot parameterization
+- whether the final implementation uses selective SSM, a learned jump-plus-drift
+  module, or another mechanism inside the same family
+
+The current working interpretation is:
+
+```text
+G_w^- = Drift(G_{w-1}^+, gap_w, meta_w)
+G_w^+ = Jump(G_w^-, packet_w, type_w)
+```
+
+where:
+
+- `packet_w` is the canonical `WindowStatePacket`
+- `G_w` is the multi-slot latent state
+- `Drift` models evolution across irregular gaps
+- `Jump` models discrete boundary updates at semantic-window boundaries
+
+The latent should expose three readouts:
+
+- `z_query`:
+  used for precedent retrieval together with packet and persistent-memory digest
+- `z_local`:
+  used for global-to-local conditioning, primarily as modulation and optionally
+  compact context tokens
+- `z_heads`:
+  used for transition, timing, and other global predictive heads
+
+The default information flow remains:
+
+- patient memory influences local attention directly
+- local attention emits the packet
+- the latent reads the packet
+- precedent retrieval uses packet + latent + persistent-memory digest
+- any future direct memory-to-latent path must be gated and compressed
+
+## Governing Refactor Decisions
+
+The current choices for chunk/window summaries, latent-state form, and
+patient-memory layout are all subordinate to the dual-memory world-model goal.
+
+Until the precedent-memory path is in place, treat these current components as
+useful precursors, not final interfaces:
+
+- the current single-vector semantic summary is a migration bridge, not the
+  final boundary-state object
+- the current latent state in `global_state.py` is an adapter baseline for the
+  now-frozen multi-slot jump-plus-drift latent family, not the final mechanism
+- the current exact-memory module in `episodic_memory.py` is the core of
+  patient-internal memory, but it should evolve into a banked design rather than
+  remain one undifferentiated reservoir
+
+The architecture should converge toward one canonical boundary object:
+
+- a **window state packet** emitted at each semantic-window boundary
+
+That packet is the substrate that should drive:
+
+- latent-state updates
+- patient-memory writes
+- precedent-memory queries
+- global-to-local conditioning for the next window
+
+## Holistic Implementation Approach
+
+### 1. Introduce a boundary-state packet
+
+The local path should stop handing the global model one opaque summary vector.
+Instead, it should emit a structured packet that separates:
+
+- end-of-window state
+- whole-window burden
+- early-to-late change
+- volatility or instability
+- intervention and support summary
+- physiology and measurement summary
+- exact memory-write candidates
+
+This packet should become the canonical interface between local attention and
+all long-range modules.
+
+### 2. Keep the local path event-native
+
+The event path already exists and should remain the canonical source of:
+
+- within-window content binding
+- typed marked generation
+- exact patient-memory write candidates
+- window-packet emission
+
+Chunking should remain a compute device, not the semantic object. The semantic
+object is the boundary packet produced from chunk states and event states.
+
+### 3. Refactor patient memory into explicit banks
+
+The current exact-memory path should be retained, but formalized into three
+banks:
+
+- `static`
+- `persistent`
+- `episodic`
+
+The present reservoir implementation should be treated as the initial
+`episodic` core. Static and persistent paths should become explicit rather than
+implicit conventions.
+
+### 4. Add cohort-external precedent memory
+
+The external memory should index **predictive clinical states**, not token
+prefixes. Each item in the index should represent:
+
+- a pre-window state key
+- current care-regime and intervention context
+- a compact future continuation summary
+- optionally an exact continuation snippet
+
+The point is to retrieve what happened after similar states, not only which
+histories looked similar.
+
+### 5. Make similarity future-aware
+
+The precedent query space should be shaped by future agreement. The retrieval
+metric should prefer states that imply similar:
+
+- next window type
+- next window timing
+- short-horizon support evolution
+- near-future event mixture
+- medium-horizon disposition or readmission behavior
+
+This is the key difference between precedent memory and nearest-neighbor token
+matching.
+
+### 6. Phase 3 design principles
+
+Phase 3 should be implemented as a **full offline precedent system**, not as a
+minimal placeholder:
+
+- one index item per semantic-window boundary
+- dense exact retrieval over stored boundary-state keys, with ANN acceleration as
+  a later optimization
+- compact future summaries plus exact continuation references on the value side
+- retrieval over the full cohort, not a hand-pruned subset
+- retrieval at semantic-window boundaries rather than token-level matching
+
+Chunk-level precedent retrieval can be explored later, but it is not the
+primary Phase 3 object. Token-level precedent retrieval is explicitly not the
+target.
+
+### 7. Finalize the latent only after the packet and dual memory exist
+
+Once the packet, patient memory, and precedent memory are fixed, the latent can
+be chosen cleanly as the best mechanism for compressive current-condition
+dynamics. The likely final choice is still one of:
+
+- gated recurrent update
+- selective SSM / Mamba-like state
+- hybrid jump-plus-drift continuous-time latent
+
+That choice should come after the dual-memory interfaces are fixed, not before.
+
+## Current Repo State
+
+Already implemented:
+
+- `build_subject_timeline()` emits `EventFrame`
+- frame-native codec routing is in place
+- packed precompiled storage serializes frame timelines
+- the collator accepts frame timelines directly
+- the collator emits token-to-event alignment, event metadata, and memory-rule metadata
+- the local model composes bundle tokens into event states before local attention
+- the local path now emits a canonical `WindowStatePacket` from chunk states and
+  window metadata, with a temporary summary adapter into the current global path
+- the patient-internal memory path is now banked as:
+  - `static`
+  - `persistent`
+  - `episodic`
+  while preserving the current exact event-write and cross-segment carry logic
+- the `static` bank is now seeded from admission-anchored global demographic
+  special events on the canonical event lane, with an explicit allowlist for
+  admission-safe features
+- the model emits event-family, event-payload, family-conditioned event-concept,
+  code-conditioned numeric event-value, next-event-gap, next-window-type, and
+  next-window-gap lanes
+- the model supports a persistent semantic-window latent state via
+  `global_context_mode=latent_state`
+- the model supports patient-internal exact memory with:
+  - event-exact writes
+  - explicit bank routing for persistent vs episodic carry
+  - auditable rule priors
+  - causal retrieval
+  - per-bank retrieval accounting
+  - diversity-aware retention
+  - retrieval-conditioned local fusion
+  - ordered cross-segment carry
+- the model now exports per-window boundary-state information required for
+  precedent indexing:
+  - `window_global_states`
+  - per-bank memory retrieval context
+  - per-bank boundary memory digests after writes
+- Phase 3 precedent infrastructure is now in code:
+  - `PrecedentIndexItem` / `PrecedentIndexStore`
+  - shard-backed `FutureSnippetRef`
+  - multi-horizon `FutureSummary` targets for `h1` / `h2` / `h3`
+  - offline precedent-index builder in `scripts/build_precedent_index.py`
+  - dense exact top-k precedent retrieval in `precedent_memory.py`
+- Phase 4 predictive-state retrieval is now in code:
+  - learned `PrecedentQueryHead`, `PrecedentKeyProjector`, and
+    `FutureSummaryProjector`
+  - online query construction from packet + latent + persistent-memory digest
+  - future-summary target export on the training path
+  - future-summary agreement loss
+  - contrastive predictive-state retrieval loss over retrieved candidates
+  - anchor-recovery auxiliary loss against stored boundary items
+- Phase 5 core dual-memory decoding path is now in code:
+  - `NextWindowHeader` and prompt-bearing precedent contracts in
+    `world_model_contract.py`
+  - stored `future_prefix_prompt` values in the offline precedent index
+  - two-stage precedent retrieval:
+    - boundary prior
+    - header-conditioned generation prompt
+  - rollout-time next-window header prediction for:
+    - next-window type
+    - next-window gap
+    - next-window duration
+    - coarse support profile
+    with teacher forcing when observed next-window metadata is available
+  - prompt-conditioned local fusion for the next window
+- the event-native marked loss path is implemented
+- the default symbolic contract prefers exact residual vocabularies or explicit
+  `UNK`; production hash fallback is no longer implicit
+
+Not yet implemented:
+
+- full `WindowStatePacket` usage across all long-range interfaces
+- ANN-accelerated precedent lookup beyond the current dense exact store
+- chunk-refresh precedent queries during long generated windows
+- retrieval-conditioned latent updates
+- final latent mechanism implementation under the frozen multi-slot
+  jump-plus-drift family contract
+- intervention-conditioned rollout path
+- multi-step generative evaluation centered on patient simulation
+
+## Architectural Defaults
+
+Until evidence suggests otherwise, the working defaults are:
+
+- local attention reads:
+  - previous latent state
+  - retrieved patient memory
+  - current window type
+- local attention emits:
+  - a compressive state summary
+  - sparse memory-write candidates
+- patient memory influences local attention directly
+- the latent reads memory only indirectly through the local summary in the
+  default design
+- any future direct memory-to-latent path should be gated and compressed
+- the first latent state should be a static prior from baseline context, not a
+  zero vector and not a history-informed state
+- precedent retrieval should read:
+  - `WindowStatePacket.query_token`
+  - latent query readout
+  - compact persistent-memory digest
+  - window type and timing metadata
+- the final latent family target is:
+  - multi-slot hybrid jump-plus-drift
+
+## Research Thesis
+
+The central research question is now:
+
+> Can a typed, marked EHR generator learn a notion of **predictive clinical
+> state** that supports both exact patient-specific memory and analogical
+> precedent retrieval, thereby enabling stronger generative forecasting than
+> flat token autoregression or compressed-state modeling alone?
+
+The publishable thesis is not "a better recurrent block." It is:
+
+- one event algebra over heterogeneous EHR events
+- one marked generative objective over what, when, and value
+- one compressive latent for current condition
+- one exact internal memory for patient-specific facts
+- one external precedent memory for similar states and futures
+
+## Phase 3 Literature Anchors
+
+The precedent-memory design should stay grounded in the following references
+and their roles:
+
+- **Predictive Representations of State**:
+  precedent similarity should be defined by future behavior rather than past
+  token overlap
+- **REMed**:
+  retrieval over long clinical history is useful, but the precedent path here
+  is generative and boundary-state based rather than discriminative
+- **RAFT**:
+  retrieval of similar historical futures is the closest direct precedent for
+  storing compact future continuations as precedent values
+- **PromptTPP**:
+  event-sequence retrieval can support streaming adaptation without immediate
+  weight updates
+- **Memorizing Transformers**, **RETRO**, and **Titans**:
+  external memory should be treated as a first-class generative conditioning
+  path rather than an analysis-only add-on
+- **G-Transformer**:
+  rollout should be intervention-conditioned, while causal claims remain
+  conservative
+- **NEXTPP** and **ORA**:
+  the precedent path should support typed marked generation rather than
+  reducing retrieval to plain token prediction
+
+## Immediate Priorities
+
+1. Complete the migration from the legacy single-vector window summary to full
+   `WindowStatePacket` usage across latent updates, memory interfaces, and
+   retrieval.
+2. Evaluate the current dual-memory decoder path and compare:
+   - no memory
+   - patient memory only
+   - precedent memory only
+   - dual memory
+3. Add multi-step rollout evaluation on top of the current header-conditioned
+   dual-memory path.
+4. Finalize the latent mechanism only after Phase 4 and Phase 5 clarify what
+   retrieval and rollout actually demand from the frozen latent family.
+
+## Concrete Implementation Path
+
+### Phase 1. Canonical boundary packet
+
+Primary files:
+
+- `src/ehr_hier/transformer/encoder.py`
+- `src/ehr_hier/transformer/aggregator.py`
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/transformer/world_model_contract.py`
+
+Implementation:
+
+- add a `WindowStatePacket` with fixed slot semantics
+- upgrade local/chunk aggregation so it emits packet slots rather than only a
+  single semantic summary
+- keep a compatibility projection from packet to one summary vector so the
+  current latent path keeps working during migration
+
+### Phase 2. Banked patient memory
+
+Primary files:
+
+- `src/ehr_hier/transformer/episodic_memory.py`
+- `src/ehr_hier/transformer/memory_rules.py`
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/transformer/collator.py`
+
+Implementation:
+
+- split the current exact-memory contract into static, persistent, and episodic
+  banks
+- keep the current learned-salience and rule-prior write path as the initial
+  episodic write policy
+- add bank-aware retrieval quotas and bank-aware carry across segments
+
+### Phase 3. Cohort precedent memory
+
+Primary files:
+
+- `src/ehr_hier/transformer/precedent_memory.py`
+- `src/ehr_hier/transformer/world_model_contract.py`
+- `src/ehr_hier/transformer/aggregator.py`
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/data/precompiled_format.py`
+- `src/ehr_hier/data/dataset.py`
+- `scripts/build_precedent_index.py`
+- `scripts/train_transformer_v1.py`
+
+Implementation:
+
+- define one precedent item per semantic-window boundary, anchored after window
+  `w` and before generation of window `w+1`
+- export canonical boundary packets from the local path so index building uses
+  the same state object as model training
+- define the precedent item with:
+  - identity fields:
+    `item_id`, `subject_id`, `trajectory_ord`, `boundary_ord`,
+    `anchor_window_ord`
+  - anchor metadata:
+    `current_window_type_id`, `current_window_start_h`,
+    `current_window_duration_h`, `gap_prev_h`
+  - coarse context:
+    `support_flags`, `anchor_mask_flags`
+  - key tensors:
+    `key_state`, `key_packet`, `key_memory`
+  - value tensors:
+    `future_summary_h1`, `future_summary_h2`, `future_summary_h3`
+  - exact continuation reference:
+    `future_snippet_ref`
+- build `key_state` from:
+  - `WindowStatePacket.query_token`
+  - current latent state
+  - compact persistent-memory digest
+  - current window-type embedding
+  - support/intervention flags
+  - log-gap and log-duration metadata
+- store values as:
+  - compact multi-horizon future summaries
+  - exact continuation references back into packed shards
+- keep the index offline and periodically rebuilt from a frozen or EMA model
+  checkpoint; online full-corpus re-encoding is not required for the paper
+- use a dense key store for `key_state` and a separate value store for future
+  summaries and snippet references; exact top-k is an acceptable first
+  implementation, with ANN as a later optimization
+
+#### Phase 3 future-summary targets
+
+The precedent value side should be multi-horizon and structured:
+
+- `h1`:
+  next semantic window
+- `h2`:
+  next 2 windows or next 24 hours, whichever is smaller
+- `h3`:
+  next 4 windows or the remainder of admission capped at 7 days
+
+Each horizon should summarize the future with targets that are learnable in
+MIMIC:
+
+- next window type
+- next window gap
+- next window duration
+- event-family histogram
+- payload histogram
+- support/intervention flags
+- transition flags
+- event count and measurement count
+- extreme-measurement count
+- numeric severity summaries
+- medium-horizon disposition flags
+- optional readmission targets at lower priority
+
+Exact token futures should not be the main precedent value representation.
+Exact continuation snippets should be optional references, not the primary
+target.
+
+#### Phase 3 retrieval architecture
+
+The storage layout should be:
+
+- dense key matrix:
+  one `key_state` vector per boundary item
+- metadata table:
+  boundary ids, regime context, support flags, and snippet references
+- compact future-summary store:
+  `h1`, `h2`, and `h3`
+- optional exact-snippet reference store:
+  shard path id, subject idx, start boundary, and stop boundary
+
+This is preferred over:
+
+- token-prefix nearest-neighbor retrieval
+- topic-style retrieval
+- fully online full-corpus latent recomputation
+
+Phase 3 retrieval should operate at semantic-window boundaries only.
+
+#### Phase 3 execution order
+
+Implement Phase 3 in the following order:
+
+1. Extend `world_model_contract.py` with:
+   - `PrecedentIndexItem`
+   - `FutureSummaryH1`
+   - `FutureSummaryH2`
+   - `FutureSummaryH3`
+   - `FutureSnippetRef`
+2. Extend `aggregator.py` and `model.py` so the canonical `WindowStatePacket`
+   can be exported together with:
+   - the current latent state
+   - a compact persistent-memory digest
+   - support/intervention flags
+3. Add `scripts/build_precedent_index.py` to:
+   - stream packed precompiled trajectories
+   - replay the current model over semantic windows
+   - emit one index item per boundary
+   - write ANN keys, metadata, future summaries, and snippet references
+4. Extend `precedent_memory.py` so it can:
+   - load the offline index
+   - run ANN lookup on `key_state`
+   - return compact precedent readouts and optional snippet references
+5. Extend `dataset.py` and `precompiled_format.py` only as needed to support
+   stable snippet references and shard path ids; avoid introducing a second
+   heavyweight storage family
+6. Keep Phase 3 retrieval offline and non-differentiable; the learned
+   future-aware metric belongs to Phase 4, not to the initial index build
+
+### Phase 4. Predictive-state retrieval objective
+
+Primary files:
+
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/transformer/loss.py`
+- `src/ehr_hier/transformer/heads.py`
+- `src/ehr_hier/transformer/precedent_memory.py`
+- `src/ehr_hier/transformer/world_model_contract.py`
+- `scripts/train_transformer_v1.py`
+
+Implementation:
+
+Phase 4 should be implemented against the frozen latent contract above.
+
+#### Phase 4 query/key contract
+
+The retrieval query must be built from the current predictive state, not from
+token history. The default query substrate is:
+
+- `WindowStatePacket.query_token`
+- latent query readout `z_query`
+- compact persistent-memory digest
+- current window type / care-regime metadata
+- support flags
+- log-gap and log-duration metadata
+
+The first concrete implementation should add:
+
+- a `PrecedentQueryHead`
+- a `PrecedentKeyProjector`
+- a `FutureSummaryProjector`
+
+with the following roles:
+
+- `PrecedentQueryHead`:
+  maps current packet + latent + persistent-memory digest into the retrieval
+  query embedding
+- `PrecedentKeyProjector`:
+  projects offline `key_state` vectors into the learned retrieval space
+- `FutureSummaryProjector`:
+  maps `h1` / `h2` / `h3` summaries into a comparable supervision space
+
+The stored Phase 3 `key_state` remains the canonical export. Phase 4 adds a
+learned retrieval space on top of that export rather than replacing the export
+format itself.
+
+#### Phase 4 target notion of similarity
+
+Two states should be close if, under comparable current regime/intervention
+context, they imply similar:
+
+- next window type
+- next window gap
+- next window duration
+- short-horizon support evolution
+- near-future event-family mixture
+- payload/modality mixture
+- medium-horizon disposition behavior
+
+This is explicitly different from:
+
+- token-prefix similarity
+- diagnosis-set overlap
+- topic-style semantic similarity
+
+#### Phase 4 losses
+
+Phase 4 should combine four loss families:
+
+1. **Future-summary agreement**
+   - retrieved neighbors should agree on `h1`, `h2`, and `h3`
+   - this is the primary shaping signal
+
+2. **Contrastive predictive-state loss**
+   - positive pairs:
+     states with similar future summaries
+   - hard negatives:
+     states from similar current regime/support buckets but divergent futures
+
+3. **Self-consistency / anchor recovery**
+   - the current state should still recover its own or nearest stored precedent
+     item under the learned query/key map
+   - lower weight than future-summary agreement
+
+4. **Optional snippet consistency**
+   - exact continuation snippets should remain secondary supervision only
+   - they are useful for diagnostics, not the primary metric-learning signal
+
+#### Phase 4 negative sampling policy
+
+Hard negatives should be chosen from states that match coarse present context
+but diverge in future behavior. The default negative buckets should match on:
+
+- current window type
+- support flag profile
+- coarse gap bucket
+
+and then prefer negatives with different:
+
+- next window type
+- next-window timing
+- support escalation or de-escalation
+- medium-horizon disposition summary
+
+This prevents the retrieval space from solving the task by trivial regime
+partitioning alone.
+
+#### Phase 4 training flow
+
+The recommended first implementation path is:
+
+1. keep the Phase 3 precedent store fixed and offline
+2. build learned query embeddings online in the model
+3. project stored keys into the learned retrieval space
+4. compute in-batch and retrieved-candidate future-summary losses
+5. keep retrieval itself non-differentiable at the store level
+
+This preserves the offline precedent-index design while still learning a
+future-aware predictive-state metric.
+
+#### Phase 4 ablations
+
+At minimum, compare:
+
+- raw dense `key_state` retrieval
+- learned future-aware retrieval
+- learned retrieval without persistent-memory digest
+- learned retrieval without latent query readout
+
+These ablations are necessary to tell whether the latent is materially helping
+retrieval or whether the packet alone is carrying the query semantics.
+
+#### Phase 4 deliverable
+
+Phase 4 is complete when:
+
+- the model produces learned precedent queries online
+- the query/key space is shaped by future agreement
+- precedent retrieval is no longer plain nearest-neighbor over raw stored keys
+- retrieval quality can be measured by future-summary agreement, not just by
+  neighbor identity or token overlap
+
+### Phase 5. Dual-memory decoding and rollout
+
+Primary files:
+
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/transformer/loss.py`
+- `src/ehr_hier/transformer/precedent_memory.py`
+- `src/ehr_hier/transformer/world_model_contract.py`
+- `scripts/build_precedent_index.py`
+- `scripts/train_transformer_v1.py`
+
+Implementation:
+
+Phase 5 should now be implemented around one explicit boundary-to-generation
+loop rather than a generic "add retrieval to the decoder" idea.
+
+#### Phase 5 boundary contract
+
+After semantic window `w` ends, the canonical post-window state is:
+
+- updated `WindowStatePacket`
+- updated patient memory banks
+- updated latent belief state
+
+Generation of window `w+1` should be mediated through one explicit object:
+
+- `NextWindowHeader`
+
+The next-window header should carry:
+
+- predicted next window type
+- predicted gap to next window
+- predicted next-window duration
+- coarse support/intervention profile
+- optional coarse event-family mixture prior
+
+This header is the bridge between boundary-state reasoning and local event
+generation.
+
+#### Phase 5 end-to-next-window flow
+
+The default causal flow should be:
+
+1. local path ends window `w` and emits:
+   - `P_w = WindowStatePacket`
+   - exact memory write candidates
+2. patient memory writes are applied immediately
+3. latent state is updated from the packet:
+   - `G_w^- = Drift(G_{w-1}^+, gap_w, meta_w)`
+   - `G_w^+ = Jump(G_w^-, P_w, type_w)`
+4. a first precedent query runs from the updated state to produce a
+   boundary-level future prior
+5. the model predicts or samples `NextWindowHeader`
+6. a second precedent query runs conditioned on that chosen next-window header
+7. patient memory is queried again for the next-window regime
+8. the local generator for `w+1` is initialized from:
+   - latent readout
+   - patient-memory readout
+   - precedent-memory generation readout
+   - `NextWindowHeader`
+9. local event generation runs until the next semantic boundary
+
+This means precedent retrieval is not one monolithic read. It is a two-stage
+process:
+
+- boundary prior retrieval
+- header-conditioned generation retrieval
+
+#### Phase 5 division of labor
+
+The three long-range sources should not enter the decoder identically.
+
+Latent state:
+
+- enters primarily as modulation
+- may also expose 1-2 compact latent tokens
+- is the compressive current-condition prior
+- should not behave like a long token memory
+
+Patient memory:
+
+- enters as exact retrieval tokens or exact bank summaries
+- should be queried separately across:
+  - `static`
+  - `persistent`
+  - `episodic`
+- should carry high-trust exact patient facts
+
+Precedent memory:
+
+- enters as analogical future guidance
+- should provide both:
+  - future-summary priors for boundary/global heads
+  - compact future-prompt tokens for local generation
+- should be treated as a softer source than patient memory
+
+#### Phase 5 precedent readout shape
+
+The precedent value used for generation should be multi-view, not only one
+dense vector and not only raw continuation tokens.
+
+Add a canonical precedent-generation readout:
+
+- `summary_prior`
+- `prompt_tokens`
+- `candidate_weights`
+- `matched_item_ids`
+- `snippet_refs`
+
+with the following roles:
+
+- `summary_prior`:
+  aggregated `h1` / `h2` / `h3` future summaries used for:
+  - next-window type prediction
+  - gap prediction
+  - duration prediction
+  - support/intervention priors
+  - coarse family-mixture priors
+- `prompt_tokens`:
+  compact future-prefix prompt tokens used by the local generator
+- `candidate_weights`:
+  explicit mixture weights across retrieved precedents
+- `matched_item_ids`:
+  diagnostics and analysis
+- `snippet_refs`:
+  optional exact backreferences for later analysis or refinement
+
+#### Phase 5 precedent query points
+
+Precedent retrieval should not be token-level by default.
+
+The preferred query points are:
+
+1. boundary query:
+   after window `w` ends and after latent/memory update
+2. header-conditioned initialization query:
+   after `NextWindowHeader` is chosen and before local generation starts
+3. optional chunk refresh query:
+   only for long or uncertain generated windows
+
+The first implementation should support:
+
+- boundary query
+- header-conditioned initialization query
+
+Chunk refresh is a later refinement, not the initial Phase 5 requirement.
+
+#### Phase 5 index extension
+
+Phase 3/4 precedent items already store:
+
+- `key_state`
+- `future_summary_h1`
+- `future_summary_h2`
+- `future_summary_h3`
+- `future_snippet_ref`
+
+Phase 5 should extend the precedent value side with:
+
+- `future_prefix_prompt`
+
+This should be a compact offline-computed prompt extracted from the first
+future window or first future chunk after the anchor boundary. It is preferred
+over raw future token splicing as the default precedent-conditioning surface.
+
+#### Phase 5 world-model contracts
+
+Add the following canonical objects in `world_model_contract.py`:
+
+- `NextWindowHeader`
+- `PrecedentGenerationReadout`
+- `WindowGenerationConditioning`
+
+with the intended meanings:
+
+- `NextWindowHeader`:
+  the predicted coarse plan for the next semantic window
+- `PrecedentGenerationReadout`:
+  the precedent-memory output used during generation
+- `WindowGenerationConditioning`:
+  the combined long-range conditioning package for the next local generator
+
+#### Phase 5 model wiring
+
+`model.py` should be refactored so that:
+
+- precedent summary priors affect boundary/global heads directly
+- header-conditioned precedent prompt retrieval happens before next-window local
+  generation
+- local generation receives:
+  - latent modulation
+  - patient-memory exact retrieval
+  - precedent prompt tokens
+  - `NextWindowHeader`
+
+The local generator should therefore not receive precedent memory only as one
+pooled dense vector.
+
+#### Phase 5 training and evaluation
+
+Training should keep the marked generative objective primary.
+Precedent-conditioning losses should be secondary and usefulness-oriented.
+
+At minimum, evaluate:
+
+- no memory
+- patient memory only
+- precedent memory only
+- dual memory
+
+and compare:
+
+- next-window header quality
+- next-window event generation quality
+- multi-step rollout quality
+
+under the same intervention/context framing used elsewhere in the project.
+
+#### Phase 5 deliverable
+
+Phase 5 is complete when:
+
+- the next window is generated from an explicit `NextWindowHeader`
+- precedent retrieval is used in two stages:
+  - boundary prior
+  - header-conditioned generation prompt
+- precedent memory contributes compact future-prompt tokens, not only dense
+  future-summary vectors
+- local generation can be run under:
+  - latent only
+  - latent + patient memory
+  - latent + precedent memory
+  - full dual memory
+
+### Phase 6. Final latent mechanism selection
+
+Primary files:
+
+- `src/ehr_hier/transformer/global_state.py`
+- `src/ehr_hier/transformer/model.py`
+
+Implementation:
+
+- keep the frozen latent family contract:
+  - multi-slot hybrid jump-plus-drift
+- compare candidate mechanisms for that family:
+  - current gated baseline
+  - selective SSM / Mamba-like update
+  - explicit jump-plus-drift continuous-time mechanism
+- make the decision based on dual-memory ablations, predictive-state retrieval,
+  and rollout behavior, not on isolated next-token-style metrics
+
+## Build and Test
+
+- install deps:
+  `python -m venv .venv; .venv\\Scripts\\activate; pip install -r requirements.txt`
+- run tests:
+  `pytest -q`
+
+## Active LRZ Paths
+
+- DSS base:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2`
-- Successful MEDS cohort root:
+- MEDS cohort:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2/etl/mimiciv_20260224_0114_fresh_img023/out_plain/MEDS_cohort`
-- Active meds_reader DB:
+- meds_reader DB:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2/etl/meds_reader_db_mimiciv_20260226_033711/mimiciv.db`
-- Active measurement artifacts dir:
+- measurement artifacts:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2/etl/pipeline_artifacts_20260226_033711`
-- Active runtime deps overlay:
+- runtime deps overlay:
   `/dss/dssfs04/lwp-dss-0002/pn76ko/pn76ko-dss-0000/proc_mining_dfg/go75meh2/containers/runtime_pydeps`
-- Current retained DSS usage after cleanup: about `22G`.
-- Practical DSS quota assumption during this stage: about `40G`. Avoid large duplicate ETL runs or repeated fat image imports.
-- `meds_reader_convert` succeeded. The DB is a directory tree, not a single `.db` file; do not search for it with `find -type f -name mimiciv.db`.
-- `compute_meas_stats.py` succeeded on the train split and produced:
-  - `code2id.pt`
-  - `stats.pt`
-- Current measurement mapping size:
-  - `n_vars_ckpt = 2344`
-  - train-kept measurement codes = `2343` plus reserved `0`
-- `train_value_cvae.py` produced a valid checkpoint:
-  - `cvae_ckpt.pt`
-  - config: `z_dim=64`, `hidden=128`, `var_emb_dim=64`, `beta_kl=0.1`
-- `scripts/eval_value_cvae.py` was added to evaluate overall and per-variable CVAE behavior on `tuning` and `held_out`.
 
-## LRZ operational notes
-- Prefer the lightweight pipeline image for CPU-side inspection/evaluation:
-  `docker://ghcr.io#andersenaaron1-bot/ehr-pipeline-cpu:0.3.1-pipeline-cpu-min`
-- The NGC PyTorch image import on LRZ (`docker://nvcr.io#nvidia/pytorch:24.10-py3`) can OOM during pyxis/enroot squashfs creation before Python starts. This is an import-memory issue, not a file-quota issue.
-- For lightweight evaluation and inspection, use the mounted repo plus `PYTHONPATH=/deps` rather than forcing the NGC image.
-- `ehr-pipeline-cpu:0.3.1-pipeline-cpu-min` may still need the mounted `/deps` overlay for `meds_reader`.
-- `df -h` on `/dss/dssfs04` reports filesystem capacity, not per-user/project quota. When LRZ reports `Disk quota exceeded`, assume DSS project quota pressure first.
-- Long LRZ jobs should be run with `tmux`, `sbatch`, or explicit logging. SSH disconnects are common and not evidence of training failure.
+## Fresh Start
 
-## Measurement/CVAE status
-- The current cVAE is numeric-only and should remain the measurement path. It is not a generic replacement for MedTok or structural tokenization.
-- Loss interpretation:
-  - current objective is Gaussian NLL on standardized values plus `0.1 * KL`
-  - negative losses are expected
-  - practical floor is near `-5`
-  - observed training losses around `-4.7` are already close to the floor for this configuration
-- `worst_by_mae` from `eval_value_cvae.py` is dominated by raw scale and is not the main fitness criterion.
-- `worst_by_nll_z` is the main signal for variable-level mismatch because it is measured in standardized space.
-- Current evaluation takeaway:
-  - bulk lab measurement modeling looks acceptable
-  - the main problem cases are high-`nll_z` flow/rate/infusion/output style variables and several `UNK`-coded measurements
-  - many of the most clinically structural or transitory variables should likely be routed out of the measurement cVAE path anyway
-- Implication for the next stage:
-  - keep the cVAE path for dense numeric measurement variables
-  - expect aggressive pruning or rerouting of sparse, bursty, operational, and structural/transitory numeric codes before final token modality assignment
+If starting fresh, begin with:
 
-## Transformer-stage priorities
-- The next stage is not "make every event numeric." The next stage is to freeze modality boundaries cleanly:
-  - measurement cVAE/RVQ path for dense numeric measurement variables
-  - MedTok path for diagnoses/procedures/medications where ontology-aware canonicalization matters
-  - structural/signifier path for transitions, unit moves, episode boundaries, overlays, and care-window markers
-- The structural/signifier design is the central modeling contribution. Favor explicit, auditable boundary and overlay tokens over overloading the cVAE with transitory operational codes.
-- Before changing the transformer, first decide which codes remain in each tokenization family and document the rationale.
-- After modality routing is stable, use the remaining high-frequency uncaptured codes to decide whether any additional token families are warranted.
-
-## Fresh-conversation handoff
-- Starting a new conversation is optional, not required. If context is getting noisy, use a new thread and begin with:
-  - "Use `AGENTS.md` and `TRANSFORMER_STAGE_HANDOFF.md` as the current handoff. The active LRZ MEDS cohort, meds_reader DB, measurement artifacts, and CVAE findings are already fixed there. I want to continue with final token-modality assignment and transformer-stage structural/window design."
-- In a new thread, the first files to open should be:
-  - `AGENTS.md`
-  - `TRANSFORMER_STAGE_HANDOFF.md`
-  - `SCHEMA_TOKENS.md`
-  - `configs/data/structural_codes.yaml`
-  - `src/ehr_hier/data/subject_timeline_builder.py`
-  - `src/ehr_hier/transformer/collator.py`
-
-## Coding style & naming conventions
-- Python 3.11+, 4-space indents, type hints on public functions, f-strings for logging.
-- Keep paths config-driven; do not hardcode dataset locations.
-- Do not commit large artifacts (`*.pt`, large `*.parquet`) unless explicitly intended.
-
-## Roles & prompt snippets
-
-### Architect agent
-Mission: keep interfaces stable across tokenizers, windowing, and the AET model.
-
-Start-here files:
-- `SCHEMA_TOKENS.md`
-- `TIME_MODEL.md`
-- `configs/data/structural_codes.yaml`
+- `AGENTS.md`
+- `paper/foundation_model_v2_outline.tex`
+- `paper/foundation_model_v2_refs.bib`
+- `src/ehr_hier/transformer/world_model_contract.py`
+- `src/ehr_hier/transformer/precedent_memory.py`
+- `src/ehr_hier/data/event_frames.py`
 - `src/ehr_hier/data/subject_timeline_builder.py`
 - `src/ehr_hier/transformer/collator.py`
 - `src/ehr_hier/transformer/model.py`
-
-Definition of done:
-- `pytest -q` passes; schema/time docs stay consistent with code.
-
-Prompt snippets:
-- "Make window signifiers first-class: freeze label ids and add a manifest-driven window type map."
-- "Add a generation-time routine that rolls out windows by predicting WIN_END/WIN_<TYPE> markers."
-
-### Tokenization engineer
-Mission: robust per-category encoders and vocab manifests that survive dataset changes.
-
-Start-here files:
-- `src/ehr_hier/tokenizers/base_encoder.py`
-- `src/ehr_hier/tokenizers/measurement_encoder.py`
-- `src/ehr_hier/tokenizers/medtok_*`
-- `artifacts/vocab_manifest.json`
-- `SCHEMA_TOKENS.md`
-
-Definition of done:
-- unknown codes map to UNK (or are explicitly dropped with a documented reason)
-- measurement bundles preserve ordering (MEAS_CODE followed by RVQ codes with dt=0)
-- manifests/offsets updated in lockstep with encoders
-
-Prompt snippets:
-- "Wire MedTok embeddings into the model embedding table (with a projector) and keep UNK stable."
-- "Add a single manifest that includes offsets + sizes + hashes and can derive AET routing."
-
-### Data/ETL agent
-Mission: deterministic window boundaries and event access (fast + reproducible).
-
-Start-here files:
-- `src/ehr_hier/data/event_router.py`
-- `src/ehr_hier/data/structural_codes.py`
-- `configs/data/structural_codes.yaml`
-- `src/ehr_hier/data/compile_dataset.py`
-
-Definition of done:
-- segmentation is deterministic; boundary/overlay labels are auditable
-- coverage tests can run against a meds_reader DB (`tests/test_*_db_*.py`)
-
-Prompt snippets:
-- "Derive structural boundary seeds from ICU stays/transfers and validate the distribution."
-- "Implement an audit that counts boundary/overlay hits and top missing codes."
-
-### Modeling agent
-Mission: hierarchical transformer (local windows + global trajectory) with time and transition modeling.
-
-Start-here files:
-- `src/ehr_hier/transformer/model.py`
-- `src/ehr_hier/transformer/encoder.py`
-- `src/ehr_hier/transformer/aggregator.py`
-- `src/ehr_hier/transformer/embeddings.py`
-- `TIME_MODEL.md`
-
-Definition of done:
-- tensor shapes covered by tests; ablation flags exist for time/transition features
-
-Prompt snippets:
-- "Add a routed embedding layer so sparse global ids from the manifest don't require a giant nn.Embedding."
-- "Expose and test a clear separation between intra-window time and inter-window time in attention."
-
-### Evaluation agent
-Mission: keep tests and small fixtures aligned with the schema and windowing behavior.
-
-Start-here files:
-- `tests/test_collator_*`
-- `tests/test_model_*`
-- `tests/test_subject_timeline_builder.py`
-
-Definition of done:
-- `pytest -q` clean; tests assert deterministic window markers and transition bias behavior
-
-Prompt snippets:
-- "Add a synthetic timeline fixture that exercises boundary + overlay + soft signifiers."
-- "Test that structural boundaries become window hooks and that window type ids are inferred as expected."
-
-## Testing guidelines
-- Framework: pytest. Run from repo root with `pytest -q` (set `PYTHONPATH=.` if needed).
-- Prefer small synthetic fixtures; DB-backed tests are marked `@pytest.mark.integration` and require env vars.
-
-## Commit & PR guidelines
-- Keep changes focused; document any schema/vocab changes and provide migration notes.
-- Flag breaking changes (token id layout, marker semantics, checkpoint formats).
+- `src/ehr_hier/transformer/global_state.py`
+- `src/ehr_hier/transformer/episodic_memory.py`

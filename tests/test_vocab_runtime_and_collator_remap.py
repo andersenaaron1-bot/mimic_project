@@ -321,6 +321,82 @@ def test_sparse_vocab_contract_requires_explicit_medtok_source(tmp_path) -> None
         assert "MedTok source" in str(exc)
 
 
+def test_sparse_vocab_contract_defaults_missing_residual_family_to_unk_policy(tmp_path) -> None:
+    from ehr_hier.tokenizers.vocab_contract import build_sparse_vocab_contract
+
+    contract_fp = tmp_path / "tokenization_v1.yaml"
+    structural_fp = tmp_path / "structural_codes.yaml"
+    medtok_dir = tmp_path / "medtok"
+    medtok_dir.mkdir(parents=True, exist_ok=True)
+
+    contract_fp.write_text(
+        yaml.safe_dump(
+            {
+                "frozen_ranges": {
+                    "special": {"offset": 0, "reserved_max_id": 31},
+                    "diagnosis": {"offset": 1000000},
+                    "diagnosis_residual": {"offset": 1160000, "buckets": 99},
+                    "procedure": {"offset": 1200000},
+                    "procedure_residual": {"offset": 1360000, "buckets": 99},
+                    "medication": {"offset": 1400000},
+                    "medication_residual": {"offset": 1800000, "buckets": 99},
+                    "measurement_code": {"offset": 2000000},
+                    "measurement_value": {"offset": 2100000},
+                    "structural": {"offset": 2200000},
+                    "observation_code": {"offset": 2300000},
+                    "observation_value": {"offset": 2320000},
+                },
+                "residual_fallback": {
+                    "enabled": True,
+                    "buckets": 99,
+                    "tail_policy": "drop",
+                    "offsets": {
+                        "diagnosis": 1160000,
+                        "procedure": 1360000,
+                        "medication": 1800000,
+                    },
+                },
+                "window_markers": {
+                    "enabled": True,
+                    "type_token_offset": 10,
+                    "num_types": 7,
+                    "end_token_id": 17,
+                    "continue_token_id": 18,
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    structural_fp.write_text(
+        yaml.safe_dump(
+            {
+                "structural_map": {"ADMISSION": "START_ADM"},
+                "transition_map": {"ADMISSION": "open_next"},
+                "window_types": {"UNK": 0, "INPATIENT": 1},
+                "window_type_map": {"ADMISSION": "INPATIENT"},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (medtok_dir / "diag_vocab.json").write_text(json.dumps({"<UNK>": 0, "I10": 1}), encoding="utf-8")
+    (medtok_dir / "proc_vocab.json").write_text(json.dumps({"<UNK>": 0, "XYZ": 1}), encoding="utf-8")
+    (medtok_dir / "med_vocab.json").write_text(json.dumps({"<UNK>": 0, "RXNORM//1": 1}), encoding="utf-8")
+
+    sparse_contract = build_sparse_vocab_contract(
+        tokenization_contract=contract_fp,
+        structural_yaml=structural_fp,
+        medtok_vocab_dir=medtok_dir,
+        measurement_code_size=128,
+        rvq_size=32,
+    )
+
+    med_residual = sparse_contract["families"]["medication_residual"]
+    assert med_residual["family_type"] == "residual_unk"
+    assert med_residual["source_size"] == 1
+    assert med_residual["meta"]["mode"] == "unk"
+    assert med_residual["meta"]["tail_policy"] == "drop"
+
+
 def test_collator_reports_overflow_and_remap_stats_and_next_type_fallback() -> None:
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.data.window_segmentation import SegmentedChunk

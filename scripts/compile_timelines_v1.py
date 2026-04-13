@@ -19,6 +19,7 @@ from scripts.audit_tokenization_flow import (  # noqa: E402
     _load_subject_ids,
     _load_tokenization_contract,
     _resolve_residual_policy,
+    _resolve_residual_tail_policies,
 )
 from src.ehr_hier.data.compile_dataset import compile_dataset  # noqa: E402
 from src.ehr_hier.data.structural_codes import structural_surface_vocab_codes  # noqa: E402
@@ -28,8 +29,8 @@ from src.ehr_hier.tokenizers.base_encoder import build_base_encoders  # noqa: E4
 def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
-            "Compile subject timelines under the frozen tokenization v1 contract and "
-            "write a precompiled index/manifest for long-run transformer training."
+            "Compile subject EventFrame timelines into packed shards and "
+            "write the canonical precompiled index/manifest for transformer training."
         )
     )
     ap.add_argument("--meds_reader_db", required=True)
@@ -89,6 +90,9 @@ def main() -> None:
         args,
         tokenization_contract=tokenization_contract,
     )
+    residual_tail_policies = _resolve_residual_tail_policies(
+        tokenization_contract=tokenization_contract,
+    )
     struct_codes_union = set(structural_surface_vocab_codes(artifacts.structural_codebook))
     struct_vocab = _build_struct_vocab(struct_codes_union, manifest=artifacts.manifest)
     meas_cfg = _build_measurement_config(args, artifacts=artifacts)
@@ -109,6 +113,7 @@ def main() -> None:
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),
+        residual_tail_policies=residual_tail_policies,
     )
 
     subject_ids = _load_subject_ids(

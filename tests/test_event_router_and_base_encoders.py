@@ -78,6 +78,7 @@ def _dummy_encoders(monkeypatch, drop_unknowns: bool) -> Dict[TokenCategory, obj
 def test_base_encoders_emit_unk_instead_of_drop(monkeypatch):
     enc = _dummy_encoders(monkeypatch, drop_unknowns=False)
     diag_enc = enc[TokenCategory.DIAGNOSIS]
+    assert hasattr(enc[TokenCategory.MEASUREMENT], "encode_frame")
     resolution = diag_enc.resolve_event(SimpleNamespace(code="ICD10CM//ZZZ"))
     assert resolution.stage == "unk"
     out = diag_enc.encode_event(SimpleNamespace(code="ICD10CM//ZZZ"), dt_hours=1.5)
@@ -124,6 +125,7 @@ def test_medication_residual_fallback_enabled(monkeypatch):
         drop_unknowns=False,
         enable_residual_fallback=True,
         residual_fallback_buckets=128,
+        residual_tail_policy="hash",
     )
     med_enc = enc[TokenCategory.MEDICATION]
     out = med_enc.encode_event(
@@ -139,6 +141,51 @@ def test_medication_residual_fallback_enabled(monkeypatch):
     assert tok.value_id != med_vocab.offset + med_vocab.unk_id
     assert tok.cat_attrs.get("residual_fallback") == 1
     assert tok.cat_attrs.get("residual_fallback_hash") == 1
+
+
+def test_medication_residual_fallback_defaults_to_unk_without_explicit_hash(monkeypatch):
+    class DummyMeasurementEncoder:
+        category = TokenCategory.MEASUREMENT
+
+        def __init__(self, cfg):
+            self.cfg = cfg
+
+        def reset_state(self):
+            return None
+
+        def encode_event(self, ev, dt_hours: float):
+            return []
+
+    monkeypatch.setattr(base_encoder, "MeasurementTokenEncoder", DummyMeasurementEncoder)
+
+    diag_vocab = CategoryVocab(name="diag", offset=1_000_000, code2id={"ICD10CM//A000": 1, "<UNK>": 0})
+    proc_vocab = CategoryVocab(name="proc", offset=1_200_000, code2id={"CPT//00100": 1, "<UNK>": 0})
+    med_vocab = CategoryVocab(name="med", offset=1_400_000, code2id={"RXNORM//1": 1, "<UNK>": 0})
+    struct_vocab = CategoryVocab(name="struct", offset=2_200_000, code2id={"<UNK>": 0})
+
+    enc = base_encoder.build_base_encoders(
+        object(),
+        diag_vocab=diag_vocab,
+        proc_vocab=proc_vocab,
+        med_vocab=med_vocab,
+        struct_vocab=struct_vocab,
+        include_other_noop=False,
+        drop_unknowns=False,
+        enable_residual_fallback=True,
+        residual_fallback_buckets=128,
+    )
+    med_enc = enc[TokenCategory.MEDICATION]
+    resolution = med_enc.resolve_event(
+        SimpleNamespace(code="MEDICATION//Acetaminophen//Administered")
+    )
+    out = med_enc.encode_event(
+        SimpleNamespace(code="MEDICATION//Acetaminophen//Administered"),
+        dt_hours=0.0,
+    )
+    assert resolution.stage == "unk"
+    assert out
+    assert out[0].value_id == med_vocab.offset + med_vocab.unk_id
+    assert out[0].cat_attrs.get("residual_fallback_hash", 0) == 0
 
 
 def test_medication_exact_residual_fallback_prefers_vocab(monkeypatch):

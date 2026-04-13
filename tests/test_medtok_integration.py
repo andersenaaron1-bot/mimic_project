@@ -12,6 +12,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
+from src.ehr_hier.data.event_frames import flatten_event_frames
 from src.ehr_hier.data.token_types import TokenCategory
 from src.ehr_hier.tokenizers import measurement_encoder as meas_mod
 from src.ehr_hier.tokenizers.base_encoder import build_base_encoders
@@ -497,9 +498,11 @@ def test_medtok_start_stop_markers(monkeypatch, tiny_vocabs):
     ]
     db = FakeDB({7: FakeSubject(events)})
 
-    tokens = build_subject_timeline(db, subject_id=7, encoders=encoders)
+    frames = build_subject_timeline(db, subject_id=7, encoders=encoders)
+    tokens = flatten_event_frames(frames)
 
-    # Two tokens per event: base med + marker
+    # Two frames, each containing a base-med token plus a marker token.
+    assert len(frames) == 2
     assert len(tokens) == 4
     assert all(t.category_id == int(TokenCategory.MEDICATION) for t in tokens)
 

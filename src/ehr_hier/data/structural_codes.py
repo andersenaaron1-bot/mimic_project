@@ -16,6 +16,38 @@ TRANSITION_ACTION_TO_ID: Dict[str, int] = {
     "suppress": 4,
 }
 TRANSITION_ACTION_FROM_ID: Dict[int, str] = {v: k for k, v in TRANSITION_ACTION_TO_ID.items()}
+DEFAULT_TRANSITION_ACTION_BY_PREFIX: Dict[str, str] = {
+    "MEDS_BIRTH": "suppress",
+    "MEDS_DEATH": "close_current",
+    "ADMISSION": "open_next",
+    "DISCHARGE": "close_current",
+    "CAREUNIT_CHANGE": "close_open",
+    "HOSPITAL_ADMISSION": "open_next",
+    "HOSPITAL_DISCHARGE": "close_current",
+    "ICU_ADMISSION": "open_next",
+    "ICU_DISCHARGE": "close_current",
+    "TRANSFER_TO": "close_open",
+    "ED_REGISTRATION": "open_next",
+    "ED_OUT": "close_current",
+}
+DEFAULT_WINDOW_TYPE_NAME_BY_PREFIX: Dict[str, str] = {
+    "ED_REGISTRATION": "ED_ADMISSION",
+    "ADMISSION": "INPATIENT",
+    "HOSPITAL_ADMISSION": "INPATIENT",
+    "CAREUNIT_CHANGE": "INPATIENT",
+    "TRANSFER_TO": "INPATIENT",
+    "ICU_ADMISSION": "ICU",
+    "STRUCT_START_OR": "OR",
+}
+DEFAULT_WINDOW_TYPE2ID_MAP: Dict[str, int] = {
+    "UNK": 0,
+    "ED_ADMISSION": 1,
+    "ED": 1,
+    "INPATIENT": 2,
+    "ICU": 3,
+    "OR": 4,
+    "POST_DISCHARGE": 5,
+}
 
 ICU_LOCATION_ALIASES = (
     "//ICU//",
@@ -120,6 +152,66 @@ def _infer_macro_window_type_from_code(code_str: str) -> Optional[str]:
     if prefix in {"ADMISSION", "HOSPITAL_ADMISSION", "CAREUNIT_CHANGE", "TRANSFER_TO"}:
         return "INPATIENT"
     return None
+
+
+def infer_transition_action_from_code(code: str | None) -> Optional[str]:
+    if code is None:
+        return None
+    code_str = str(code).strip()
+    if not code_str:
+        return None
+    return DEFAULT_TRANSITION_ACTION_BY_PREFIX.get(code_str.split("//", 1)[0].upper())
+
+
+def infer_transition_window_type_name_from_code(code: str | None) -> Optional[str]:
+    if code is None:
+        return None
+    code_str = str(code).strip()
+    if not code_str:
+        return None
+    upper = code_str.upper()
+    prefix = upper.split("//", 1)[0]
+    if prefix == "TRANSFER_TO":
+        if looks_ed_location(upper):
+            return "ED_ADMISSION"
+        if looks_icu_location(upper):
+            return "ICU"
+        if looks_or_location(upper):
+            return "OR"
+    inferred = _infer_macro_window_type_from_code(code_str)
+    if inferred is not None:
+        return inferred
+    return DEFAULT_WINDOW_TYPE_NAME_BY_PREFIX.get(prefix)
+
+
+def infer_transition_window_type_id_from_code(
+    code: str | None,
+    *,
+    window_type2id_map: Mapping[str, int] | None,
+) -> Optional[int]:
+    if not window_type2id_map:
+        return None
+    name = infer_transition_window_type_name_from_code(code)
+    if name is None:
+        return None
+    type_id = window_type2id_map.get(name)
+    if type_id is not None:
+        return int(type_id)
+    if name == "ED_ADMISSION":
+        fallback = window_type2id_map.get("ED")
+        return None if fallback is None else int(fallback)
+    if name == "ED":
+        fallback = window_type2id_map.get("ED_ADMISSION")
+        return None if fallback is None else int(fallback)
+    return None
+
+
+def infer_transition_site_id_from_code(code: str | None) -> Optional[int]:
+    macro_type = infer_transition_window_type_name_from_code(code)
+    site_name = canonical_transition_site_name(code=code, macro_type=macro_type)
+    if site_name is None:
+        return None
+    return _stable_site_id(site_name)
 
 
 def _extract_transition_site_components(code_str: str) -> list[str]:

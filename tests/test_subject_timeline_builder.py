@@ -9,6 +9,7 @@ from src.ehr_hier.data.structural_codes import (
     StructuralCodebook,
     load_structural_codebook_yaml,
 )
+from src.ehr_hier.data.event_frames import flatten_event_frames
 from src.ehr_hier.data.subject_timeline_builder import build_subject_timeline
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
@@ -99,7 +100,11 @@ def test_subject_timeline_orders_and_attaches_numeric():
 
     # Medication numeric_value should be attached when encoder omits it
     assert tokens[2].num_attrs["numeric_value"] == 7.5
-    # Structural hook should be applied from the map
+    # Structural boundaries should now carry explicit transition metadata even
+    # on the fallback map path, with the hook retained only as a redundant split signal.
+    assert tokens[3].cat_attrs["transition_action_id"] == TRANSITION_ACTION_TO_ID["open_next"]
+    assert tokens[3].cat_attrs["transition_window_type_id"] == 2
+    assert tokens[3].cat_attrs["window_type_id"] == 2
     assert tokens[3].window_hook == "episode"
 
 
@@ -545,7 +550,9 @@ def test_blood_pressure_routes_to_measurement_obs_fallback():
         encoders={TokenCategory.MEASUREMENT: EmptyMeasEncoder()},
     )
 
-    obs_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.MEASUREMENT)]
+    obs_frames = [frame for frame in tokens if frame.category_id == int(TokenCategory.MEASUREMENT)]
+    assert len(obs_frames) == 1
+    obs_tokens = flatten_event_frames(obs_frames)
     assert len(obs_tokens) == 2
     assert obs_tokens[0].cat_attrs.get("obs_bundle_pos") == 1
     assert obs_tokens[1].cat_attrs.get("obs_bundle_pos") == 2
@@ -583,7 +590,9 @@ def test_blood_pressure_obs_uses_exact_vocabs_when_present():
         qual_obs_tail_policy="drop",
     )
 
-    obs_tokens = [tok for tok in tokens if tok.category_id == int(TokenCategory.MEASUREMENT)]
+    obs_frames = [frame for frame in tokens if frame.category_id == int(TokenCategory.MEASUREMENT)]
+    assert len(obs_frames) == 1
+    obs_tokens = flatten_event_frames(obs_frames)
     assert [int(tok.value_id) for tok in obs_tokens] == [2_300_001, 2_320_005]
     assert obs_tokens[0].cat_attrs.get("obs_code_exact") == 1
     assert obs_tokens[1].cat_attrs.get("obs_value_exact") == 1

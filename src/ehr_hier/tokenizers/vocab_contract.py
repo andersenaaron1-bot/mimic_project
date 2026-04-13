@@ -135,26 +135,59 @@ def _residual_vocab_meta(
     family: str,
     offset: int,
     default_buckets: int,
+    tail_policy: str = "drop",
 ) -> Dict[str, Any]:
+    tail_policy_norm = str(tail_policy).strip().lower() or "drop"
+    if tail_policy_norm not in {"drop", "hash"}:
+        raise ValueError(
+            f"Unsupported residual tail policy {tail_policy!r} for family {family!r}; expected drop|hash"
+        )
     fp = resolve_residual_fallback_vocab_path(medtok_vocab_dir, family)
     if fp is None:
+        if tail_policy_norm == "hash":
+            return {
+                "offset": int(offset),
+                "mode": "hash",
+                "source_size": int(default_buckets),
+                "exact_size": 0,
+                "tail_policy": "hash",
+                "tail_buckets": int(default_buckets),
+                "vocab_json": None,
+            }
         return {
             "offset": int(offset),
-            "mode": "hash",
-            "source_size": int(default_buckets),
-            "tail_policy": "hash",
-            "tail_buckets": int(default_buckets),
+            "mode": "unk",
+            "source_size": 1,
+            "exact_size": 0,
+            "tail_policy": "drop",
+            "tail_buckets": 0,
             "vocab_json": None,
         }
     size = _vocab_size_from_json(fp) or 1
+    tail_buckets = int(default_buckets) if tail_policy_norm == "hash" else 0
     return {
         "offset": int(offset),
         "mode": "exact_vocab",
-        "source_size": int(size),
-        "tail_policy": "drop",
-        "tail_buckets": 0,
+        "source_size": int(size + tail_buckets),
+        "exact_size": int(size),
+        "tail_policy": str(tail_policy_norm),
+        "tail_buckets": int(tail_buckets),
         "vocab_json": str(fp),
     }
+
+
+def _residual_family_type(meta: Mapping[str, Any]) -> str:
+    mode = str(meta.get("mode", "")).strip().lower()
+    tail_policy = str(meta.get("tail_policy", "drop")).strip().lower()
+    if mode == "exact_vocab" and tail_policy == "drop":
+        return "residual_exact"
+    if mode == "exact_vocab" and tail_policy == "hash":
+        return "residual_exact_hash"
+    if mode == "hash":
+        return "residual_hash"
+    if mode == "unk":
+        return "residual_unk"
+    return "residual"
 
 
 def _code2id_size(code2id_pt: str | Path | None) -> Optional[int]:
@@ -243,6 +276,7 @@ def build_sparse_vocab_contract(
     contract = _load_yaml(tokenization_contract)
     frozen = _safe_dict(contract.get("frozen_ranges", {}))
     residual_cfg = _safe_dict(contract.get("residual_fallback", {}))
+    residual_family_cfg = _safe_dict(residual_cfg.get("families", {}))
     markers_cfg = _safe_dict(contract.get("window_markers", {}))
     segmentation_cfg = _safe_dict(contract.get("window_segmentation", {}))
 
@@ -323,23 +357,30 @@ def build_sparse_vocab_contract(
         _vocab_size_from_json((medtok_dir / "obs_value_vocab.json") if medtok_dir is not None else None)
         or int(_safe_dict(frozen.get("observation_value", {})).get("size", 80_000))
     )
+    default_residual_tail_policy = str(residual_cfg.get("tail_policy", "drop")).strip().lower() or "drop"
+    diag_tail_policy = str(_safe_dict(residual_family_cfg.get("diagnosis", {})).get("tail_policy", default_residual_tail_policy))
+    proc_tail_policy = str(_safe_dict(residual_family_cfg.get("procedure", {})).get("tail_policy", default_residual_tail_policy))
+    med_tail_policy = str(_safe_dict(residual_family_cfg.get("medication", {})).get("tail_policy", default_residual_tail_policy))
     diag_res_meta = _residual_vocab_meta(
         medtok_vocab_dir=medtok_dir,
         family="diagnosis",
         offset=diag_res_offset,
         default_buckets=_bucket("diagnosis_residual", 39_999),
+        tail_policy=diag_tail_policy,
     )
     proc_res_meta = _residual_vocab_meta(
         medtok_vocab_dir=medtok_dir,
         family="procedure",
         offset=proc_res_offset,
         default_buckets=_bucket("procedure_residual", 39_999),
+        tail_policy=proc_tail_policy,
     )
     med_res_meta = _residual_vocab_meta(
         medtok_vocab_dir=medtok_dir,
         family="medication",
         offset=med_res_offset,
         default_buckets=_bucket("medication_residual", 39_999),
+        tail_policy=med_tail_policy,
     )
     structural_contract: Dict[str, Any] = {}
     try:
@@ -381,7 +422,7 @@ def build_sparse_vocab_contract(
         "diagnosis_residual": _family_entry(
             offset=diag_res_offset,
             source_size=int(diag_res_meta["source_size"]),
-            family_type="residual_exact" if str(diag_res_meta["mode"]) == "exact_vocab" else "residual",
+            family_type=_residual_family_type(diag_res_meta),
             runtime_head="logits_medtok",
             meta=diag_res_meta,
         ),
@@ -394,7 +435,7 @@ def build_sparse_vocab_contract(
         "procedure_residual": _family_entry(
             offset=proc_res_offset,
             source_size=int(proc_res_meta["source_size"]),
-            family_type="residual_exact" if str(proc_res_meta["mode"]) == "exact_vocab" else "residual",
+            family_type=_residual_family_type(proc_res_meta),
             runtime_head="logits_medtok",
             meta=proc_res_meta,
         ),
@@ -407,7 +448,7 @@ def build_sparse_vocab_contract(
         "medication_residual": _family_entry(
             offset=med_res_offset,
             source_size=int(med_res_meta["source_size"]),
-            family_type="residual_exact" if str(med_res_meta["mode"]) == "exact_vocab" else "residual",
+            family_type=_residual_family_type(med_res_meta),
             runtime_head="logits_medtok",
             meta=med_res_meta,
         ),
@@ -512,6 +553,7 @@ def build_sparse_vocab_contract(
         "residual_fallback": {
             "enabled": bool(residual_cfg.get("enabled", True)),
             "buckets": int(residual_cfg.get("buckets", 39_999)),
+            "tail_policy": str(default_residual_tail_policy),
             "families": residual_families,
         },
         "runtime_lane_order": list(DEFAULT_RUNTIME_LANE_ORDER),

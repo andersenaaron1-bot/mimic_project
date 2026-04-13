@@ -2,10 +2,20 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
-from typing import Any, Dict, List, Literal
+from typing import Any, Dict, List, Literal, Mapping
 
 import torch
 
+from src.ehr_hier.data.event_frames import (
+    EventFrame,
+    EventPayloadKind,
+    build_event_frame,
+    clone_event_frame,
+    ensure_event_frames,
+    flatten_event_frames,
+    payload_kind_to_id,
+    slice_event_frame,
+)
 from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.data.window_segmentation import (
     SegmentedChunk,
@@ -13,6 +23,10 @@ from src.ehr_hier.data.window_segmentation import (
     WindowSegmentationConfig,
     chunk_segmented_windows,
     segment_event_tokens,
+)
+from src.ehr_hier.transformer.memory_rules import (
+    classify_event_frame_for_memory,
+    update_seen_memory_keys,
 )
 
 
@@ -50,12 +64,46 @@ class WindowMarkerConfig:
     marker_category: TokenCategory = TokenCategory.SPECIAL
 
 
+@dataclass(frozen=True)
+class PreparedChunk:
+    ids: List[int]
+    times: List[float]
+    vals: List[float]
+    valmask: List[int]
+    types: List[int]
+    start_abs: float
+    start_offset: float
+    token_event_index: List[int]
+    token_event_slot_ids: List[int]
+    event_ids: List[int]
+    event_times: List[float]
+    event_vals: List[float]
+    event_valmask: List[int]
+    event_types: List[int]
+    event_payloads: List[int]
+    event_demographic_feature_ids: List[int]
+    event_memory_rule_scores: List[float]
+    event_memory_group_ids: List[int]
+    event_memory_first_flags: List[int]
+    event_memory_chronic_flags: List[int]
+
+    def __iter__(self):
+        yield self.ids
+        yield self.times
+        yield self.vals
+        yield self.valmask
+        yield self.types
+        yield self.start_abs
+        yield self.start_offset
+
+
 class AETHierarchicalCollator:
     """
-    Collates a batch of EventToken timelines into padded (B, W, L, ...) tensors.
+    Collates a batch of event-frame timelines into padded (B, W, L, ...) tensors.
 
     - Windows are segmented with bundle-based transition logic.
-    - Explicit transition metadata takes precedence over legacy token.window_hook splits.
+    - Explicit transition metadata is the canonical windowing signal.
+    - token.window_hook remains only as a fallback for older artifacts/tests.
     - Special (window-0) tokens are prefixed to every window.
     - Times are made relative to the start of each window.
     - token_type_ids mirror TokenCategory for now (head mapping handled later).
@@ -84,7 +132,27 @@ class AETHierarchicalCollator:
         self.id_remapper = id_remapper
         self.emit_global_input_ids = bool(emit_global_input_ids)
 
-    def __call__(self, batch_timelines: List[List[EventToken]]) -> Dict[str, Any]:
+    def __call__(self, batch_timelines: List[Any]) -> Dict[str, Any]:
+        normalized_timelines: List[List[EventFrame | EventToken]] = []
+        batch_subject_ids: List[int] = []
+        batch_trajectory_ords: List[int] = []
+        for item in batch_timelines:
+            if isinstance(item, Mapping):
+                timeline = item.get("timeline", None)
+                if not timeline:
+                    continue
+                normalized_timelines.append(list(timeline))
+                batch_subject_ids.append(int(item.get("subject_id", -1)))
+                batch_trajectory_ords.append(int(item.get("trajectory_ord", -1)))
+            else:
+                if not item:
+                    continue
+                normalized_timelines.append(list(item))
+                batch_subject_ids.append(-1)
+                batch_trajectory_ords.append(-1)
+        if not normalized_timelines:
+            raise ValueError("Collator received no non-empty timelines.")
+
         batch_ids: List[List[List[List[int]]]] = []
         batch_times: List[List[List[List[float]]]] = []
         batch_vals: List[List[List[List[float]]]] = []
@@ -101,6 +169,19 @@ class AETHierarchicalCollator:
         batch_window_duration_hours: List[List[float]] = []
         batch_chunk_token_counts: List[List[List[float]]] = []
         batch_chunk_duration_hours: List[List[List[float]]] = []
+        batch_token_event_index: List[List[List[List[int]]]] = []
+        batch_token_event_slot_ids: List[List[List[List[int]]]] = []
+        batch_event_ids: List[List[List[List[int]]]] = []
+        batch_event_times: List[List[List[List[float]]]] = []
+        batch_event_vals: List[List[List[List[float]]]] = []
+        batch_event_valmask: List[List[List[List[int]]]] = []
+        batch_event_types: List[List[List[List[int]]]] = []
+        batch_event_payloads: List[List[List[List[int]]]] = []
+        batch_event_demographic_feature_ids: List[List[List[List[int]]]] = []
+        batch_event_memory_rule_scores: List[List[List[List[float]]]] = []
+        batch_event_memory_group_ids: List[List[List[List[int]]]] = []
+        batch_event_memory_first_flags: List[List[List[List[int]]]] = []
+        batch_event_memory_chronic_flags: List[List[List[List[int]]]] = []
         semantic_windows_total = 0
         semantic_windows_kept = 0
         semantic_windows_dropped = 0
@@ -111,9 +192,15 @@ class AETHierarchicalCollator:
         chunk_structural_tokens_dropped_by_cap = 0
         subjects_with_overflow = 0
 
-        for timeline in batch_timelines:
-            special_tokens, events = self._split_special(timeline)
-            semantic_windows_all = self._segment_windows(events)
+        for timeline in normalized_timelines:
+            frame_timeline = ensure_event_frames(timeline)
+            special_frames, event_frames = self._split_special(frame_timeline)
+            special_tokens = flatten_event_frames(special_frames, clone=False)
+            semantic_windows_all = self._segment_windows(event_frames)
+            semantic_frame_windows_all = self._align_frames_to_segmented_windows(
+                event_frames,
+                semantic_windows_all,
+            )
             semantic_windows_total += int(len(semantic_windows_all))
             dropped_windows = max(0, int(len(semantic_windows_all) - int(self.max_windows)))
             subject_dropped_tokens = 0
@@ -135,6 +222,11 @@ class AETHierarchicalCollator:
             semantic_tokens_dropped += int(subject_dropped_tokens)
             semantic_structural_tokens_dropped += int(subject_dropped_structural_tokens)
             chunked_windows = self._chunk_windows(semantic_windows, special_tokens=special_tokens)
+            semantic_frame_windows = semantic_frame_windows_all[: self.max_windows]
+            chunked_frame_windows = self._align_frames_to_chunked_windows(
+                semantic_frame_windows,
+                chunked_windows,
+            )
             window_type_ids = [self._clamp_window_type_id(int(window.window_type_id)) for window in chunked_windows]
             window_start_abs_times = [float(window.start_time_hours) for window in chunked_windows]
             subject_dropped_chunks = 0
@@ -173,6 +265,20 @@ class AETHierarchicalCollator:
             subj_window_duration_hours: List[float] = []
             subj_chunk_token_counts: List[List[float]] = []
             subj_chunk_duration_hours: List[List[float]] = []
+            subj_token_event_index: List[List[List[int]]] = []
+            subj_token_event_slot_ids: List[List[List[int]]] = []
+            subj_event_ids: List[List[List[int]]] = []
+            subj_event_times: List[List[List[float]]] = []
+            subj_event_vals: List[List[List[float]]] = []
+            subj_event_valmask: List[List[List[int]]] = []
+            subj_event_types: List[List[List[int]]] = []
+            subj_event_payloads: List[List[List[int]]] = []
+            subj_event_demographic_feature_ids: List[List[List[int]]] = []
+            subj_event_memory_rule_scores: List[List[List[float]]] = []
+            subj_event_memory_group_ids: List[List[List[int]]] = []
+            subj_event_memory_first_flags: List[List[List[int]]] = []
+            subj_event_memory_chronic_flags: List[List[List[int]]] = []
+            seen_memory_keys: set[str] = set()
 
             for wi, window in enumerate(chunked_windows):
                 next_type_id = window_type_ids[wi + 1] if wi + 1 < len(window_type_ids) else None
@@ -189,28 +295,59 @@ class AETHierarchicalCollator:
                 chunk_is_last: List[int] = []
                 chunk_token_counts: List[float] = []
                 chunk_duration_hours: List[float] = []
+                chunk_token_event_index: List[List[int]] = []
+                chunk_token_event_slot_ids: List[List[int]] = []
+                chunk_event_ids: List[List[int]] = []
+                chunk_event_times: List[List[float]] = []
+                chunk_event_vals: List[List[float]] = []
+                chunk_event_valmask: List[List[int]] = []
+                chunk_event_types: List[List[int]] = []
+                chunk_event_payloads: List[List[int]] = []
+                chunk_event_demographic_feature_ids: List[List[int]] = []
+                chunk_event_memory_rule_scores: List[List[float]] = []
+                chunk_event_memory_group_ids: List[List[int]] = []
+                chunk_event_memory_first_flags: List[List[int]] = []
+                chunk_event_memory_chronic_flags: List[List[int]] = []
 
-                for chunk in window.chunks:
-                    ids, times, vals, valmask, types, start_abs, start_offset = self._process_chunk(
+                for ci, chunk in enumerate(window.chunks):
+                    prepared = self._process_chunk(
                         chunk,
-                        special_tokens,
+                        special_tokens=special_tokens,
+                        special_frames=special_frames,
+                        chunk_frames=chunked_frame_windows[wi][ci] if wi < len(chunked_frame_windows) and ci < len(chunked_frame_windows[wi]) else [],
                         w_type_id=window_type_ids[wi],
                         w_start_abs=window_start_abs_times[wi],
                         next_type_id=next_type_id,
                         next_start_abs=next_start_abs,
+                        seen_memory_keys=seen_memory_keys,
                     )
-                    seq_len = len(ids)
-                    chunk_ids.append(ids)
-                    chunk_times.append(times)
-                    chunk_vals.append(vals)
-                    chunk_types.append(types)
+                    seq_len = len(prepared.ids)
+                    chunk_ids.append(prepared.ids)
+                    chunk_times.append(prepared.times)
+                    chunk_vals.append(prepared.vals)
+                    chunk_types.append(prepared.types)
                     chunk_masks.append([1] * seq_len)
-                    chunk_valmask.append(valmask)
+                    chunk_valmask.append(prepared.valmask)
                     chunk_mask.append(1)
-                    chunk_offsets.append(start_offset)
-                    chunk_start_times.append(start_abs)
+                    chunk_offsets.append(prepared.start_offset)
+                    chunk_start_times.append(prepared.start_abs)
                     chunk_is_last.append(1 if chunk.is_last_chunk else 0)
                     chunk_token_counts.append(float(len(chunk.tokens)))
+                    chunk_token_event_index.append(prepared.token_event_index)
+                    chunk_token_event_slot_ids.append(prepared.token_event_slot_ids)
+                    chunk_event_ids.append(prepared.event_ids)
+                    chunk_event_times.append(prepared.event_times)
+                    chunk_event_vals.append(prepared.event_vals)
+                    chunk_event_valmask.append(prepared.event_valmask)
+                    chunk_event_types.append(prepared.event_types)
+                    chunk_event_payloads.append(prepared.event_payloads)
+                    chunk_event_demographic_feature_ids.append(
+                        prepared.event_demographic_feature_ids
+                    )
+                    chunk_event_memory_rule_scores.append(prepared.event_memory_rule_scores)
+                    chunk_event_memory_group_ids.append(prepared.event_memory_group_ids)
+                    chunk_event_memory_first_flags.append(prepared.event_memory_first_flags)
+                    chunk_event_memory_chronic_flags.append(prepared.event_memory_chronic_flags)
                     if chunk.tokens:
                         chunk_duration_hours.append(float(chunk.tokens[-1].t_from_start_hours) - float(chunk.start_time_hours))
                     else:
@@ -235,6 +372,21 @@ class AETHierarchicalCollator:
                     subj_window_duration_hours.append(0.0)
                 subj_chunk_token_counts.append(chunk_token_counts)
                 subj_chunk_duration_hours.append(chunk_duration_hours)
+                subj_token_event_index.append(chunk_token_event_index)
+                subj_token_event_slot_ids.append(chunk_token_event_slot_ids)
+                subj_event_ids.append(chunk_event_ids)
+                subj_event_times.append(chunk_event_times)
+                subj_event_vals.append(chunk_event_vals)
+                subj_event_valmask.append(chunk_event_valmask)
+                subj_event_types.append(chunk_event_types)
+                subj_event_payloads.append(chunk_event_payloads)
+                subj_event_demographic_feature_ids.append(
+                    chunk_event_demographic_feature_ids
+                )
+                subj_event_memory_rule_scores.append(chunk_event_memory_rule_scores)
+                subj_event_memory_group_ids.append(chunk_event_memory_group_ids)
+                subj_event_memory_first_flags.append(chunk_event_memory_first_flags)
+                subj_event_memory_chronic_flags.append(chunk_event_memory_chronic_flags)
 
             batch_ids.append(subj_ids)
             batch_times.append(subj_times)
@@ -252,6 +404,21 @@ class AETHierarchicalCollator:
             batch_window_duration_hours.append(subj_window_duration_hours)
             batch_chunk_token_counts.append(subj_chunk_token_counts)
             batch_chunk_duration_hours.append(subj_chunk_duration_hours)
+            batch_token_event_index.append(subj_token_event_index)
+            batch_token_event_slot_ids.append(subj_token_event_slot_ids)
+            batch_event_ids.append(subj_event_ids)
+            batch_event_times.append(subj_event_times)
+            batch_event_vals.append(subj_event_vals)
+            batch_event_valmask.append(subj_event_valmask)
+            batch_event_types.append(subj_event_types)
+            batch_event_payloads.append(subj_event_payloads)
+            batch_event_demographic_feature_ids.append(
+                subj_event_demographic_feature_ids
+            )
+            batch_event_memory_rule_scores.append(subj_event_memory_rule_scores)
+            batch_event_memory_group_ids.append(subj_event_memory_group_ids)
+            batch_event_memory_first_flags.append(subj_event_memory_first_flags)
+            batch_event_memory_chronic_flags.append(subj_event_memory_chronic_flags)
 
         out = self._pad_batch(
             batch_ids,
@@ -270,11 +437,24 @@ class AETHierarchicalCollator:
             batch_window_duration_hours,
             batch_chunk_token_counts,
             batch_chunk_duration_hours,
+            batch_token_event_index,
+            batch_token_event_slot_ids,
+            batch_event_ids,
+            batch_event_times,
+            batch_event_vals,
+            batch_event_valmask,
+            batch_event_types,
+            batch_event_payloads,
+            batch_event_demographic_feature_ids,
+            batch_event_memory_rule_scores,
+            batch_event_memory_group_ids,
+            batch_event_memory_first_flags,
+            batch_event_memory_chronic_flags,
         )
         total_windows_base = max(1, int(semantic_windows_total))
-        total_subjects_base = max(1, int(len(batch_timelines)))
+        total_subjects_base = max(1, int(len(normalized_timelines)))
         out["overflow_stats"] = {
-            "subjects": int(len(batch_timelines)),
+            "subjects": int(len(normalized_timelines)),
             "subjects_with_overflow": int(subjects_with_overflow),
             "subjects_with_overflow_frac": float(subjects_with_overflow) / float(total_subjects_base),
             "semantic_windows_total": int(semantic_windows_total),
@@ -287,23 +467,124 @@ class AETHierarchicalCollator:
             "chunk_tokens_dropped_by_max_chunks": int(chunk_tokens_dropped_by_cap),
             "chunk_structural_tokens_dropped_by_max_chunks": int(chunk_structural_tokens_dropped_by_cap),
         }
+        out["subject_ids"] = torch.tensor(batch_subject_ids, dtype=torch.long)
+        out["trajectory_ords"] = torch.tensor(batch_trajectory_ords, dtype=torch.long)
         return out
 
-    def _split_special(self, timeline: List[EventToken]) -> tuple[List[EventToken], List[EventToken]]:
-        specials: List[EventToken] = []
-        events: List[EventToken] = []
-        for tok in timeline:
-            if tok.category_id == int(TokenCategory.SPECIAL):
-                specials.append(tok)
+    def _split_special(self, timeline: List[EventFrame]) -> tuple[List[EventFrame], List[EventFrame]]:
+        specials: List[EventFrame] = []
+        events: List[EventFrame] = []
+        for frame in timeline:
+            if int(frame.category_id) == int(TokenCategory.SPECIAL):
+                specials.append(frame)
             else:
-                events.append(tok)
+                events.append(frame)
         return specials, events
 
-    def _segment_into_windows(self, events: List[EventToken]) -> List[List[EventToken]]:
+    def _segment_into_windows(self, events: List[EventFrame]) -> List[List[EventToken]]:
         return [window.tokens for window in self._segment_windows(events)]
 
-    def _segment_windows(self, events: List[EventToken]) -> List[SegmentedWindow]:
-        return segment_event_tokens(events, config=self.segmentation)
+    def _segment_windows(self, events: List[EventFrame]) -> List[SegmentedWindow]:
+        return segment_event_tokens(flatten_event_frames(events, clone=False), config=self.segmentation)
+
+    def _consume_frames_for_token_budget(
+        self,
+        frames: List[EventFrame],
+        *,
+        token_count: int,
+    ) -> tuple[List[EventFrame], List[EventFrame]]:
+        need = max(0, int(token_count))
+        if need == 0:
+            return [], list(frames)
+
+        remaining = [clone_event_frame(frame) for frame in frames]
+        out: List[EventFrame] = []
+        while need > 0 and remaining:
+            frame = remaining.pop(0)
+            if frame.token_count <= need:
+                out.append(frame)
+                need -= int(frame.token_count)
+                continue
+
+            out.append(slice_event_frame(frame, start=0, stop=need))
+            remaining.insert(0, slice_event_frame(frame, start=need))
+            need = 0
+
+        if need != 0:
+            raise ValueError(
+                f"Unable to align frame bundles to token budget {int(token_count)}; {int(need)} tokens remain unassigned."
+            )
+        return out, remaining
+
+    def _align_frames_to_segmented_windows(
+        self,
+        events: List[EventFrame],
+        segmented_windows: List[SegmentedWindow],
+    ) -> List[List[EventFrame]]:
+        remaining = [clone_event_frame(frame) for frame in events]
+        out: List[List[EventFrame]] = []
+        for window in segmented_windows:
+            aligned, remaining = self._consume_frames_for_token_budget(
+                remaining,
+                token_count=len(window.tokens),
+            )
+            out.append(aligned)
+        return out
+
+    def _align_frames_to_chunked_windows(
+        self,
+        semantic_frame_windows: List[List[EventFrame]],
+        chunked_windows: List[SegmentedWindow],
+    ) -> List[List[List[EventFrame]]]:
+        out: List[List[List[EventFrame]]] = []
+        for frame_window, chunked_window in zip(semantic_frame_windows, chunked_windows):
+            remaining = [clone_event_frame(frame) for frame in frame_window]
+            window_chunks: List[List[EventFrame]] = []
+            for chunk in chunked_window.chunks:
+                aligned, remaining = self._consume_frames_for_token_budget(
+                    remaining,
+                    token_count=len(chunk.tokens),
+                )
+                window_chunks.append(aligned)
+            out.append(window_chunks)
+        return out
+
+    @staticmethod
+    def _extract_frame_numeric_scalar(frame: EventFrame) -> tuple[float, int]:
+        candidate_keys = ("z", "numeric_value", "value_as_number", "value")
+        for key in candidate_keys:
+            raw = (frame.num_attrs or {}).get(key)
+            if raw is None:
+                continue
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value):
+                return value, 1
+        return 0.0, 0
+
+    def _build_marker_frame(
+        self,
+        *,
+        token_id: int,
+        time_hours: float,
+        cat_attrs: Dict[str, int] | None = None,
+    ) -> EventFrame:
+        return build_event_frame(
+            [
+                EventToken(
+                    value_id=int(token_id),
+                    category_id=int(self.window_markers.marker_category),
+                    t_from_start_hours=float(time_hours),
+                    dt_from_prev_hours=0.0,
+                    cat_attrs=dict(cat_attrs or {}),
+                    num_attrs={},
+                )
+            ],
+            payload_kind=EventPayloadKind.SPECIAL,
+            semantic_label="window_marker",
+        )
 
     def _chunk_windows(
         self,
@@ -338,80 +619,125 @@ class AETHierarchicalCollator:
         chunk: SegmentedChunk,
         special_tokens: List[EventToken],
         *,
+        special_frames: List[EventFrame] | None = None,
+        chunk_frames: List[EventFrame] | None = None,
         w_type_id: int,
         w_start_abs: float,
         next_type_id: int | None,
         next_start_abs: float | None,
-    ) -> tuple[List[int], List[float], List[float], List[int], List[int], float, float]:
+        seen_memory_keys: set[str] | None = None,
+    ) -> PreparedChunk:
         if not chunk.tokens:
-            return [], [], [], [], [], float(w_start_abs), 0.0
+            return PreparedChunk(
+                ids=[],
+                times=[],
+                vals=[],
+                valmask=[],
+                types=[],
+                start_abs=float(w_start_abs),
+                start_offset=0.0,
+                token_event_index=[],
+                token_event_slot_ids=[],
+                event_ids=[],
+                event_times=[],
+                event_vals=[],
+                event_valmask=[],
+                event_types=[],
+                event_payloads=[],
+                event_demographic_feature_ids=[],
+                event_memory_rule_scores=[],
+                event_memory_group_ids=[],
+                event_memory_first_flags=[],
+                event_memory_chronic_flags=[],
+            )
 
         w_start_abs = float(w_start_abs)
         w_type_id = int(w_type_id)
         chunk_start_abs = float(chunk.start_time_hours)
         chunk_start_offset = max(0.0, chunk_start_abs - w_start_abs)
-
+        special_frames = (
+            [clone_event_frame(frame) for frame in special_frames]
+            if special_frames is not None
+            else ensure_event_frames(special_tokens, payload_kind=EventPayloadKind.SPECIAL)
+        )
+        chunk_frames = (
+            [clone_event_frame(frame) for frame in chunk_frames]
+            if chunk_frames is not None
+            else ensure_event_frames(chunk.tokens)
+        )
         prefix: List[EventToken] = list(special_tokens)
+        prefix_frames: List[EventFrame] = [clone_event_frame(frame) for frame in special_frames]
         suffix: List[EventToken] = []
+        suffix_frames: List[EventFrame] = []
         if self.window_markers.enabled:
             type_token_id = int(self.window_markers.type_token_offset) + int(w_type_id)
             end_token_id = self._window_end_token_id()
             end_mode = str(getattr(self.window_markers, "end_mode", "end_token"))
 
-            prefix.append(
-                EventToken(
-                    value_id=type_token_id,
-                    category_id=int(self.window_markers.marker_category),
-                    t_from_start_hours=chunk_start_abs,
-                    dt_from_prev_hours=0.0,
-                    cat_attrs={"window_type_id": int(w_type_id)},
-                    num_attrs={},
-                )
+            start_marker = self._build_marker_frame(
+                token_id=type_token_id,
+                time_hours=chunk_start_abs,
+                cat_attrs={"window_type_id": int(w_type_id)},
             )
+            prefix_frames.append(start_marker)
+            prefix.extend(start_marker.token_bundle)
             if not chunk.is_last_chunk:
-                suffix.append(
-                    EventToken(
-                        value_id=self._window_continue_token_id(),
-                        category_id=int(self.window_markers.marker_category),
-                        t_from_start_hours=float(chunk.tokens[-1].t_from_start_hours),
-                        dt_from_prev_hours=0.0,
-                        cat_attrs={"window_type_id": int(w_type_id), "chunk_continue": 1},
-                        num_attrs={},
-                    )
+                continue_marker = self._build_marker_frame(
+                    token_id=self._window_continue_token_id(),
+                    time_hours=float(chunk.tokens[-1].t_from_start_hours),
+                    cat_attrs={"window_type_id": int(w_type_id), "chunk_continue": 1},
                 )
+                suffix_frames.append(continue_marker)
+                suffix.extend(continue_marker.token_bundle)
             elif end_mode == "next_type" and next_type_id is not None:
                 next_type_id_int = self._clamp_window_type_id(int(next_type_id))
                 next_token_id = int(self.window_markers.type_token_offset) + int(next_type_id_int)
-                suffix.append(
-                    EventToken(
-                        value_id=next_token_id,
-                        category_id=int(self.window_markers.marker_category),
-                        t_from_start_hours=float(next_start_abs) if next_start_abs is not None else float(chunk.tokens[-1].t_from_start_hours),
-                        dt_from_prev_hours=0.0,
-                        cat_attrs={"window_type_id": int(next_type_id_int)},
-                        num_attrs={},
-                    )
+                next_marker = self._build_marker_frame(
+                    token_id=next_token_id,
+                    time_hours=(
+                        float(next_start_abs)
+                        if next_start_abs is not None
+                        else float(chunk.tokens[-1].t_from_start_hours)
+                    ),
+                    cat_attrs={"window_type_id": int(next_type_id_int)},
                 )
+                suffix_frames.append(next_marker)
+                suffix.extend(next_marker.token_bundle)
             else:
-                suffix.append(
-                    EventToken(
-                        value_id=end_token_id,
-                        category_id=int(self.window_markers.marker_category),
-                        t_from_start_hours=float(chunk.tokens[-1].t_from_start_hours),
-                        dt_from_prev_hours=0.0,
-                        cat_attrs={},
-                        num_attrs={},
-                    )
+                end_marker = self._build_marker_frame(
+                    token_id=end_token_id,
+                    time_hours=float(chunk.tokens[-1].t_from_start_hours),
                 )
+                suffix_frames.append(end_marker)
+                suffix.extend(end_marker.token_bundle)
 
         budget = max(0, int(self.max_len) - len(prefix) - len(suffix))
         seq: List[EventToken] = prefix + chunk.tokens[:budget] + suffix
+        seq_frames: List[EventFrame] = (
+            prefix_frames
+            + [clone_event_frame(frame) for frame in chunk_frames]
+            + suffix_frames
+        )
 
         ids: List[int] = []
         times: List[float] = []
         vals: List[float] = []
         val_mask: List[int] = []
         types: List[int] = []
+        token_event_index: List[int] = []
+        token_event_slot_ids: List[int] = []
+        event_ids: List[int] = []
+        event_times: List[float] = []
+        event_vals: List[float] = []
+        event_valmask: List[int] = []
+        event_types: List[int] = []
+        event_payloads: List[int] = []
+        event_demographic_feature_ids: List[int] = []
+        event_memory_rule_scores: List[float] = []
+        event_memory_group_ids: List[int] = []
+        event_memory_first_flags: List[int] = []
+        event_memory_chronic_flags: List[int] = []
+        seen_exact_keys = seen_memory_keys if seen_memory_keys is not None else set()
 
         for tok in seq:
             ids.append(int(tok.value_id))
@@ -429,7 +755,7 @@ class AETHierarchicalCollator:
                     pass
             vals.append(safe_val)
             val_mask.append(1 if has_val else 0)
-            if tok in special_tokens:
+            if len(times) < len(prefix):
                 times.append(0.0)
             else:
                 rel_t = max(0.0, float(tok.t_from_start_hours) - chunk_start_abs)
@@ -437,7 +763,68 @@ class AETHierarchicalCollator:
                     rel_t = 0.0
                 times.append(rel_t)
 
-        return ids, times, vals, val_mask, types, float(chunk_start_abs), float(chunk_start_offset)
+        for event_idx, frame in enumerate(seq_frames):
+            event_ids.append(int(frame.token_bundle[0].value_id))
+            event_types.append(int(frame.category_id))
+            event_payloads.append(payload_kind_to_id(frame.payload_kind))
+            frame_cat_attrs = dict(frame.cat_attrs or {})
+            demographic_feature_id = 0
+            if int(frame.category_id) == int(TokenCategory.SPECIAL):
+                if int(frame_cat_attrs.get("global_demographic", 0)) != 0:
+                    demographic_feature_id = int(
+                        frame_cat_attrs.get("demographic_feature_id", 0) or 0
+                    )
+            event_demographic_feature_ids.append(int(demographic_feature_id))
+            scalar, scalar_mask = self._extract_frame_numeric_scalar(frame)
+            event_vals.append(float(scalar))
+            event_valmask.append(int(scalar_mask))
+            memory_rule = classify_event_frame_for_memory(
+                frame=frame,
+                seen_exact_keys=seen_exact_keys,
+            )
+            event_memory_rule_scores.append(float(memory_rule.rule_score))
+            event_memory_group_ids.append(int(memory_rule.group_id))
+            event_memory_first_flags.append(int(memory_rule.first_occurrence))
+            event_memory_chronic_flags.append(int(memory_rule.chronic_flag))
+            if event_idx < len(prefix_frames):
+                event_times.append(0.0)
+            else:
+                rel_event_time = max(0.0, float(frame.t_from_start_hours) - chunk_start_abs)
+                if not math.isfinite(rel_event_time):
+                    rel_event_time = 0.0
+                event_times.append(rel_event_time)
+            for slot_idx, _ in enumerate(frame.token_bundle):
+                token_event_index.append(int(event_idx))
+                token_event_slot_ids.append(int(slot_idx))
+            update_seen_memory_keys(seen_exact_keys, frame)
+
+        if len(token_event_index) != len(seq):
+            raise ValueError(
+                "Chunk event alignment mismatch: token-event map length does not match token sequence length."
+            )
+
+        return PreparedChunk(
+            ids=ids,
+            times=times,
+            vals=vals,
+            valmask=val_mask,
+            types=types,
+            start_abs=float(chunk_start_abs),
+            start_offset=float(chunk_start_offset),
+            token_event_index=token_event_index,
+            token_event_slot_ids=token_event_slot_ids,
+            event_ids=event_ids,
+            event_times=event_times,
+            event_vals=event_vals,
+            event_valmask=event_valmask,
+            event_types=event_types,
+            event_payloads=event_payloads,
+            event_demographic_feature_ids=event_demographic_feature_ids,
+            event_memory_rule_scores=event_memory_rule_scores,
+            event_memory_group_ids=event_memory_group_ids,
+            event_memory_first_flags=event_memory_first_flags,
+            event_memory_chronic_flags=event_memory_chronic_flags,
+        )
 
     def _process_window(
         self,
@@ -460,15 +847,25 @@ class AETHierarchicalCollator:
             is_first_chunk=True,
             is_last_chunk=True,
         )
-        ids, times, vals, valmask, types, _, _ = self._process_chunk(
+        prepared = self._process_chunk(
             pseudo_chunk,
-            special_tokens,
+            special_tokens=special_tokens,
+            special_frames=ensure_event_frames(special_tokens, payload_kind=EventPayloadKind.SPECIAL),
+            chunk_frames=ensure_event_frames(window_tokens),
             w_type_id=w_type_id,
             w_start_abs=w_start_abs,
             next_type_id=next_type_id,
             next_start_abs=next_start_abs,
         )
-        return ids, times, vals, valmask, types, int(w_type_id), float(w_start_abs)
+        return (
+            prepared.ids,
+            prepared.times,
+            prepared.vals,
+            prepared.valmask,
+            prepared.types,
+            int(w_type_id),
+            float(w_start_abs),
+        )
 
     def _infer_window_type_id(self, window_tokens: List[EventToken]) -> int:
         """
@@ -520,11 +917,25 @@ class AETHierarchicalCollator:
         batch_window_duration_hours: List[List[float]],
         batch_chunk_token_counts: List[List[List[float]]],
         batch_chunk_duration_hours: List[List[List[float]]],
+        batch_token_event_index: List[List[List[List[int]]]],
+        batch_token_event_slot_ids: List[List[List[List[int]]]],
+        batch_event_ids: List[List[List[List[int]]]],
+        batch_event_times: List[List[List[List[float]]]],
+        batch_event_vals: List[List[List[List[float]]]],
+        batch_event_valmask: List[List[List[List[int]]]],
+        batch_event_types: List[List[List[List[int]]]],
+        batch_event_payloads: List[List[List[List[int]]]],
+        batch_event_demographic_feature_ids: List[List[List[List[int]]]],
+        batch_event_memory_rule_scores: List[List[List[List[float]]]],
+        batch_event_memory_group_ids: List[List[List[List[int]]]],
+        batch_event_memory_first_flags: List[List[List[List[int]]]],
+        batch_event_memory_chronic_flags: List[List[List[List[int]]]],
     ) -> Dict[str, Any]:
         B = len(batch_ids)
         W = max((len(x) for x in batch_ids), default=0)
         C = max((len(chunks) for subj in batch_ids for chunks in subj), default=0)
         L = self.max_len
+        E = max((len(events) for subj in batch_event_times for win in subj for events in win), default=0)
 
         input_ids = torch.full((B, W, C, L), self.pad_id, dtype=torch.long)
         time_ids = torch.zeros((B, W, C, L), dtype=torch.float)
@@ -543,6 +954,20 @@ class AETHierarchicalCollator:
         semantic_duration_hours = torch.zeros((B, W), dtype=torch.float)
         chunk_token_counts = torch.zeros((B, W, C), dtype=torch.float)
         chunk_duration_hours = torch.zeros((B, W, C), dtype=torch.float)
+        token_event_index = torch.full((B, W, C, L), fill_value=-1, dtype=torch.long)
+        token_event_slot_ids = torch.zeros((B, W, C, L), dtype=torch.long)
+        event_input_ids = torch.full((B, W, C, E), self.pad_id, dtype=torch.long)
+        event_time_ids = torch.zeros((B, W, C, E), dtype=torch.float)
+        event_numeric_values = torch.zeros((B, W, C, E, 1), dtype=torch.float)
+        event_numeric_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_type_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_payload_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_demographic_feature_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_attention_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_memory_rule_scores = torch.zeros((B, W, C, E), dtype=torch.float)
+        event_memory_group_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_memory_first_flags = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_memory_chronic_flags = torch.zeros((B, W, C, E), dtype=torch.long)
 
         for b in range(B):
             for w in range(len(batch_ids[b])):
@@ -563,7 +988,21 @@ class AETHierarchicalCollator:
                     types = batch_types[b][w][c]
                     mask = batch_masks[b][w][c]
                     valmask = batch_valmask[b][w][c]
+                    tok_to_event = batch_token_event_index[b][w][c]
+                    tok_event_slots = batch_token_event_slot_ids[b][w][c]
+                    event_ids = batch_event_ids[b][w][c]
+                    event_times = batch_event_times[b][w][c]
+                    event_vals = batch_event_vals[b][w][c]
+                    event_valmask = batch_event_valmask[b][w][c]
+                    event_types = batch_event_types[b][w][c]
+                    event_payloads = batch_event_payloads[b][w][c]
+                    event_demographic_features = batch_event_demographic_feature_ids[b][w][c]
+                    event_memory_scores = batch_event_memory_rule_scores[b][w][c]
+                    event_memory_groups = batch_event_memory_group_ids[b][w][c]
+                    event_memory_first = batch_event_memory_first_flags[b][w][c]
+                    event_memory_chronic = batch_event_memory_chronic_flags[b][w][c]
                     seq_len = min(len(ids), L)
+                    event_len = min(len(event_times), E)
                     chunk_mask[b, w, c] = 1
 
                     input_ids[b, w, c, :seq_len] = torch.tensor(ids[:seq_len], dtype=torch.long)
@@ -574,6 +1013,44 @@ class AETHierarchicalCollator:
                     val_slice = torch.tensor(vals[:seq_len], dtype=torch.float).unsqueeze(-1)
                     numeric_values[b, w, c, :seq_len, :] = val_slice
                     numeric_mask[b, w, c, :seq_len] = torch.tensor(valmask[:seq_len], dtype=torch.long)
+                    token_event_index[b, w, c, :seq_len] = torch.tensor(tok_to_event[:seq_len], dtype=torch.long)
+                    token_event_slot_ids[b, w, c, :seq_len] = torch.tensor(tok_event_slots[:seq_len], dtype=torch.long)
+                    if event_len > 0:
+                        event_input_ids[b, w, c, :event_len] = torch.tensor(event_ids[:event_len], dtype=torch.long)
+                        event_time_ids[b, w, c, :event_len] = torch.tensor(event_times[:event_len], dtype=torch.float)
+                        event_numeric_values[b, w, c, :event_len, :] = (
+                            torch.tensor(event_vals[:event_len], dtype=torch.float).unsqueeze(-1)
+                        )
+                        event_numeric_mask[b, w, c, :event_len] = torch.tensor(
+                            event_valmask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_type_ids[b, w, c, :event_len] = torch.tensor(event_types[:event_len], dtype=torch.long)
+                        event_payload_ids[b, w, c, :event_len] = torch.tensor(
+                            event_payloads[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_demographic_feature_ids[b, w, c, :event_len] = torch.tensor(
+                            event_demographic_features[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_attention_mask[b, w, c, :event_len] = 1
+                        event_memory_rule_scores[b, w, c, :event_len] = torch.tensor(
+                            event_memory_scores[:event_len],
+                            dtype=torch.float,
+                        )
+                        event_memory_group_ids[b, w, c, :event_len] = torch.tensor(
+                            event_memory_groups[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_memory_first_flags[b, w, c, :event_len] = torch.tensor(
+                            event_memory_first[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_memory_chronic_flags[b, w, c, :event_len] = torch.tensor(
+                            event_memory_chronic[:event_len],
+                            dtype=torch.long,
+                        )
 
                     if b < len(batch_chunk_start_offsets) and w < len(batch_chunk_start_offsets[b]) and c < len(batch_chunk_start_offsets[b][w]):
                         chunk_start_offsets[b, w, c] = float(batch_chunk_start_offsets[b][w][c])
@@ -587,12 +1064,17 @@ class AETHierarchicalCollator:
                         chunk_duration_hours[b, w, c] = float(batch_chunk_duration_hours[b][w][c])
 
         input_ids_out = input_ids
+        event_input_ids_out = event_input_ids
         remap_stats: Dict[str, Any] | None = None
         input_ids_global = input_ids.clone() if self.emit_global_input_ids else None
         if self.id_remapper is not None:
             input_ids_out, remap_stats = self.id_remapper.map_tensor(
                 input_ids,
                 valid_mask=attention_mask,
+            )
+            event_input_ids_out, _ = self.id_remapper.map_tensor(
+                event_input_ids,
+                valid_mask=event_attention_mask,
             )
 
         out: Dict[str, Any] = {
@@ -613,6 +1095,20 @@ class AETHierarchicalCollator:
             "semantic_duration_hours": semantic_duration_hours,
             "chunk_token_counts": chunk_token_counts,
             "chunk_duration_hours": chunk_duration_hours,
+            "token_event_index": token_event_index,
+            "token_event_slot_ids": token_event_slot_ids,
+            "event_input_ids": event_input_ids_out,
+            "event_time_ids": event_time_ids,
+            "event_numeric_values": event_numeric_values,
+            "event_numeric_mask": event_numeric_mask,
+            "event_type_ids": event_type_ids,
+            "event_payload_ids": event_payload_ids,
+            "event_demographic_feature_ids": event_demographic_feature_ids,
+            "event_attention_mask": event_attention_mask,
+            "event_memory_rule_scores": event_memory_rule_scores,
+            "event_memory_group_ids": event_memory_group_ids,
+            "event_memory_first_flags": event_memory_first_flags,
+            "event_memory_chronic_flags": event_memory_chronic_flags,
         }
         if input_ids_global is not None:
             out["input_ids_global"] = input_ids_global

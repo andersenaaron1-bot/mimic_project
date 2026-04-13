@@ -1,0 +1,224 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1960" height="1380" viewBox="0 0 1960 1380">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #0f172a; }
+      .section { font: 700 22px Arial, sans-serif; fill: #0f172a; }
+      .boxhead { font: 700 17px Arial, sans-serif; fill: #0f172a; }
+      .body { font: 14px Arial, sans-serif; fill: #1e293b; }
+      .small { font: 13px Arial, sans-serif; fill: #334155; }
+      .label { font: 600 13px Arial, sans-serif; fill: #475569; }
+      .panel { stroke: #94a3b8; stroke-width: 2; rx: 16; ry: 16; }
+      .box { stroke: #64748b; stroke-width: 2; rx: 14; ry: 14; }
+      .arrow { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 8 6; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1960" height="1380" fill="#f8fafc"/>
+  <text x="50" y="48" class="title">Transformer Directory Architecture Map</text>
+
+  <rect x="35" y="75" width="360" height="1220" fill="#e0f2fe" class="panel"/>
+  <text x="55" y="110" class="section">Input / Support Surface</text>
+
+  <rect x="60" y="145" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="170" class="boxhead">collator.py</text>
+  <text x="80" y="196" class="body">AETHierarchicalCollator</text>
+  <text x="80" y="218" class="body">Builds local token lane, event lane,</text>
+  <text x="80" y="240" class="body">window metadata, memory-rule metadata,</text>
+  <text x="80" y="262" class="body">subject_ids and trajectory_ords.</text>
+
+  <rect x="60" y="295" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="320" class="boxhead">world_model_contract.py</text>
+  <text x="80" y="346" class="body">Canonical long-range objects:</text>
+  <text x="80" y="368" class="body">- WindowStatePacket</text>
+  <text x="80" y="390" class="body">- NextWindowHeader</text>
+  <text x="80" y="412" class="body">- PrecedentIndexItem / Store / Readouts</text>
+
+  <rect x="60" y="445" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="470" class="boxhead">vocab_runtime.py</text>
+  <text x="80" y="496" class="body">Compact dense/runtime vocabulary and</text>
+  <text x="80" y="518" class="body">token remapping used by precompile,</text>
+  <text x="80" y="540" class="body">training, and evaluation.</text>
+
+  <rect x="60" y="595" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="620" class="boxhead">memory_rules.py</text>
+  <text x="80" y="646" class="body">Rule priors for exact patient memory:</text>
+  <text x="80" y="668" class="body">structural, chronic, first occurrence,</text>
+  <text x="80" y="690" class="body">extreme measurement salience.</text>
+
+  <rect x="60" y="745" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="770" class="boxhead">heads.py</text>
+  <text x="80" y="796" class="body">AETOutputHeads and AETPrecedentHeads.</text>
+  <text x="80" y="818" class="body">Projects to token/event heads and the</text>
+  <text x="80" y="840" class="body">learned precedent query/key/future space.</text>
+
+  <rect x="60" y="895" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="920" class="boxhead">loss.py</text>
+  <text x="80" y="946" class="body">AETLossModule:</text>
+  <text x="80" y="968" class="body">- marked event losses</text>
+  <text x="80" y="990" class="body">- next-window type/gap/duration/support</text>
+  <text x="80" y="1012" class="body">- precedent phase 4 retrieval losses</text>
+
+  <rect x="60" y="1045" width="310" height="120" fill="#ffffff" class="box"/>
+  <text x="80" y="1070" class="boxhead">generation.py</text>
+  <text x="80" y="1096" class="body">Generation / rollout utilities.</text>
+  <text x="80" y="1118" class="body">This remains lighter than the main</text>
+  <text x="80" y="1140" class="body">forward path and will matter more as</text>
+  <text x="80" y="1162" class="body">multi-step rollout evaluation expands.</text>
+
+  <rect x="440" y="75" width="920" height="520" fill="#dcfce7" class="panel"/>
+  <text x="460" y="110" class="section">AdaptiveEpisodicTransformer Core (model.py)</text>
+
+  <rect x="470" y="150" width="190" height="120" fill="#ffffff" class="box"/>
+  <text x="490" y="175" class="boxhead">embeddings.py</text>
+  <text x="490" y="201" class="body">AETEmbeddings</text>
+  <text x="490" y="223" class="body">Optional MultiScaleTimeEmbedding</text>
+  <text x="490" y="245" class="body">Numeric/type-aware token embeddings</text>
+
+  <rect x="710" y="150" width="210" height="120" fill="#ffffff" class="box"/>
+  <text x="730" y="175" class="boxhead">event_composer.py</text>
+  <text x="730" y="201" class="body">AETEventComposer</text>
+  <text x="730" y="223" class="body">Fuses bundle tokens into event states</text>
+  <text x="730" y="245" class="body">and can scatter back to token space</text>
+
+  <rect x="970" y="150" width="210" height="120" fill="#ffffff" class="box"/>
+  <text x="990" y="175" class="boxhead">encoder.py</text>
+  <text x="990" y="201" class="body">AETLocalEncoder</text>
+  <text x="990" y="223" class="body">Local causal attention inside chunks</text>
+  <text x="990" y="245" class="body">with chunk summaries as output</text>
+
+  <rect x="1230" y="150" width="100" height="120" fill="#ffffff" class="box"/>
+  <text x="1248" y="175" class="boxhead">...</text>
+  <text x="1245" y="201" class="body">token</text>
+  <text x="1241" y="223" class="body">scatter /</text>
+  <text x="1243" y="245" class="body">masks</text>
+
+  <rect x="540" y="325" width="300" height="145" fill="#ffffff" class="box"/>
+  <text x="560" y="350" class="boxhead">aggregator.py</text>
+  <text x="560" y="376" class="body">AETIntraWindowAggregator</text>
+  <text x="560" y="398" class="body">Builds chunk states and semantic summaries</text>
+  <text x="560" y="424" class="body">AETWindowStatePacketBuilder</text>
+  <text x="560" y="446" class="body">Emits slot tokens, query token, write tokens,</text>
+  <text x="560" y="468" class="body">window start/duration/gap metadata</text>
+
+  <rect x="900" y="325" width="390" height="145" fill="#ffffff" class="box"/>
+  <text x="920" y="350" class="boxhead">global_state.py</text>
+  <text x="920" y="376" class="body">AETLatentHealthState</text>
+  <text x="920" y="398" class="body">Current adapter baseline for the frozen latent contract:</text>
+  <text x="920" y="420" class="body">window-stepped, gap-aware, used for z_query / z_local / z_heads</text>
+  <text x="920" y="446" class="body">Target family remains multi-slot jump-plus-drift</text>
+
+  <line x1="660" y1="210" x2="710" y2="210" class="arrow"/>
+  <line x1="920" y1="210" x2="970" y2="210" class="arrow"/>
+  <line x1="1075" y1="270" x2="1075" y2="325" class="arrow"/>
+  <line x1="1180" y1="210" x2="1230" y2="210" class="arrow"/>
+  <line x1="825" y1="270" x2="690" y2="325" class="arrow"/>
+
+  <rect x="440" y="625" width="920" height="360" fill="#fef3c7" class="panel"/>
+  <text x="460" y="660" class="section">Long-Range Memory and Decoder Conditioning</text>
+
+  <rect x="470" y="700" width="300" height="170" fill="#ffffff" class="box"/>
+  <text x="490" y="725" class="boxhead">episodic_memory.py</text>
+  <text x="490" y="751" class="body">AETEpisodicMemory + PatientMemoryState</text>
+  <text x="490" y="773" class="body">Three banks:</text>
+  <text x="490" y="795" class="body">- static</text>
+  <text x="490" y="817" class="body">- persistent</text>
+  <text x="490" y="839" class="body">- episodic</text>
+  <text x="490" y="861" class="body">Reads exact facts and writes event-exact memory</text>
+
+  <rect x="820" y="700" width="250" height="170" fill="#ffffff" class="box"/>
+  <text x="840" y="725" class="boxhead">Boundary Query Readout</text>
+  <text x="840" y="751" class="body">packet.query_token</text>
+  <text x="840" y="773" class="body">+ latent z_query</text>
+  <text x="840" y="795" class="body">+ persistent-memory digest</text>
+  <text x="840" y="817" class="body">+ window/gap/duration/support metadata</text>
+  <text x="840" y="843" class="body">forms the predictive-state retrieval key</text>
+
+  <rect x="1120" y="700" width="300" height="170" fill="#ffffff" class="box"/>
+  <text x="1140" y="725" class="boxhead">precedent_memory.py</text>
+  <text x="1140" y="751" class="body">AETPrecedentMemory</text>
+  <text x="1140" y="773" class="body">- boundary prior query</text>
+  <text x="1140" y="795" class="body">- header-conditioned generation prompt query</text>
+  <text x="1140" y="817" class="body">- reads offline PrecedentIndexStore</text>
+  <text x="1140" y="839" class="body">- returns future summaries and prompt tokens</text>
+
+  <rect x="470" y="895" width="300" height="70" fill="#ffffff" class="box"/>
+  <text x="490" y="920" class="boxhead">Patient Memory Context</text>
+  <text x="490" y="946" class="body">Exact tokens / summaries fused into local decoding</text>
+
+  <rect x="820" y="895" width="250" height="70" fill="#ffffff" class="box"/>
+  <text x="840" y="920" class="boxhead">NextWindowHeader</text>
+  <text x="840" y="946" class="body">type + gap + duration + support profile</text>
+
+  <rect x="1120" y="895" width="300" height="70" fill="#ffffff" class="box"/>
+  <text x="1140" y="920" class="boxhead">Precedent Prompt Context</text>
+  <text x="1140" y="946" class="body">Analogical future guidance for next-window generation</text>
+
+  <line x1="1075" y1="470" x2="1075" y2="700" class="arrow"/>
+  <line x1="690" y1="470" x2="620" y2="700" class="arrow"/>
+  <line x1="900" y1="470" x2="945" y2="700" class="arrow"/>
+  <line x1="770" y1="785" x2="820" y2="785" class="arrow"/>
+  <line x1="1070" y1="785" x2="1120" y2="785" class="arrow"/>
+  <line x1="945" y1="870" x2="945" y2="895" class="arrow"/>
+
+  <rect x="1410" y="75" width="515" height="600" fill="#fde68a" class="panel"/>
+  <text x="1430" y="110" class="section">Offline Precedent Infrastructure</text>
+
+  <rect x="1440" y="150" width="455" height="140" fill="#ffffff" class="box"/>
+  <text x="1460" y="175" class="boxhead">scripts/build_precedent_index.py</text>
+  <text x="1460" y="201" class="body">Replays a checkpoint over precompiled trajectories and writes one item per semantic-window boundary.</text>
+  <text x="1460" y="223" class="body">Exports:</text>
+  <text x="1460" y="245" class="body">key_state, key_packet, key_memory, h1/h2/h3 future summaries, future_prefix_prompt, snippet refs</text>
+  <text x="1460" y="267" class="body">Used by both training and inference-time precedent retrieval.</text>
+
+  <rect x="1440" y="325" width="455" height="160" fill="#ffffff" class="box"/>
+  <text x="1460" y="350" class="boxhead">PrecedentIndexStore Layout</text>
+  <text x="1460" y="376" class="body">- dense key matrix over boundary states</text>
+  <text x="1460" y="398" class="body">- support flags and anchor metadata</text>
+  <text x="1460" y="420" class="body">- compact h1/h2/h3 future summaries</text>
+  <text x="1460" y="442" class="body">- future_prefix_prompt tokens</text>
+  <text x="1460" y="464" class="body">- optional exact continuation snippet references</text>
+
+  <rect x="1440" y="520" width="455" height="120" fill="#ffffff" class="box"/>
+  <text x="1460" y="545" class="boxhead">Phase 4 Retrieval Training</text>
+  <text x="1460" y="571" class="body">Learns a future-aware predictive-state similarity space:</text>
+  <text x="1460" y="593" class="body">query head, key projector, future-summary projector, contrastive and anchor losses</text>
+  <text x="1460" y="615" class="body">without changing the offline store contract</text>
+
+  <rect x="1410" y="705" width="515" height="590" fill="#fee2e2" class="panel"/>
+  <text x="1430" y="740" class="section">Decoder, Training, and Evaluation Surface</text>
+
+  <rect x="1440" y="780" width="455" height="150" fill="#ffffff" class="box"/>
+  <text x="1460" y="805" class="boxhead">model.py fusion path</text>
+  <text x="1460" y="831" class="body">Local hidden states are conditioned by:</text>
+  <text x="1460" y="853" class="body">- shifted latent context</text>
+  <text x="1460" y="875" class="body">- patient-memory context</text>
+  <text x="1460" y="897" class="body">- precedent prompt cross-attention</text>
+  <text x="1460" y="919" class="body">- shifted chunk context</text>
+
+  <rect x="1440" y="965" width="455" height="140" fill="#ffffff" class="box"/>
+  <text x="1460" y="990" class="boxhead">Output Projection</text>
+  <text x="1460" y="1016" class="body">AETOutputHeads plus additional scalar heads in model.py:</text>
+  <text x="1460" y="1038" class="body">event heads, token head, transition heads, next-window heads,</text>
+  <text x="1460" y="1060" class="body">event value head, event dt head, precedent query outputs</text>
+
+  <rect x="1440" y="1140" width="455" height="120" fill="#ffffff" class="box"/>
+  <text x="1460" y="1165" class="boxhead">Training / Evaluation Entry Points</text>
+  <text x="1460" y="1191" class="body">- scripts/train_transformer_v1.py</text>
+  <text x="1460" y="1213" class="body">- scripts/rollout_transformer_v1.py</text>
+  <text x="1460" y="1235" class="body">- ablations over latent / patient / precedent / dual-memory</text>
+
+  <line x1="1420" y1="785" x2="1440" y2="785" class="arrow"/>
+  <line x1="945" y1="965" x2="1440" y2="855" class="arrow"/>
+  <line x1="1285" y1="965" x2="1440" y2="855" class="arrow"/>
+  <line x1="1680" y1="675" x2="1680" y2="705" class="arrow"/>
+  <line x1="1670" y1="930" x2="1670" y2="965" class="arrow"/>
+  <line x1="1670" y1="1105" x2="1670" y2="1140" class="arrow"/>
+
+  <text x="525" y="1015" class="label">exact personalized memory</text>
+  <text x="1165" y="1015" class="label">analogical future memory</text>
+  <text x="935" y="1000" class="label">header bridge</text>
+</svg>

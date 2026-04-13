@@ -1,0 +1,523 @@
+\documentclass[11pt]{article}
+
+\usepackage[margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{hyperref}
+\usepackage{amsmath}
+
+\title{Outline: A Dual-Memory Patient World Model for Generative EHR}
+\author{Project Working Draft}
+\date{Last updated: 2026-04-12}
+
+\begin{document}
+\maketitle
+
+\section{Status and Scope}
+
+This file is a living manuscript scaffold for the repository's v2 line. It is
+not a polished paper draft. Its purpose is to keep the implementation,
+literature positioning, and scientific claim aligned while the codebase is
+refactored toward a stronger conceptual contribution.
+
+The active thesis is no longer ``hierarchical EHR transformer with better long
+memory.'' The active thesis is a \textbf{dual-memory patient world model}:
+\begin{itemize}
+    \item typed fused events rather than raw token bundles
+    \item marked time-to-event training rather than plain token prediction
+    \item a compressive latent health state for current condition
+    \item exact patient-internal memory for facts that should not be compressed away
+    \item cohort-external precedent memory for analogous prior states and futures
+    \item intervention-conditioned prospective rollout
+\end{itemize}
+
+\section{Working Title Options}
+
+\begin{itemize}
+    \item A Dual-Memory Patient World Model for Generative Electronic Health Records
+    \item Generative EHR with Predictive-State Retrieval, Exact Patient Memory, and Marked Event Modeling
+    \item A Typed Dual-Memory World Model for Longitudinal EHR Simulation
+\end{itemize}
+
+\section{One-Paragraph Thesis}
+
+Electronic health records combine heterogeneous symbolic events, continuous
+measurements, explicit care-regime transitions, and irregular timing over long,
+multi-admission trajectories. Existing models typically flatten these records
+into token or event streams and rely on one compressed context to summarize the
+patient history. We instead propose a dual-memory patient world model for
+structured EHR. Local attention operates over typed fused events inside semantic
+care windows; a global latent health state represents current condition and
+transition hazard; a patient-internal exact memory retains sparse personalized
+facts that should not be compressed; and a cohort-external precedent memory
+retrieves similar prior states together with their observed future
+continuations. Training centers on marked time-to-event generation and
+intervention-conditioned rollout. The intended contribution is not simply a new
+backbone or tokenizer, but a reconceptualization of EHR generation as
+\emph{state-based patient simulation} with both exact memory and analogical
+future retrieval.
+
+\section{Primary Claim Hierarchy}
+
+\subsection{Primary claim}
+
+\begin{quote}
+Generative EHR modeling benefits from separating compressive state,
+patient-specific exact memory, and cohort-level precedent memory, rather than
+forcing all long-range information into either a single latent state or a long
+token prefix.
+\end{quote}
+
+\subsection{Secondary claims}
+
+\begin{itemize}
+    \item EHR sequence modeling should compare patients by predictive clinical state, not only by token-prefix similarity.
+    \item Numeric measurements should be modeled as continuous marks, not merely as extra tokens.
+    \item Structural care transitions should be explicit modeling objects and natural window boundaries.
+    \item Intervention-conditioned rollout is a more appropriate generative framing for clinical forecasting than unconstrained next-token continuation.
+\end{itemize}
+
+\subsection{Claims to avoid}
+
+\begin{itemize}
+    \item Do not claim that memory-augmented sequence modeling is new in general machine learning.
+    \item Do not claim that retrieval by itself implies causal counterfactual validity.
+    \item Do not claim that a richer recurrent block alone is the contribution.
+    \item Do not claim a universal tokenizer for all EHR modalities.
+\end{itemize}
+
+\section{Central Reconceptualization}
+
+The key reframing is:
+\begin{quote}
+EHR generation should operate on \emph{predictive clinical state}, not merely
+on a tokenized prefix of observed history.
+\end{quote}
+
+The practical implication is that two patient histories may differ substantially
+in observed token space while still being close in state space if they imply
+similar distributions over plausible short- and medium-horizon futures under
+similar intervention context.
+
+This motivates three distinct state-bearing mechanisms:
+\begin{itemize}
+    \item a latent state for compressive current condition
+    \item an internal exact memory for personalized facts
+    \item an external precedent memory for analogical future support
+\end{itemize}
+
+This is the central scientific move. The target system is therefore not just a
+forecaster, but a \emph{patient world model}. The closest formal intuition is a
+predictive-state representation: boundary states should be compared by the
+future behavior they imply, not only by how similar their past token prefixes
+looked \cite{littman2001psr}.
+
+\section{Novelty Positioning}
+
+As of 2026-04-12, none of the following ingredients are novel in isolation:
+\begin{itemize}
+    \item continuous-time latent dynamics for irregular medical or event sequences
+    \item attention-based or marked temporal point-process modeling
+    \item explicit memory modules in general sequence modeling
+    \item retrieval over large medical histories for discriminative prediction
+\end{itemize}
+
+The novelty should instead be framed as the combination:
+\begin{itemize}
+    \item typed fused EHR events with marked generative training
+    \item semantic care-window hierarchy
+    \item a compressive latent health state for current condition
+    \item patient-internal exact memory for sparse personalized facts
+    \item cohort-external precedent retrieval over predictive clinical state
+    \item intervention-conditioned prospective rollout
+\end{itemize}
+
+The paper should explicitly state that memory-augmented generation is known in
+general sequence modeling \cite{rae2020compressive,wu2022memorizing,bulatov2022rmt,borgeaud2022retro,behrouz2025titans},
+and that retrieval over very long EHR histories is already useful in
+discriminative settings \cite{kim2024remed}. The contribution is the
+\emph{EHR-specific world-model decomposition} and the generative use of two
+memory systems with a typed marked objective.
+
+\section{Related Work Map}
+
+\subsection{Hierarchical and long-context EHR models}
+
+Hierarchical EHR transformers established that visit-level structure matters
+when raw patient history exceeds the effective receptive field of a flat model
+\cite{li2021hibehrt,odgaard2024corebehrt}. Linear-time EHR foundation models
+such as EHRMamba strengthen the long-context baseline but still rely on a
+single compressed state path rather than an explicit exact-memory mechanism
+\cite{fallahpour2025ehrmamba}.
+
+\subsection{Continuous-time latent modeling in health}
+
+Latent ODEs established continuous-time latent dynamics for irregularly sampled
+data \cite{rubanova2019latentode}. In health-specific settings, MIRA uses Neural
+ODE extrapolation for medical time-series forecasting \cite{li2025mira}, while
+TrajSurv learns continuous latent trajectories for survival modeling
+\cite{zeng2025trajsurv}. These works motivate continuous or hybrid latent
+dynamics, but they do not provide the dual-memory generative formulation.
+
+\subsection{Marked event modeling}
+
+Neural temporal point processes already provide a more faithful framework for
+irregular event modeling than plain next-token prediction
+\cite{enguehard2020ehrtpp,song2024dmtpp,liu2026nextpp}. ORA makes the
+EHR-specific argument that pretraining should jointly model timing and marks
+rather than rely on language-style token loss \cite{jing2026ora}. This project
+inherits that objective stance.
+
+\subsection{Memory-augmented sequence modeling}
+
+General long-range sequence modeling has moved toward explicit memory:
+compressed memory \cite{rae2020compressive}, non-differentiable exact memory
+\cite{wu2022memorizing}, recurrent memory tokens \cite{bulatov2022rmt},
+retrieval-augmented generation \cite{borgeaud2022retro}, and test-time memory
+systems that separate long-term memory from attention
+\cite{behrouz2025titans}. PromptTPP further shows that event-sequence models can
+benefit from streaming retrieval without retraining \cite{xue2023prompttpp}.
+
+\subsection{Retrieval in clinical and time-series modeling}
+
+REMed demonstrates that near-infinite EHR history retrieval is powerful for
+clinical prediction \cite{kim2024remed}. RAFT shows that retrieval of analogous
+historical futures can improve forecasting in general time series
+\cite{han2025raft}. These are especially relevant to the precedent-memory idea:
+the value is not only remembering the current patient, but also retrieving what
+happened to similar prior states.
+
+\subsection{Clinical rollout and intervention modeling}
+
+G-Transformer is a key antecedent for intervention-conditioned patient rollout
+\cite{xiong2024gtransformer}. The present project should borrow the idea of
+simulation under treatment regimes while staying conservative about causal
+claims. Without stronger causal assumptions, the correct phrasing is
+\emph{intervention-conditioned prospective rollout}, not unrestricted
+counterfactual inference.
+
+\subsection{Generative EHR baselines}
+
+POPCORN is an important generative EHR point-process baseline
+\cite{bhave2021popcorn}. It helps anchor the claim that the project is not
+simply ``doing generative EHR for the first time,'' but rather proposing a
+different generative factorization and memory architecture.
+
+\section{Model Section Outline}
+
+\subsection{Problem definition}
+
+Represent the patient trajectory as an irregular sequence of typed events
+\[
+    \mathcal{E} = \{(t_i, f_i, c_i, u_i, m_i)\}_{i=1}^{N},
+\]
+where:
+\begin{itemize}
+    \item $t_i$ is event time
+    \item $f_i$ is coarse family
+    \item $c_i$ is concept identity
+    \item $u_i$ is value or payload mark
+    \item $m_i$ is a modifier set
+\end{itemize}
+
+Semantic windows partition the sequence into care regimes. Generation proceeds
+over windows and events, not only over raw token prefixes.
+
+\subsection{Typed event algebra and codecs}
+
+\begin{itemize}
+    \item Numeric measurements use the existing cVAE-plus-RVQ codec.
+    \item Symbolic families use canonical concept identities plus modifiers.
+    \item Structural transitions remain first-class events.
+    \item All families map into a fused event interface before local modeling.
+\end{itemize}
+
+\subsection{Local event model}
+
+Local attention runs over typed fused events within semantic windows. Chunking is
+used only as a compute device. The local model has two responsibilities:
+\begin{itemize}
+    \item bind current within-window evidence for generation
+    \item emit boundary summaries and memory-write candidates
+\end{itemize}
+
+\subsection{Global latent health state}
+
+The latent is a belief state over current clinical condition:
+\begin{align*}
+    g_w^- &= \text{Drift}(g_{w-1}^+, \Delta \tau_w, \text{meta}_w) \\
+    g_w^+ &= \text{Jump}(g_w^-, s_w, \text{type}_w),
+\end{align*}
+where $s_w$ is a compressive summary emitted by the local model.
+
+The latent should encode:
+\begin{itemize}
+    \item current burden and instability
+    \item support intensity
+    \item unresolved problems carried forward
+    \item transition hazard and tempo
+\end{itemize}
+
+The latent should not be treated as the patient file.
+
+\subsection{Patient-internal exact memory}
+
+The internal memory stores sparse exact facts that should not be compressed away.
+Conceptually it is split into:
+\begin{itemize}
+    \item static memory
+    \item persistent memory
+    \item episodic memory
+\end{itemize}
+
+This memory is patient-specific, online, and exact. It is intended for:
+\begin{itemize}
+    \item durable chronic facts
+    \item major procedures and support history
+    \item critical rare events
+    \item baseline non-competing facts
+\end{itemize}
+
+\subsection{Cohort-external precedent memory}
+
+The second memory is the main conceptual step.
+
+Each precedent item should contain:
+\begin{itemize}
+    \item a key representing a pre-window predictive clinical state
+    \item care-regime and intervention metadata
+    \item a compact future summary
+    \item optionally an exact future continuation snippet
+\end{itemize}
+
+Retrieval should therefore answer:
+\begin{quote}
+Which prior patients were in a similar predictive clinical state, under similar
+current intervention context, and what happened next?
+\end{quote}
+
+This differs sharply from token-prefix retrieval.
+
+\subsection{Precedent item schema and future values}
+
+The precedent index should store one item per semantic-window boundary, not one
+item per token span. Each item should contain:
+\begin{itemize}
+    \item identity: subject, trajectory, boundary, and anchor-window ordinals
+    \item anchor metadata: current window type, start time, duration, and previous-gap time
+    \item coarse support/intervention flags
+    \item a dense retrieval key built from the boundary packet, latent state, and a compact persistent-memory digest
+    \item compact multi-horizon future summaries
+    \item an optional exact continuation reference back into packed precompiled shards
+\end{itemize}
+
+The value side should be structured rather than token-level. A useful design is
+three future horizons:
+\begin{itemize}
+    \item $h_1$: the next semantic window
+    \item $h_2$: the next two windows or the next 24 hours
+    \item $h_3$: the next four windows or the remainder of admission capped at 7 days
+\end{itemize}
+
+Each horizon should summarize the future with targets that are well supported
+by MIMIC:
+\begin{itemize}
+    \item next-window type and timing
+    \item event-family and payload histograms
+    \item support or intervention flags
+    \item transition flags
+    \item event and measurement density
+    \item extreme-measurement counts and numeric severity summaries
+    \item medium-horizon disposition flags, with readmission targets as optional lower-priority additions
+\end{itemize}
+
+\subsection{Predictive-state similarity}
+
+The paper should define state similarity functionally:
+
+Two boundary states are similar if, under comparable current intervention and
+regime context, they induce similar distributions over:
+\begin{itemize}
+    \item next window type
+    \item next window timing
+    \item short-horizon support evolution
+    \item near-future event mixture
+    \item medium-horizon disposition or readmission outcomes
+\end{itemize}
+
+This is the scientific justification for precedent retrieval.
+
+\subsection{Generative loop}
+
+The intended causal loop is:
+\begin{enumerate}
+    \item read internal patient memory using current latent and boundary metadata
+    \item read external precedent memory using the current predictive state query
+    \item run local attention conditioned on latent state, patient memory, precedent memory, and intervention context
+    \item generate the current or next event/window
+    \item update internal patient memory with exact writes
+    \item update the latent state with a compressive summary
+\end{enumerate}
+
+\subsection{Marked generative objective}
+
+The core objective remains:
+\[
+    \log p(\Delta t, f, c, u \mid \mathcal{H}, M_{\text{patient}}, M_{\text{precedent}}, a),
+\]
+where:
+\begin{itemize}
+    \item $\mathcal{H}$ is the observed history
+    \item $M_{\text{patient}}$ is patient-internal exact memory
+    \item $M_{\text{precedent}}$ is external precedent memory
+    \item $a$ is current intervention context
+\end{itemize}
+
+Discrete marks use cross-entropy, continuous marks use family-conditioned
+likelihood terms, and timing uses continuous-time likelihood.
+
+\subsection{Intervention-conditioned rollout}
+
+The paper should treat rollout as a first-class use case. The clean claim is:
+\begin{itemize}
+    \item the model supports prospective rollout under specified intervention context
+    \item the model does not automatically justify unrestricted counterfactual claims
+\end{itemize}
+
+\section{Implementation Path}
+
+The repo should be evolved toward the dual-memory world model in the following
+order:
+\begin{enumerate}
+    \item introduce a canonical boundary-state packet as the interface between local attention and all long-range modules
+    \item refactor patient-internal memory into explicit static, persistent, and episodic banks
+    \item build a cohort-external precedent index over boundary states with aligned multi-horizon future summaries and exact continuation references
+    \item add a future-aware retrieval objective so precedent similarity reflects future agreement rather than token-prefix overlap
+    \item condition generation on latent state, patient memory, and precedent memory jointly
+    \item only then finalize the latent-state family
+\end{enumerate}
+
+The first engineering principle is therefore:
+\begin{quote}
+Do not finalize the latent before the boundary-state packet and dual-memory
+interfaces are fixed.
+\end{quote}
+
+This is important because the current single-vector summary and the current
+single-vector latent are migration bridges, not the final conceptual objects.
+
+\section{Why This Is More Than ``A Better Latent''}
+
+The paper should be explicit here. A stronger recurrent or continuous-time
+latent backbone alone is not the main contribution. The main contribution is the
+division of labor:
+\begin{itemize}
+    \item latent state for current condition
+    \item exact internal memory for patient-specific facts
+    \item precedent memory for analogical future support
+\end{itemize}
+
+Once that contract is fixed, the final latent family can be chosen more
+cleanly. Before that, a more expressive latent mostly risks becoming an
+accidental memory store.
+
+\section{Experiments Section Outline}
+
+\subsection{Baselines}
+
+\begin{itemize}
+    \item v1 project baseline
+    \item hierarchical transformer baselines such as Hi-BEHRT and CORE-BEHRT
+    \item long-context/state-space baselines such as EHRMamba
+    \item generative event baselines such as POPCORN
+    \item retrieval baselines such as REMed-style or RAFT-style retrieval without dual-memory decomposition
+    \item intervention-rollout comparison to G-Transformer-style settings where applicable
+\end{itemize}
+
+\subsection{Core ablations}
+
+\begin{itemize}
+    \item token-path vs fused-event-path
+    \item plain autoregression vs marked objective
+    \item no memory vs patient memory only vs precedent memory only vs dual memory
+    \item no latent vs latent only vs latent plus patient memory vs latent plus dual memory
+    \item generic similarity vs future-aware predictive-state similarity
+    \item latent family comparison once the dual-memory interface is fixed
+\end{itemize}
+
+\subsection{Task families}
+
+\begin{itemize}
+    \item next-event and next-window generative forecasting
+    \item support escalation and deterioration prediction
+    \item transfer, discharge, and readmission timing
+    \item intervention-conditioned prospective rollout
+    \item rare-pathway generation under long historical context
+\end{itemize}
+
+\subsection{Key diagnostics}
+
+\begin{itemize}
+    \item long-horizon degradation with and without each memory system
+    \item retrieval quality measured by future agreement, not only embedding similarity
+    \item behavior on patients with divergent token histories but similar future trajectories
+    \item performance stratified by inter-admission gap and trajectory length
+    \item reliance on patient memory vs precedent memory across clinical regimes
+\end{itemize}
+
+\section{Tables and Figures To Reserve Early}
+
+\subsection{Figures}
+
+\begin{itemize}
+    \item overall dual-memory world-model architecture
+    \item typed event algebra and payload-codec schematic
+    \item patient memory vs precedent memory vs latent state
+    \item predictive-state retrieval diagram
+    \item intervention-conditioned rollout diagram
+\end{itemize}
+
+\subsection{Tables}
+
+\begin{itemize}
+    \item literature positioning table
+    \item modality routing table
+    \item ablation table
+    \item long-horizon robustness table
+    \item memory write/read policy table
+    \item precedent retrieval evaluation table
+\end{itemize}
+
+\section{Literature Positioning Table Skeleton}
+
+\begin{center}
+\begin{tabular}{p{0.18\linewidth}p{0.13\linewidth}p{0.14\linewidth}p{0.14\linewidth}p{0.14\linewidth}p{0.18\linewidth}}
+\hline
+Model / paper & Hierarchical local/global & Continuous-time latent & Internal exact memory & External precedent retrieval & Generative / rollout framing \\
+\hline
+Hi-BEHRT \cite{li2021hibehrt} & yes & no & no & no & no \\
+CORE-BEHRT \cite{odgaard2024corebehrt} & no & no & no & no & no \\
+EHRMamba \cite{fallahpour2025ehrmamba} & no & no & no & no & partly \\
+POPCORN \cite{bhave2021popcorn} & no & yes-like TPP timing & no & no & yes \\
+REMed \cite{kim2024remed} & no & no & partial history retrieval & no & no \\
+G-Transformer \cite{xiong2024gtransformer} & no & rollout-focused & no & no & yes \\
+TrajSurv \cite{zeng2025trajsurv} & no & yes & no & no & no \\
+ORA \cite{jing2026ora} & objective only & no & no & no & partly \\
+Ours & yes & yes or hybrid & yes & yes & yes \\
+\hline
+\end{tabular}
+\end{center}
+
+\section{Open Risks}
+
+\begin{itemize}
+    \item External precedent retrieval may help only if the similarity space is future-aware rather than syntax-aware.
+    \item The internal and external memories may collapse onto similar roles unless their write/read contracts are explicit.
+    \item Intervention-conditioned rollout is scientifically strong but must not be oversold as causal counterfactual prediction.
+    \item The final latent design should be chosen only after the dual-memory interface is fixed, otherwise architecture search may optimize the wrong object.
+\end{itemize}
+
+\bibliographystyle{plain}
+\bibliography{foundation_model_v2_refs}
+
+\end{document}

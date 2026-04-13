@@ -161,6 +161,23 @@ def _load_tokenization_contract(tokenization_yaml: Optional[str]) -> Dict[str, A
     return payload if isinstance(payload, dict) else {}
 
 
+def _resolve_observation_tail_policy(
+    *,
+    tokenization_contract: Mapping[str, Any],
+) -> str:
+    cfg = tokenization_contract.get("qualitative_observation", {})
+    if not isinstance(cfg, dict):
+        cfg = tokenization_contract.get("observation", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    tail_policy = str(cfg.get("tail_policy", "drop")).strip().lower() or "drop"
+    if tail_policy not in {"drop", "hash"}:
+        raise ValueError(
+            f"Unsupported qualitative observation tail policy {tail_policy!r}; expected drop|hash"
+        )
+    return tail_policy
+
+
 def _build_window_marker_config(
     *,
     tokenization_contract: Mapping[str, Any],
@@ -290,6 +307,32 @@ def _resolve_residual_policy(
     return residual_enabled, residual_buckets, offsets
 
 
+def _resolve_residual_tail_policies(
+    *,
+    tokenization_contract: Mapping[str, Any],
+) -> Dict[str, str]:
+    cfg = tokenization_contract.get("residual_fallback", {})
+    if not isinstance(cfg, dict):
+        cfg = {}
+    families_cfg = cfg.get("families", {})
+    if not isinstance(families_cfg, dict):
+        families_cfg = {}
+    default_tail_policy = str(cfg.get("tail_policy", "drop")).strip().lower() or "drop"
+
+    out: Dict[str, str] = {}
+    for family in ("diagnosis", "procedure", "medication"):
+        family_cfg = families_cfg.get(family, {})
+        if not isinstance(family_cfg, dict):
+            family_cfg = {}
+        tail_policy = str(family_cfg.get("tail_policy", default_tail_policy)).strip().lower() or "drop"
+        if tail_policy not in {"drop", "hash"}:
+            raise ValueError(
+                f"Unsupported residual tail policy {tail_policy!r} for family {family!r}; expected drop|hash"
+            )
+        out[family] = tail_policy
+    return out
+
+
 def _load_subject_ids(
     splits_parquet: str,
     split: str,
@@ -364,6 +407,7 @@ def _build_semantic_resolution_encoders(
     residual_enabled: bool,
     residual_buckets: int,
     residual_offsets: Mapping[str, int],
+    residual_tail_policies: Mapping[str, str],
 ) -> Dict[str, MedTokenWithAttrsEncoder]:
     diag_residual = int(residual_offsets["diagnosis"]) if residual_enabled and "diagnosis" in residual_offsets else None
     proc_residual = int(residual_offsets["procedure"]) if residual_enabled and "procedure" in residual_offsets else None
@@ -379,6 +423,7 @@ def _build_semantic_resolution_encoders(
             residual_exact_vocab=residual_vocabs.get("diagnosis"),
             residual_fallback_offset=diag_residual,
             residual_fallback_buckets=int(residual_buckets),
+            residual_tail_policy=str(residual_tail_policies.get("diagnosis", "drop")),
         ),
         "procedure": MedTokenWithAttrsEncoder(
             TokenCategory.PROCEDURE,
@@ -389,6 +434,7 @@ def _build_semantic_resolution_encoders(
             residual_exact_vocab=residual_vocabs.get("procedure"),
             residual_fallback_offset=proc_residual,
             residual_fallback_buckets=int(residual_buckets),
+            residual_tail_policy=str(residual_tail_policies.get("procedure", "drop")),
         ),
         "medication": MedTokenWithAttrsEncoder(
             TokenCategory.MEDICATION,
@@ -399,6 +445,7 @@ def _build_semantic_resolution_encoders(
             residual_exact_vocab=residual_vocabs.get("medication"),
             residual_fallback_offset=med_residual,
             residual_fallback_buckets=int(residual_buckets),
+            residual_tail_policy=str(residual_tail_policies.get("medication", "drop")),
         ),
     }
 
@@ -453,6 +500,9 @@ def _build_med_numeric_cfg(manifest: Mapping[str, Any]) -> Dict[str, NumericBinC
 
 
 def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
+    tokenization_contract = _load_tokenization_contract(
+        getattr(args, "tokenization_yaml", None)
+    )
     manifest = _load_manifest(getattr(args, "sparse_vocab_json", None))
     structural_codebook = (
         load_structural_codebook_yaml(
@@ -616,6 +666,10 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
     if codes_parquet_parent_lookup:
         medtok_parent_lookup = load_parent_lookup_from_codes_parquet(codes_parquet_parent_lookup)
 
+    obs_tail_policy = _resolve_observation_tail_policy(
+        tokenization_contract=tokenization_contract,
+    )
+
     return AuditArtifacts(
         manifest=manifest,
         structural_codebook=structural_codebook,
@@ -633,7 +687,7 @@ def _build_static_artifacts(args: argparse.Namespace) -> AuditArtifacts:
         residual_fallback_vocabs=residual_fallback_vocabs,
         obs_code_vocab=obs_code_vocab,
         obs_value_vocab=obs_value_vocab,
-        obs_tail_policy="drop" if (obs_code_vocab is not None or obs_value_vocab is not None) else "hash",
+        obs_tail_policy=str(obs_tail_policy),
     )
 
 
@@ -1701,11 +1755,15 @@ def main() -> None:
         args,
         tokenization_contract=tokenization_contract,
     )
+    residual_tail_policies = _resolve_residual_tail_policies(
+        tokenization_contract=tokenization_contract,
+    )
     semantic_resolvers = _build_semantic_resolution_encoders(
         artifacts=artifacts,
         residual_enabled=bool(residual_enabled),
         residual_buckets=int(residual_buckets),
         residual_offsets=dict(residual_offsets),
+        residual_tail_policies=residual_tail_policies,
     )
     db = mr.SubjectDatabase(args.meds_reader_db)
     subject_ids = _parse_subject_ids(args.subject_ids)
@@ -1787,6 +1845,7 @@ def main() -> None:
         enable_residual_fallback=bool(residual_enabled),
         residual_fallback_buckets=int(residual_buckets),
         residual_fallback_offsets=dict(residual_offsets),
+        residual_tail_policies=residual_tail_policies,
     )
 
     downstream = _summarize_tokenization_and_collation(
@@ -1838,6 +1897,7 @@ def main() -> None:
             "tokenization_yaml": args.tokenization_yaml,
             "residual_fallback_enabled": bool(residual_enabled),
             "residual_fallback_buckets": int(residual_buckets),
+            "residual_tail_policies": dict(residual_tail_policies),
             "diag_residual_offset": residual_offsets.get("diagnosis"),
             "proc_residual_offset": residual_offsets.get("procedure"),
             "med_residual_offset": residual_offsets.get("medication"),

@@ -21,6 +21,18 @@ def _semantic_family(payload: Mapping[str, Any], family: str) -> Mapping[str, An
     )
 
 
+def _runtime_sparse_contract(runtime_payload: Mapping[str, Any]) -> Mapping[str, Any]:
+    top_level = runtime_payload.get("sparse_vocab_contract", {})
+    if isinstance(top_level, Mapping) and top_level:
+        return top_level
+    vocab_config = runtime_payload.get("vocab_config", {})
+    if isinstance(vocab_config, Mapping):
+        nested = vocab_config.get("sparse_vocab_contract", {})
+        if isinstance(nested, Mapping):
+            return nested
+    return {}
+
+
 def evaluate_tokenization_freeze(
     audit_payload: Mapping[str, Any],
     *,
@@ -31,6 +43,7 @@ def evaluate_tokenization_freeze(
     require_no_residual_hash: bool = False,
     min_structural_observed_ids: int = 2,
     required_preserve_full_blocks: Optional[set[str]] = None,
+    forbid_hash_tail_policy: bool = True,
 ) -> Dict[str, Any]:
     min_mapped_rates = dict(min_mapped_rates or {})
     min_medtok_rates = dict(min_medtok_rates or {})
@@ -92,6 +105,31 @@ def evaluate_tokenization_freeze(
             structural_observed >= int(min_structural_observed_ids),
             {"value": structural_observed, "min_required": int(min_structural_observed_ids)},
         )
+        sparse_contract = _runtime_sparse_contract(runtime_payload)
+        if bool(forbid_hash_tail_policy) and isinstance(sparse_contract, Mapping) and sparse_contract:
+            residual_cfg = sparse_contract.get("residual_fallback", {})
+            if not isinstance(residual_cfg, Mapping):
+                residual_cfg = {}
+            residual_families = residual_cfg.get("families", {})
+            if not isinstance(residual_families, Mapping):
+                residual_families = {}
+            for family in ("diagnosis", "procedure", "medication"):
+                family_cfg = residual_families.get(family, {})
+                if not isinstance(family_cfg, Mapping):
+                    family_cfg = {}
+                tail_policy = str(family_cfg.get("tail_policy", residual_cfg.get("tail_policy", "drop")))
+                record(
+                    f"{family}_tail_policy_not_hash",
+                    tail_policy.strip().lower() != "hash",
+                    {"value": tail_policy, "forbidden": "hash"},
+                )
+        if bool(forbid_hash_tail_policy):
+            obs_tail_policy = str(runtime_payload.get("qual_obs_tail_policy", "drop"))
+            record(
+                "observation_tail_policy_not_hash",
+                obs_tail_policy.strip().lower() != "hash",
+                {"value": obs_tail_policy, "forbidden": "hash"},
+            )
 
     return {"passed": all(item["passed"] for item in checks), "checks": checks}
 
@@ -104,6 +142,7 @@ def main() -> None:
     ap.add_argument("--runtime_vocab_json", default=None)
     ap.add_argument("--max_window_type_unk_frac", type=float, default=0.0)
     ap.add_argument("--require_no_residual_hash", action="store_true")
+    ap.add_argument("--allow_hash_tail_policy", action="store_true")
     ap.add_argument("--min_structural_observed_ids", type=int, default=2)
     ap.add_argument("--required_preserve_full_blocks", default="special,structural")
     ap.add_argument("--min_mapped_rate_diagnosis", type=float, default=0.99)
@@ -135,6 +174,7 @@ def main() -> None:
             for part in str(args.required_preserve_full_blocks).split(",")
             if part.strip()
         },
+        forbid_hash_tail_policy=not bool(args.allow_hash_tail_policy),
     )
     print(json.dumps(result, indent=2))
     if not bool(result.get("passed", False)):

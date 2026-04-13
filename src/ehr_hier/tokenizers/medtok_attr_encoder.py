@@ -232,7 +232,7 @@ class MedTokenWithAttrsEncoder:
         tail_policy = (
             str(residual_tail_policy).strip().lower()
             if residual_tail_policy is not None
-            else ("drop" if residual_exact_vocab is not None else "hash")
+            else "drop"
         )
         if tail_policy not in {"hash", "drop"}:
             raise ValueError(f"Unsupported residual_tail_policy={residual_tail_policy!r}")

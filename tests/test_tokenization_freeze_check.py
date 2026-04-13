@@ -27,6 +27,17 @@ def test_tokenization_freeze_check_passes_with_clean_payload() -> None:
         "collation": {"window_type_unk_frac": 0.0},
     }
     runtime_payload = {
+        "qual_obs_tail_policy": "drop",
+        "sparse_vocab_contract": {
+            "residual_fallback": {
+                "tail_policy": "drop",
+                "families": {
+                    "diagnosis": {"tail_policy": "drop"},
+                    "procedure": {"tail_policy": "drop"},
+                    "medication": {"tail_policy": "drop"},
+                },
+            }
+        },
         "summary": {
             "preserve_full_blocks": ["special", "structural"],
             "observed_ids_per_block": {"structural": 5},
@@ -70,6 +81,17 @@ def test_tokenization_freeze_check_fails_on_structural_and_hash_tail() -> None:
         "collation": {"window_type_unk_frac": 0.0},
     }
     runtime_payload = {
+        "qual_obs_tail_policy": "hash",
+        "sparse_vocab_contract": {
+            "residual_fallback": {
+                "tail_policy": "drop",
+                "families": {
+                    "diagnosis": {"tail_policy": "drop"},
+                    "procedure": {"tail_policy": "drop"},
+                    "medication": {"tail_policy": "hash"},
+                },
+            }
+        },
         "summary": {
             "preserve_full_blocks": ["special"],
             "observed_ids_per_block": {"structural": 1},
@@ -88,3 +110,5 @@ def test_tokenization_freeze_check_fails_on_structural_and_hash_tail() -> None:
     assert "medication_residual_hash_zero" in failed
     assert "preserve_full_blocks" in failed
     assert "structural_observed_ids" in failed
+    assert "medication_tail_policy_not_hash" in failed
+    assert "observation_tail_policy_not_hash" in failed

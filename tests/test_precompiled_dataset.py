@@ -8,6 +8,7 @@ import torch
 
 import src.ehr_hier.data.compile_dataset as compile_mod
 import src.ehr_hier.data.dataset as dataset_mod
+from src.ehr_hier.data.event_frames import ensure_event_frames, flatten_event_frames
 from src.ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
 from src.ehr_hier.data.precompiled_format import (
     deserialize_timeline_compact,
@@ -133,8 +134,8 @@ def _make_split_timeline() -> list[EventToken]:
 
 
 def test_precompiled_dataset_filters_from_index_split_column(tmp_path: Path) -> None:
-    _write_timeline(tmp_path, "00/101.pt", [{"subject_id": 101}])
-    _write_timeline(tmp_path, "01/202.pt", [{"subject_id": 202}])
+    _write_timeline(tmp_path, "00/101.pt", serialize_timeline_compact(_make_timeline(101, length=2)))
+    _write_timeline(tmp_path, "01/202.pt", serialize_timeline_compact(_make_timeline(202, length=2)))
     pd.DataFrame(
         [
             {"subject_id": 101, "rel_path": "00/101.pt", "split": "train"},
@@ -146,17 +147,17 @@ def test_precompiled_dataset_filters_from_index_split_column(tmp_path: Path) -> 
     val_ds = dataset_mod.PrecompiledMEDSDataset(str(tmp_path), split="val")
 
     assert len(train_ds) == 1
-    assert train_ds[0][0]["subject_id"] == 101
+    assert flatten_event_frames(train_ds[0])[0].value_id == _make_timeline(101, length=2)[0].value_id
     assert len(val_ds) == 1
-    assert val_ds[0][0]["subject_id"] == 202
+    assert flatten_event_frames(val_ds[0])[0].value_id == _make_timeline(202, length=2)[0].value_id
 
 
 def test_precompiled_dataset_prefers_canonical_splits_parquet_over_index_split(
     tmp_path: Path,
     monkeypatch,
 ) -> None:
-    _write_timeline(tmp_path, "00/101.pt", [{"subject_id": 101}])
-    _write_timeline(tmp_path, "01/202.pt", [{"subject_id": 202}])
+    _write_timeline(tmp_path, "00/101.pt", serialize_timeline_compact(_make_timeline(101, length=2)))
+    _write_timeline(tmp_path, "01/202.pt", serialize_timeline_compact(_make_timeline(202, length=2)))
     pd.DataFrame(
         [
             {"subject_id": 101, "rel_path": "00/101.pt", "split": "train"},
@@ -182,7 +183,7 @@ def test_precompiled_dataset_prefers_canonical_splits_parquet_over_index_split(
 
     assert len(tuning_ds) == 1
     assert Path(tuning_ds.file_paths[0]).name == "202.pt"
-    assert tuning_ds[0][0]["subject_id"] == 202
+    assert flatten_event_frames(tuning_ds[0])[0].value_id == _make_timeline(202, length=2)[0].value_id
 
 
 def test_write_precompiled_index_writes_manifest_and_split_counts(
@@ -254,7 +255,7 @@ def test_compact_timeline_roundtrip_preserves_event_fields() -> None:
     compact = serialize_timeline_compact(timeline)
     restored = deserialize_timeline_compact(compact)
 
-    assert restored == timeline
+    assert restored == ensure_event_frames(timeline)
 
 
 def test_precompiled_dataset_loads_packed_shard_from_index(tmp_path: Path) -> None:
@@ -295,8 +296,49 @@ def test_precompiled_dataset_loads_packed_shard_from_index(tmp_path: Path) -> No
 
     assert len(train_ds) == 1
     assert len(val_ds) == 1
-    assert train_ds[0] == train_timeline
-    assert val_ds[0] == tuning_timeline
+    assert train_ds[0] == ensure_event_frames(train_timeline)
+    assert val_ds[0] == ensure_event_frames(tuning_timeline)
+
+
+def test_precompiled_dataset_can_return_metadata(tmp_path: Path) -> None:
+    shard_path = tmp_path / "shards" / "000000.ptz"
+    timeline = _make_timeline(101, length=5)
+    save_packed_shard(
+        shard_path,
+        subject_ids=[101],
+        serialized_timelines=[serialize_timeline_compact(timeline)],
+    )
+    pd.DataFrame(
+        [
+            {
+                "subject_id": 101,
+                "rel_path": "shards/000000.ptz",
+                "subject_idx": 0,
+                "trajectory_ord": 0,
+                "materialized_trajectory": 1,
+                "split": "train",
+            }
+        ]
+    ).to_csv(tmp_path / "trajectory_index.csv", index=False)
+    (tmp_path / "manifest.json").write_text(
+        '{"version": 2, "storage_format": "packed_shard_v2"}',
+        encoding="utf-8",
+    )
+
+    ds = dataset_mod.PrecompiledMEDSDataset(
+        str(tmp_path),
+        split="train",
+        index_filename="trajectory_index.csv",
+        return_metadata=True,
+    )
+    sample = ds[0]
+
+    assert int(sample["subject_id"]) == 101
+    assert int(sample["trajectory_ord"]) == 0
+    assert str(sample["rel_path"]) == "shards/000000.ptz"
+    assert int(sample["subject_idx"]) == 0
+    assert bool(sample["materialized_trajectory"]) is True
+    assert sample["timeline"] == ensure_event_frames(timeline)
 
 
 def test_packed_shard_is_smaller_than_legacy_subject_pickle(tmp_path: Path) -> None:
@@ -347,7 +389,7 @@ def test_precompiled_dataset_loads_materialized_trajectory_rows_directly(tmp_pat
     )
 
     assert len(ds) == 1
-    assert ds[0] == trajectory
+    assert ds[0] == ensure_event_frames(trajectory)
 
 
 def test_build_trajectory_index_records_materializes_direct_trajectory_shards(tmp_path: Path) -> None:

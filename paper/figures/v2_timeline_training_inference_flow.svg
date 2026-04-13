@@ -1,0 +1,189 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1960" height="1360" viewBox="0 0 1960 1360">
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,6 L9,3 z" fill="#334155"/>
+    </marker>
+    <style>
+      .title { font: 700 30px Arial, sans-serif; fill: #0f172a; }
+      .subtitle { font: 600 17px Arial, sans-serif; fill: #334155; }
+      .section { font: 700 22px Arial, sans-serif; fill: #0f172a; }
+      .boxhead { font: 700 17px Arial, sans-serif; fill: #0f172a; }
+      .body { font: 14px Arial, sans-serif; fill: #1e293b; }
+      .small { font: 13px Arial, sans-serif; fill: #334155; }
+      .label { font: 600 13px Arial, sans-serif; fill: #475569; }
+      .panel { stroke: #94a3b8; stroke-width: 2; rx: 16; ry: 16; }
+      .box { stroke: #64748b; stroke-width: 2; rx: 14; ry: 14; }
+      .arrow { stroke: #334155; stroke-width: 3; fill: none; marker-end: url(#arrow); }
+      .dashed { stroke-dasharray: 8 6; }
+    </style>
+  </defs>
+
+  <rect x="0" y="0" width="1960" height="1360" fill="#f8fafc"/>
+  <text x="50" y="48" class="title">Dual-Memory Patient World Model: Conceptual Training and Rollout Flow</text>
+  <text x="50" y="78" class="subtitle">Target behavior when the full model is complete. Training/evaluation and autonomous inference are separated explicitly.</text>
+
+  <rect x="35" y="105" width="1890" height="210" fill="#dbeafe" class="panel"/>
+  <text x="55" y="140" class="section">1. Offline Timeline Construction and Canonical Inputs</text>
+
+  <rect x="60" y="170" width="260" height="110" fill="#ffffff" class="box"/>
+  <text x="80" y="195" class="boxhead">Raw MEDS Subject History</text>
+  <text x="80" y="221" class="body">- admissions, transfers, meds, labs</text>
+  <text x="80" y="243" class="body">- timestamps, values, demographics</text>
+  <text x="80" y="265" class="body">- observed longitudinal patient history</text>
+
+  <rect x="380" y="170" width="320" height="125" fill="#ffffff" class="box"/>
+  <text x="400" y="195" class="boxhead">EventFrame Timeline</text>
+  <text x="400" y="221" class="body">subject_timeline_builder.py constructs:</text>
+  <text x="400" y="243" class="body">- typed symbolic events</text>
+  <text x="400" y="265" class="body">- numeric measurement frames</text>
+  <text x="400" y="287" class="body">- structural transitions and demographic specials</text>
+
+  <rect x="760" y="170" width="330" height="125" fill="#ffffff" class="box"/>
+  <text x="780" y="195" class="boxhead">Windowed Trajectory View</text>
+  <text x="780" y="221" class="body">Segmentation and optional trajectory splitting create:</text>
+  <text x="780" y="243" class="body">- semantic care windows</text>
+  <text x="780" y="265" class="body">- local chunks inside each window</text>
+  <text x="780" y="287" class="body">- full-subject or admission-chain trajectories</text>
+
+  <rect x="1150" y="170" width="300" height="125" fill="#ffffff" class="box"/>
+  <text x="1170" y="195" class="boxhead">Packed Precompiled Roots</text>
+  <text x="1170" y="221" class="body">compile_dataset / compile_timelines_v2.py writes:</text>
+  <text x="1170" y="243" class="body">- packed frame shards</text>
+  <text x="1170" y="265" class="body">- index / trajectory index</text>
+  <text x="1170" y="287" class="body">- manifest and stable metadata</text>
+
+  <rect x="1510" y="170" width="390" height="125" fill="#ffffff" class="box"/>
+  <text x="1530" y="195" class="boxhead">Collated Batch Tensors</text>
+  <text x="1530" y="221" class="body">collator.py emits:</text>
+  <text x="1530" y="243" class="body">- token lane and event lane tensors</text>
+  <text x="1530" y="265" class="body">- window/chunk metadata and masks</text>
+  <text x="1530" y="287" class="body">- subject ids, trajectory ords, memory-rule metadata</text>
+
+  <line x1="320" y1="225" x2="380" y2="225" class="arrow"/>
+  <line x1="700" y1="235" x2="760" y2="235" class="arrow"/>
+  <line x1="1090" y1="235" x2="1150" y2="235" class="arrow"/>
+  <line x1="1450" y1="235" x2="1510" y2="235" class="arrow"/>
+
+  <rect x="35" y="345" width="920" height="955" fill="#dcfce7" class="panel"/>
+  <text x="55" y="380" class="section">2. Training and Offline Evaluation Path</text>
+  <text x="55" y="408" class="small">Observed future windows are available here. Teacher forcing is allowed for the next-window header during supervision.</text>
+
+  <rect x="60" y="445" width="390" height="170" fill="#ffffff" class="box"/>
+  <text x="80" y="470" class="boxhead">Observed Prefix Through Window w</text>
+  <text x="80" y="496" class="body">The model ingests the true patient timeline prefix:</text>
+  <text x="80" y="518" class="body">- local token and event tensors for current windows</text>
+  <text x="80" y="540" class="body">- current window types, starts, durations, chunk offsets</text>
+  <text x="80" y="562" class="body">- current exact patient memory state and latent carry</text>
+  <text x="80" y="584" class="body">- subject/trajectory ids for precedent anchor supervision</text>
+
+  <rect x="510" y="445" width="390" height="210" fill="#ffffff" class="box"/>
+  <text x="530" y="470" class="boxhead">Core World-Model Forward Pass</text>
+  <text x="530" y="496" class="body">- embeddings -> event composer -> local attention</text>
+  <text x="530" y="518" class="body">- chunk aggregation -> WindowStatePacket</text>
+  <text x="530" y="540" class="body">- patient-memory reads/writes</text>
+  <text x="530" y="562" class="body">- latent state update from the packet</text>
+  <text x="530" y="584" class="body">- boundary precedent query from packet + latent + persistent digest</text>
+  <text x="530" y="606" class="body">- predicted next-window header from boundary context</text>
+  <text x="530" y="628" class="body">- header-conditioned precedent prompt query</text>
+
+  <rect x="60" y="685" width="390" height="190" fill="#ffffff" class="box"/>
+  <text x="80" y="710" class="boxhead">Teacher-Forced Header When Available</text>
+  <text x="80" y="736" class="body">If the true next window exists in the batch, training uses:</text>
+  <text x="80" y="758" class="body">- actual next-window type</text>
+  <text x="80" y="780" class="body">- actual next-window gap</text>
+  <text x="80" y="802" class="body">- actual next-window duration</text>
+  <text x="80" y="824" class="body">- actual coarse support profile</text>
+  <text x="80" y="846" class="body">This stabilizes precedent prompt retrieval and supervision.</text>
+
+  <rect x="510" y="685" width="390" height="190" fill="#ffffff" class="box"/>
+  <text x="530" y="710" class="boxhead">Predicted Header When Not Available</text>
+  <text x="530" y="736" class="body">If the next true window is absent, training falls back to the model's own:</text>
+  <text x="530" y="758" class="body">- predicted next-window type</text>
+  <text x="530" y="780" class="body">- predicted next-window gap</text>
+  <text x="530" y="802" class="body">- predicted next-window duration</text>
+  <text x="530" y="824" class="body">- predicted coarse support profile</text>
+  <text x="530" y="846" class="body">This is the same bridge object used later at inference.</text>
+
+  <rect x="60" y="945" width="840" height="180" fill="#ffffff" class="box"/>
+  <text x="80" y="970" class="boxhead">Supervised Outputs and Losses</text>
+  <text x="80" y="996" class="body">Marked generation losses:</text>
+  <text x="80" y="1018" class="body">- token/event family/payload/concept outputs</text>
+  <text x="80" y="1040" class="body">- numeric value and event-time likelihoods</text>
+  <text x="80" y="1062" class="body">Next-window control losses:</text>
+  <text x="80" y="1084" class="body">- next-window type, gap, duration, support profile</text>
+  <text x="80" y="1106" class="body">Precedent retrieval losses:</text>
+  <text x="80" y="1128" class="body">- future-summary agreement, contrastive predictive-state retrieval, anchor recovery</text>
+
+  <rect x="60" y="1160" width="840" height="100" fill="#ffffff" class="box"/>
+  <text x="80" y="1185" class="boxhead">Offline Evaluation Around the Trained Model</text>
+  <text x="80" y="1211" class="body">Compares predicted headers, retrieved precedents, and generated next-window content to held-out observed futures.</text>
+  <text x="80" y="1233" class="body">This is evaluation machinery around the model, not part of the runtime generative loop itself.</text>
+
+  <line x1="450" y1="530" x2="510" y2="530" class="arrow"/>
+  <line x1="705" y1="655" x2="705" y2="685" class="arrow"/>
+  <line x1="255" y1="615" x2="255" y2="685" class="arrow"/>
+  <line x1="450" y1="780" x2="510" y2="780" class="arrow"/>
+  <line x1="705" y1="875" x2="705" y2="945" class="arrow"/>
+  <line x1="480" y1="1035" x2="480" y2="1160" class="arrow"/>
+
+  <rect x="985" y="345" width="940" height="955" fill="#ffedd5" class="panel"/>
+  <text x="1005" y="380" class="section">3. Autonomous Inference / Patient Rollout Path</text>
+  <text x="1005" y="408" class="small">No ground-truth future is used here. The model must bridge from window w to window w+1 using its own header and memory state.</text>
+
+  <rect x="1010" y="445" width="390" height="170" fill="#ffffff" class="box"/>
+  <text x="1030" y="470" class="boxhead">Initialize Current State</text>
+  <text x="1030" y="496" class="body">At the start of rollout, the model has:</text>
+  <text x="1030" y="518" class="body">- observed prefix through current window w</text>
+  <text x="1030" y="540" class="body">- latent belief state</text>
+  <text x="1030" y="562" class="body">- patient-internal memory banks</text>
+  <text x="1030" y="584" class="body">- loaded cohort precedent index</text>
+
+  <rect x="1460" y="445" width="430" height="190" fill="#ffffff" class="box"/>
+  <text x="1480" y="470" class="boxhead">Process Window w and Update Long-Range State</text>
+  <text x="1480" y="496" class="body">- local attention encodes the current window</text>
+  <text x="1480" y="518" class="body">- WindowStatePacket is emitted</text>
+  <text x="1480" y="540" class="body">- patient memory writes are committed</text>
+  <text x="1480" y="562" class="body">- latent state updates from the packet</text>
+  <text x="1480" y="584" class="body">- boundary precedent query yields an analogical future prior</text>
+  <text x="1480" y="606" class="body">- the model predicts NextWindowHeader for window w+1</text>
+
+  <rect x="1010" y="685" width="390" height="190" fill="#ffffff" class="box"/>
+  <text x="1030" y="710" class="boxhead">Header-Conditioned Retrieval for Window w+1</text>
+  <text x="1030" y="736" class="body">Using the predicted NextWindowHeader, the model re-queries:</text>
+  <text x="1030" y="758" class="body">- precedent memory for future_prefix_prompt and summary priors</text>
+  <text x="1030" y="780" class="body">- patient memory banks for exact relevant facts</text>
+  <text x="1030" y="802" class="body">This sets up the long-range conditioning surface for the next window.</text>
+
+  <rect x="1460" y="685" width="430" height="190" fill="#ffffff" class="box"/>
+  <text x="1480" y="710" class="boxhead">Generate Window w+1</text>
+  <text x="1480" y="736" class="body">Local decoding for the next window uses:</text>
+  <text x="1480" y="758" class="body">- latent modulation (compressive current condition)</text>
+  <text x="1480" y="780" class="body">- patient-memory exact tokens</text>
+  <text x="1480" y="802" class="body">- precedent prompt tokens and future priors</text>
+  <text x="1480" y="824" class="body">The model generates events, values, and times within the new window.</text>
+
+  <rect x="1010" y="945" width="880" height="170" fill="#ffffff" class="box"/>
+  <text x="1030" y="970" class="boxhead">Roll Forward</text>
+  <text x="1030" y="996" class="body">The generated window w+1 is now treated as the new current window:</text>
+  <text x="1030" y="1018" class="body">- it updates the latent state</text>
+  <text x="1030" y="1040" class="body">- it produces new patient-memory writes</text>
+  <text x="1030" y="1062" class="body">- it becomes the anchor for the next boundary query and next-window header</text>
+  <text x="1030" y="1084" class="body">The system repeats this loop to simulate the patient trajectory over future windows.</text>
+
+  <rect x="1010" y="1160" width="880" height="100" fill="#ffffff" class="box"/>
+  <text x="1030" y="1185" class="boxhead">Optional External Evaluation of Rollout</text>
+  <text x="1030" y="1211" class="body">When held-out future data exists, an external evaluator compares the generated headers/windows to reality.</text>
+  <text x="1030" y="1233" class="body">This scoring is outside the runtime loop itself.</text>
+
+  <line x1="1400" y1="530" x2="1460" y2="530" class="arrow"/>
+  <line x1="1675" y1="635" x2="1675" y2="685" class="arrow"/>
+  <line x1="1460" y1="780" x2="1400" y2="780" class="arrow"/>
+  <line x1="1400" y1="780" x2="1400" y2="945" class="arrow"/>
+  <line x1="1675" y1="875" x2="1675" y2="945" class="arrow"/>
+  <path d="M1450,1030 C1320,1030 1280,900 1280,780" class="arrow"/>
+  <path d="M1450,1030 C1540,1030 1610,930 1675,875" class="arrow"/>
+  <line x1="1450" y1="1115" x2="1450" y2="1160" class="arrow dashed"/>
+
+  <text x="1260" y="920" class="label">generated window becomes new current window</text>
+  <text x="1290" y="1150" class="label">external scoring only if held-out future exists</text>
+</svg>

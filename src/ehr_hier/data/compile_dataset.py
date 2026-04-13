@@ -1,8 +1,8 @@
 """
-Utility to materialize subject timelines to disk for fast training.
+Utility to materialize subject frame timelines to disk for fast training.
 
 This is intentionally minimal: callers must construct encoders/structural codebook
-upstream and pass a meds_reader DB path. Packed shard outputs are written under
+upstream and pass a meds_reader DB path. Packed event-frame shard outputs are written under
 <root>/shards/<shard>.ptz with an index.csv mapping subject_id -> shard row.
 """
 from __future__ import annotations
@@ -37,7 +37,7 @@ from src.ehr_hier.data.trajectory_splitting import (
     build_trajectory_timelines,
 )
 from src.ehr_hier.data.window_segmentation import WindowSegmentationConfig
-from src.ehr_hier.tokenizers.interfaces import EventTokenEncoder
+from src.ehr_hier.tokenizers.interfaces import EventFrameEncoder
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.data.structural_codes import StructuralCodebook
 
@@ -154,7 +154,7 @@ def write_precompiled_index(
 
 def _init_compile_worker(
     db_path: str,
-    encoders: Dict[TokenCategory, EventTokenEncoder],
+    encoders: Dict[TokenCategory, EventFrameEncoder],
     codebook: Optional[StructuralCodebook],
     output_dir: str,
     window_hook_label: str = "window_boundary",
@@ -427,7 +427,7 @@ def _iter_subject_batches(subject_ids: Sequence[int], batch_size: int) -> List[L
 def compile_dataset(
     *,
     db_path: str,
-    encoders: Dict[TokenCategory, EventTokenEncoder],
+    encoders: Dict[TokenCategory, EventFrameEncoder],
     output_dir: str,
     structural_codebook: Optional[StructuralCodebook] = None,
     qual_obs_code_vocab: Optional[CategoryVocab] = None,
@@ -448,7 +448,7 @@ def compile_dataset(
     Build timelines for selected subjects and persist them to disk.
     """
     if not encoders:
-        raise ValueError("encoders must be provided (TokenCategory -> EventTokenEncoder)")
+        raise ValueError("encoders must be provided (TokenCategory -> EventFrameEncoder)")
     if num_output_shards <= 0:
         raise ValueError("num_output_shards must be > 0")
 
