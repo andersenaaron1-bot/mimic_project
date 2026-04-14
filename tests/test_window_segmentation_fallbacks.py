@@ -32,7 +32,9 @@ def test_segment_default_first_window_type_id_applies_to_leading_unknown_window(
     windows = segment_event_tokens(events, config=cfg)
     assert len(windows) == 2
     assert windows[0].window_type_id == 1
+    assert windows[0].fallback_window_type_source == "default_first_window_type"
     assert windows[1].window_type_id == 3
+    assert windows[1].fallback_window_type_source is None
 
 
 def test_segment_leaves_unknown_trailing_window_untyped() -> None:
@@ -86,6 +88,7 @@ def test_segment_leaves_unknown_trailing_window_untyped() -> None:
     assert len(windows) == 2
     assert windows[0].window_type_id == 2
     assert windows[1].window_type_id == 0
+    assert windows[1].fallback_window_type_source is None
 
 
 def test_segment_assigns_post_discharge_window_between_discharge_and_next_opener() -> None:

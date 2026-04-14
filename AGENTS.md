@@ -1176,6 +1176,34 @@ Re-audit all event families against the marked objective:
   confirm which are event-lane objects, which are header/static-bank seeds, and
   which should never be treated as ordinary autoregressive targets
 
+The next audit pass must additionally make the following failure modes explicit:
+
+- leading semantic windows that currently fall through to `UNK`
+- qualitative-observation frames that lose their observation-value token and
+  appear only as stray `OBS_CODE::*` tokens at decode time
+- medication attributes that are absent in source data vs present in source
+  data but not preserved as emitted frame attributes
+- token-level numeric density vs event-level numeric density
+
+It must also produce a trajectory-shape report that answers:
+
+- whether fallback-typed windows are mainly leading, trailing, or interior
+- which ordinary window type most often follows `HISTORY_PREFIX`
+- whether `POST_DISCHARGE` windows are mostly same-day carry or long-gap
+  inter-admission intervals
+- what clinical content categories populate those fallback windows
+- how many residual true `UNK` windows remain after explicit fallback typing
+
+The default corrective action is now:
+
+- add one explicit fallback regime:
+  `HISTORY_PREFIX`
+- assign the leading unknown semantic window to that type through
+  `window_segmentation.default_first_window_type`
+- keep `POST_DISCHARGE` as the explicit post-discharge carry regime
+- avoid forcing leading history-prefix windows into ordinary care-setting types
+  such as `ED_ADMISSION` or `INPATIENT`
+
 #### Phase 5.5 family-level MTTE contract
 
 The tokenization audit should freeze the following family-by-family target
@@ -1384,6 +1412,14 @@ Implement the phase in the following order:
    - identify which medication/observation attributes require dedicated heads
      instead of being collapsed into one scalar or left implicit in token
      bundles
+   - add an explicit audit over the actual built `EventFrame` timeline that
+     reports:
+     - frame payload-kind counts
+     - qualitative-observation bundle integrity
+     - decoded round-trip observation bundles vs stray observation tokens
+     - raw medication attribute presence
+     - emitted medication frame attribute presence
+     - explicit fallback-window-type usage vs residual true `UNK`
 4. In `global_state.py`, `episodic_memory.py`, and `precedent_memory.py`:
    - align every time-dependent operation to the canonical clocks above
    - document which clock each module consumes

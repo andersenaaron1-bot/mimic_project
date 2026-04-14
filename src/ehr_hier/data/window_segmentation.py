@@ -54,6 +54,7 @@ class SegmentedWindow:
     window_type_id: int
     start_time_hours: float
     window_site_id: int = 0
+    fallback_window_type_source: Optional[str] = None
     opening_action: Optional[str] = None
     closing_action: Optional[str] = None
     opening_time_hours: Optional[float] = None
@@ -267,6 +268,12 @@ def _apply_window_type_fallbacks(
                 window_type_id=int(w_type),
                 start_time_hours=float(window.start_time_hours),
                 window_site_id=int(window.window_site_id),
+                fallback_window_type_source=(
+                    "default_first_window_type"
+                    if int(window.window_type_id) == unk
+                    and int(w_type) != int(window.window_type_id)
+                    else window.fallback_window_type_source
+                ),
                 opening_action=window.opening_action,
                 closing_action=window.closing_action,
                 opening_time_hours=window.opening_time_hours,
@@ -718,6 +725,7 @@ def rebalance_segmented_windows(
                     window_type_id=int(window.window_type_id),
                     start_time_hours=float(chunk[0].t_from_start_hours),
                     window_site_id=int(window.window_site_id),
+                    fallback_window_type_source=window.fallback_window_type_source,
                     opening_action=window.opening_action if idx == 0 else None,
                     closing_action=window.closing_action if idx == len(chunks) - 1 else None,
                     opening_time_hours=window.opening_time_hours if idx == 0 else None,
@@ -764,6 +772,7 @@ def chunk_segmented_windows(
                     window_type_id=int(window.window_type_id),
                     start_time_hours=float(window.start_time_hours),
                     window_site_id=int(window.window_site_id),
+                    fallback_window_type_source=window.fallback_window_type_source,
                     opening_action=window.opening_action,
                     closing_action=window.closing_action,
                     opening_time_hours=window.opening_time_hours,
@@ -873,6 +882,7 @@ def chunk_segmented_windows(
                 window_type_id=int(window.window_type_id),
                 start_time_hours=float(window.start_time_hours),
                 window_site_id=int(window.window_site_id),
+                fallback_window_type_source=window.fallback_window_type_source,
                 opening_action=window.opening_action,
                 closing_action=window.closing_action,
                 opening_time_hours=window.opening_time_hours,

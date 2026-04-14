@@ -27,6 +27,7 @@ from src.ehr_hier.data.demographics import (
     infer_event_age_years,
     infer_subject_sex,
 )
+from src.ehr_hier.data.event_frames import EventFrame, flatten_event_frames
 from src.ehr_hier.data.event_router import classify_code_to_category
 from src.ehr_hier.data.structural_codes import (
     StructuralCodebook,
@@ -401,6 +402,86 @@ def _is_finite_numeric(value: object) -> bool:
     return math.isfinite(fv)
 
 
+def _has_nonempty_attr(value: object) -> bool:
+    if value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (list, tuple, set, dict)):
+        return len(value) > 0
+    return True
+
+
+def _is_nonzero_numeric(value: object) -> bool:
+    if not _is_finite_numeric(value):
+        return False
+    return abs(float(value)) > 0.0
+
+
+def _count_medication_raw_attrs(
+    ev: object,
+    *,
+    categorical_attrs: Iterable[str],
+    numeric_attrs: Iterable[str],
+    categorical_counter: Counter[str],
+    numeric_finite_counter: Counter[str],
+    numeric_nonzero_counter: Counter[str],
+) -> None:
+    for attr_name in categorical_attrs:
+        if _has_nonempty_attr(getattr(ev, attr_name, None)):
+            categorical_counter[str(attr_name)] += 1
+    for attr_name in numeric_attrs:
+        raw = getattr(ev, attr_name, None)
+        if _is_finite_numeric(raw):
+            numeric_finite_counter[str(attr_name)] += 1
+        if _is_nonzero_numeric(raw):
+            numeric_nonzero_counter[str(attr_name)] += 1
+
+
+def _window_end_time_hours(window) -> float:
+    if getattr(window, "tokens", None):
+        return float(window.tokens[-1].t_from_start_hours)
+    return float(getattr(window, "start_time_hours", 0.0))
+
+
+def _window_position_name(index: int, total: int) -> str:
+    if total <= 1:
+        return "singleton"
+    if index == 0:
+        return "leading"
+    if index == total - 1:
+        return "trailing"
+    return "interior"
+
+
+def _gap_bucket_name(hours: Optional[float]) -> str:
+    if hours is None:
+        return "<none>"
+    h = max(0.0, float(hours))
+    if h <= 1.0:
+        return "<=1h"
+    if h <= 6.0:
+        return "1-6h"
+    if h <= 24.0:
+        return "6-24h"
+    if h <= 24.0 * 7.0:
+        return "1-7d"
+    if h <= 24.0 * 31.0:
+        return "7-31d"
+    return ">31d"
+
+
+def _window_category_counter(window) -> Counter[str]:
+    out: Counter[str] = Counter()
+    for tok in getattr(window, "tokens", []) or []:
+        try:
+            name = TokenCategory(int(tok.category_id)).name
+        except Exception:
+            name = f"CATEGORY::{int(tok.category_id)}"
+        out[name] += 1
+    return out
+
+
 def _build_semantic_resolution_encoders(
     *,
     artifacts: AuditArtifacts,
@@ -721,6 +802,9 @@ def _summarize_raw_subjects(
         "procedure": Counter(),
         "medication": Counter(),
     }
+    med_raw_categorical_attrs = Counter()
+    med_raw_numeric_attrs_finite = Counter()
+    med_raw_numeric_attrs_nonzero = Counter()
     structural_labels = Counter()
     structural_boundaries = Counter()
     structural_overlays = Counter()
@@ -783,6 +867,14 @@ def _summarize_raw_subjects(
                     medtok_hits["procedure"]["miss"] += 1
                     medtok_miss_samples["procedure"][code_str] += 1
             elif category == TokenCategory.MEDICATION:
+                _count_medication_raw_attrs(
+                    ev,
+                    categorical_attrs=artifacts.med_attr_vocabs.keys(),
+                    numeric_attrs=artifacts.med_numeric_attrs.keys(),
+                    categorical_counter=med_raw_categorical_attrs,
+                    numeric_finite_counter=med_raw_numeric_attrs_finite,
+                    numeric_nonzero_counter=med_raw_numeric_attrs_nonzero,
+                )
                 resolution = semantic_resolvers["medication"].resolve_event(ev)
                 medtok_resolution_stages["medication"][resolution.stage] += 1
                 if resolution.stage in EXPLICIT_MEDTOK_RESOLUTION_STAGES:
@@ -822,6 +914,11 @@ def _summarize_raw_subjects(
         "medtok_hits": {k: _as_plain_counter(v) for k, v in medtok_hits.items()},
         "medtok_resolution_stages": {
             k: _as_plain_counter(v) for k, v in medtok_resolution_stages.items()
+        },
+        "medication_raw_attr_presence": {
+            "categorical_nonempty": _as_plain_counter(med_raw_categorical_attrs),
+            "numeric_finite": _as_plain_counter(med_raw_numeric_attrs_finite),
+            "numeric_nonzero": _as_plain_counter(med_raw_numeric_attrs_nonzero),
         },
         "top_prefixes": _top_counter(prefix_counts, top_k),
         "top_other_codes": _top_counter(other_codes, top_k),
@@ -962,6 +1059,7 @@ def _audit_subject_tokenization(
     encoders: Dict[TokenCategory, Any],
     codebook: Optional[StructuralCodebook],
     artifacts: AuditArtifacts,
+    struct_id2code: Mapping[int, str],
 ) -> Dict[str, Any]:
     subj = db[int(subject_id)]
     events = list(subj.events)
@@ -985,6 +1083,15 @@ def _audit_subject_tokenization(
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
     family_min_id: Dict[str, int] = {}
     family_max_id: Dict[str, int] = {}
+    frame_payload_kind_counts = Counter()
+    frame_bundle_sizes_by_payload_kind: Dict[str, Counter[int]] = defaultdict(Counter)
+    observation_frame_integrity = Counter()
+    medication_frame_categorical_attrs = Counter()
+    medication_frame_numeric_attrs_nonzero = Counter()
+    medication_frame_numeric_attrs_finite = Counter()
+    medication_frame_marker_tokens = Counter()
+    decoded_preview_kind_counts = Counter()
+    decoded_observation_integrity = Counter()
 
     last_emitted_time = None
     timeline = build_subject_timeline(
@@ -996,6 +1103,71 @@ def _audit_subject_tokenization(
         qual_obs_value_vocab=artifacts.obs_value_vocab,
         qual_obs_tail_policy=artifacts.obs_tail_policy,
     )
+
+    flattened_timeline = flatten_event_frames(timeline, clone=False)
+    decoded_timeline = decode_timeline_tokens(
+        flattened_timeline,
+        code_token_offset=_offset(artifacts.manifest, "measurement_code", 2_000_000),
+        rvq_token_offset=_offset(artifacts.manifest, "measurement_value", 2_100_000),
+        rvq_codebook_stride=artifacts.measurement_stride or 256,
+        measurement_num_codebooks=artifacts.measurement_num_codebooks,
+        measurement_code2name=invert_code2id(artifacts.code2id or {}),
+        diagnosis_offset=artifacts.diag_vocab.offset,
+        diagnosis_id2code=invert_code2id(artifacts.diag_vocab.code2id),
+        procedure_offset=artifacts.proc_vocab.offset,
+        procedure_id2code=invert_code2id(artifacts.proc_vocab.code2id),
+        medication_offset=artifacts.med_vocab.offset,
+        medication_id2code=invert_code2id(artifacts.med_vocab.code2id),
+        observation_code_offset=_offset(artifacts.manifest, "observation_code", 2_300_000),
+        observation_value_offset=_offset(artifacts.manifest, "observation_value", 2_320_000),
+        structural_offset=_offset(artifacts.manifest, "structural", 2_200_000),
+        structural_id2label=_make_structural_id2label(codebook),
+        structural_id2code=struct_id2code,
+        special_id2name=SPECIAL_ID2NAME,
+    )
+
+    for item in decoded_timeline:
+        decoded_preview_kind_counts[str(item.get("kind", "<unk>"))] += 1
+        if item.get("kind") == "observation_bundle":
+            decoded_observation_integrity["bundle"] += 1
+        elif item.get("label", "").startswith("OBS_CODE::"):
+            decoded_observation_integrity["stray_code_token"] += 1
+        elif item.get("label", "").startswith("OBS_VAL::"):
+            decoded_observation_integrity["stray_value_token"] += 1
+
+    for frame in timeline:
+        if not isinstance(frame, EventFrame):
+            continue
+        payload_kind = str(frame.payload_kind)
+        frame_payload_kind_counts[payload_kind] += 1
+        frame_bundle_sizes_by_payload_kind[payload_kind][int(len(frame.token_bundle))] += 1
+
+        if payload_kind == "qualitative_observation":
+            obs_positions = [int((tok.cat_attrs or {}).get("obs_bundle_pos", 0)) for tok in frame.token_bundle]
+            observation_frame_integrity["frames_total"] += 1
+            if obs_positions == [1, 2]:
+                observation_frame_integrity["complete_two_token"] += 1
+            else:
+                observation_frame_integrity["malformed"] += 1
+            if 1 in obs_positions:
+                observation_frame_integrity["has_code_token"] += 1
+            if 2 in obs_positions:
+                observation_frame_integrity["has_value_token"] += 1
+
+        if int(frame.category_id) == int(TokenCategory.MEDICATION):
+            medication_frame_marker_tokens[
+                "has_marker_token" if any((tok.cat_attrs or {}).get("event_marker") is not None for tok in frame.token_bundle) else "base_only"
+            ] += 1
+            for attr_name in artifacts.med_attr_vocabs.keys():
+                raw = (frame.cat_attrs or {}).get(attr_name, 0)
+                if int(raw or 0) != 0:
+                    medication_frame_categorical_attrs[str(attr_name)] += 1
+            for attr_name in artifacts.med_numeric_attrs.keys():
+                raw = (frame.num_attrs or {}).get(attr_name, None)
+                if _is_finite_numeric(raw):
+                    medication_frame_numeric_attrs_finite[str(attr_name)] += 1
+                if _is_nonzero_numeric(raw):
+                    medication_frame_numeric_attrs_nonzero[str(attr_name)] += 1
 
     struct_only = codebook.structural_only if codebook is not None else set()
     struct_keep_orig = codebook.keep_original if codebook is not None else set()
@@ -1173,6 +1345,17 @@ def _audit_subject_tokenization(
         "family_unique_ids": family_unique_ids,
         "family_min_id": family_min_id,
         "family_max_id": family_max_id,
+        "frame_payload_kind_counts": frame_payload_kind_counts,
+        "frame_bundle_sizes_by_payload_kind": frame_bundle_sizes_by_payload_kind,
+        "observation_frame_integrity": observation_frame_integrity,
+        "decoded_preview_kind_counts": decoded_preview_kind_counts,
+        "decoded_observation_integrity": decoded_observation_integrity,
+        "medication_frame_attr_presence": {
+            "categorical_nonzero": medication_frame_categorical_attrs,
+            "numeric_finite": medication_frame_numeric_attrs_finite,
+            "numeric_nonzero": medication_frame_numeric_attrs_nonzero,
+            "marker_tokens": medication_frame_marker_tokens,
+        },
     }
 
 
@@ -1194,6 +1377,19 @@ def _summarize_tokenization_and_collation(
     progress_every: int = 0,
 ) -> Dict[str, Any]:
     struct_id2label = _make_structural_id2label(artifacts.structural_codebook)
+    type_id2name: Dict[int, str] = {}
+    if artifacts.structural_codebook is not None:
+        type_id2name.update(
+            {int(v): str(k) for k, v in artifacts.structural_codebook.window_type2id().items()}
+        )
+    history_prefix_type_id = next(
+        (k for k, v in type_id2name.items() if str(v) == "HISTORY_PREFIX"),
+        None,
+    )
+    post_discharge_type_id = next(
+        (k for k, v in type_id2name.items() if str(v) == "POST_DISCHARGE"),
+        segmentation_config.post_discharge_window_type_id if segmentation_config is not None else None,
+    )
     collator = AETHierarchicalCollator(
         max_windows=max_windows,
         max_chunks_per_window=max_chunks_per_window,
@@ -1217,12 +1413,25 @@ def _summarize_tokenization_and_collation(
     family_unique_ids: Dict[str, set[int]] = defaultdict(set)
     family_min_id: Dict[str, int] = {}
     family_max_id: Dict[str, int] = {}
+    frame_payload_kind_counts = Counter()
+    frame_bundle_sizes_by_payload_kind: Dict[str, Counter[int]] = defaultdict(Counter)
+    observation_frame_integrity = Counter()
+    decoded_preview_kind_counts = Counter()
+    decoded_observation_integrity = Counter()
+    medication_frame_attr_presence: Dict[str, Counter[str]] = {
+        "categorical_nonzero": Counter(),
+        "numeric_finite": Counter(),
+        "numeric_nonzero": Counter(),
+        "marker_tokens": Counter(),
+    }
 
     window_counts = Counter()
     chunk_counts = Counter()
     truncation_counts = Counter()
     numeric_mask_ones = 0
     attention_mask_ones = 0
+    event_numeric_mask_ones = 0
+    event_attention_mask_ones = 0
     window_mask_ones = 0
     chunk_mask_ones = 0
     window_type_zero = 0
@@ -1243,8 +1452,33 @@ def _summarize_tokenization_and_collation(
     unknown_window_first_transition_type = Counter()
     unknown_window_first_window_type_attr = Counter()
     unknown_window_first_struct_label = Counter()
+    window_type_fallback_sources = Counter()
     unknown_window_samples: List[Dict[str, Any]] = []
     unknown_window_total = 0
+    trajectory_shape = {
+        "history_prefix_total": 0,
+        "history_prefix_position_counts": Counter(),
+        "history_prefix_next_type_counts": Counter(),
+        "history_prefix_prev_gap_buckets": Counter(),
+        "history_prefix_next_gap_buckets": Counter(),
+        "history_prefix_duration_buckets": Counter(),
+        "history_prefix_token_categories": Counter(),
+        "history_prefix_samples": [],
+        "post_discharge_total": 0,
+        "post_discharge_position_counts": Counter(),
+        "post_discharge_next_type_counts": Counter(),
+        "post_discharge_prev_gap_buckets": Counter(),
+        "post_discharge_next_gap_buckets": Counter(),
+        "post_discharge_duration_buckets": Counter(),
+        "post_discharge_token_categories": Counter(),
+        "post_discharge_same_day_carry": Counter(),
+        "post_discharge_samples": [],
+        "residual_unknown_total": 0,
+        "residual_unknown_position_counts": Counter(),
+        "residual_unknown_prev_type_counts": Counter(),
+        "residual_unknown_next_type_counts": Counter(),
+        "residual_unknown_samples": [],
+    }
     example_rows: List[Dict[str, Any]] = []
     batch_timelines: List[List[EventToken]] = []
 
@@ -1257,6 +1491,7 @@ def _summarize_tokenization_and_collation(
             encoders=encoders,
             codebook=artifacts.structural_codebook,
             artifacts=artifacts,
+            struct_id2code=struct_id2code,
         )
         timeline = audited["timeline"]
         batch_timelines.append(timeline)
@@ -1280,6 +1515,14 @@ def _summarize_tokenization_and_collation(
             family_max_id[family] = max(max_id, family_max_id.get(family, max_id))
         for cat_name, bundle_counter in audited["bundle_sizes_by_category"].items():
             bundle_sizes_by_category[cat_name].update(bundle_counter)
+        frame_payload_kind_counts.update(audited.get("frame_payload_kind_counts", {}))
+        for payload_kind, size_counter in audited.get("frame_bundle_sizes_by_payload_kind", {}).items():
+            frame_bundle_sizes_by_payload_kind[payload_kind].update(size_counter)
+        observation_frame_integrity.update(audited.get("observation_frame_integrity", {}))
+        decoded_preview_kind_counts.update(audited.get("decoded_preview_kind_counts", {}))
+        decoded_observation_integrity.update(audited.get("decoded_observation_integrity", {}))
+        for section, counter in audited.get("medication_frame_attr_presence", {}).items():
+            medication_frame_attr_presence.setdefault(str(section), Counter()).update(counter)
 
         specials, events = collator._split_special(timeline)
         all_windows = collator._segment_windows(events)
@@ -1293,6 +1536,9 @@ def _summarize_tokenization_and_collation(
         chunked_windows = collator._chunk_windows(kept_windows, special_tokens=specials)
         chunk_counts["chunks_total_post_cap"] += sum(len(window.chunks) for window in chunked_windows)
         chunk_counts["semantic_windows_split_into_chunks"] += sum(1 for window in chunked_windows if len(window.chunks) > 1)
+        for window in chunked_windows:
+            if getattr(window, "fallback_window_type_source", None):
+                window_type_fallback_sources[str(window.fallback_window_type_source)] += 1
 
         raw_win_types = [int(window.window_type_id) for window in chunked_windows]
         win_types = [collator._clamp_window_type_id(w) for w in raw_win_types]
@@ -1310,6 +1556,26 @@ def _summarize_tokenization_and_collation(
                 truncation_counts["semantic_windows_truncated_by_max_chunks"] += 1
             if budget == 0 and len(window.tokens) > 0:
                 truncation_counts["marker_only_windows"] += 1
+
+            prev_type_name = (
+                type_id2name.get(int(win_types[wi - 1]), str(int(win_types[wi - 1])))
+                if wi > 0
+                else "<none>"
+            )
+            next_type_name = (
+                type_id2name.get(int(win_types[wi + 1]), str(int(win_types[wi + 1])))
+                if wi + 1 < len(win_types)
+                else "<none>"
+            )
+            prev_end = _window_end_time_hours(chunked_windows[wi - 1]) if wi > 0 else None
+            cur_start = float(window.start_time_hours)
+            cur_end = _window_end_time_hours(window)
+            next_start_for_shape = float(chunked_windows[wi + 1].start_time_hours) if wi + 1 < len(chunked_windows) else None
+            prev_gap_h = (cur_start - prev_end) if prev_end is not None else None
+            next_gap_h = (next_start_for_shape - cur_end) if next_start_for_shape is not None else None
+            duration_h = max(0.0, cur_end - cur_start)
+            position_name = _window_position_name(wi, len(chunked_windows))
+            token_categories = _window_category_counter(window)
 
             if int(win_types[wi]) == int(collator.window_markers.unk_type_id):
                 unknown_window_total += 1
@@ -1415,6 +1681,84 @@ def _summarize_tokenization_and_collation(
                             }
                         )
 
+                trajectory_shape["residual_unknown_total"] += 1
+                trajectory_shape["residual_unknown_position_counts"][position_name] += 1
+                trajectory_shape["residual_unknown_prev_type_counts"][str(prev_type_name)] += 1
+                trajectory_shape["residual_unknown_next_type_counts"][str(next_type_name)] += 1
+                if len(trajectory_shape["residual_unknown_samples"]) < 24:
+                    trajectory_shape["residual_unknown_samples"].append(
+                        {
+                            "subject_id": int(sid),
+                            "window_index": int(wi),
+                            "position": position_name,
+                            "opening_action": window.opening_action,
+                            "closing_action": window.closing_action,
+                            "prev_type": str(prev_type_name),
+                            "next_type": str(next_type_name),
+                            "prev_gap_bucket": _gap_bucket_name(prev_gap_h),
+                            "next_gap_bucket": _gap_bucket_name(next_gap_h),
+                            "duration_bucket": _gap_bucket_name(duration_h),
+                            "token_categories": {str(k): int(v) for k, v in token_categories.items()},
+                        }
+                    )
+
+            if history_prefix_type_id is not None and int(win_types[wi]) == int(history_prefix_type_id):
+                trajectory_shape["history_prefix_total"] += 1
+                trajectory_shape["history_prefix_position_counts"][position_name] += 1
+                trajectory_shape["history_prefix_next_type_counts"][str(next_type_name)] += 1
+                trajectory_shape["history_prefix_prev_gap_buckets"][_gap_bucket_name(prev_gap_h)] += 1
+                trajectory_shape["history_prefix_next_gap_buckets"][_gap_bucket_name(next_gap_h)] += 1
+                trajectory_shape["history_prefix_duration_buckets"][_gap_bucket_name(duration_h)] += 1
+                trajectory_shape["history_prefix_token_categories"].update(token_categories)
+                if len(trajectory_shape["history_prefix_samples"]) < 24:
+                    trajectory_shape["history_prefix_samples"].append(
+                        {
+                            "subject_id": int(sid),
+                            "window_index": int(wi),
+                            "position": position_name,
+                            "opening_action": window.opening_action,
+                            "closing_action": window.closing_action,
+                            "next_type": str(next_type_name),
+                            "prev_gap_bucket": _gap_bucket_name(prev_gap_h),
+                            "next_gap_bucket": _gap_bucket_name(next_gap_h),
+                            "duration_bucket": _gap_bucket_name(duration_h),
+                            "token_categories": {str(k): int(v) for k, v in token_categories.items()},
+                            "fallback_source": getattr(window, "fallback_window_type_source", None),
+                        }
+                    )
+
+            if post_discharge_type_id is not None and int(win_types[wi]) == int(post_discharge_type_id):
+                trajectory_shape["post_discharge_total"] += 1
+                trajectory_shape["post_discharge_position_counts"][position_name] += 1
+                trajectory_shape["post_discharge_next_type_counts"][str(next_type_name)] += 1
+                trajectory_shape["post_discharge_prev_gap_buckets"][_gap_bucket_name(prev_gap_h)] += 1
+                trajectory_shape["post_discharge_next_gap_buckets"][_gap_bucket_name(next_gap_h)] += 1
+                trajectory_shape["post_discharge_duration_buckets"][_gap_bucket_name(duration_h)] += 1
+                trajectory_shape["post_discharge_token_categories"].update(token_categories)
+                carry_key = (
+                    "same_day_or_short_carry"
+                    if (duration_h <= 24.0 or (next_gap_h is not None and next_gap_h <= 24.0))
+                    else "long_gap_or_inter_admission"
+                )
+                trajectory_shape["post_discharge_same_day_carry"][carry_key] += 1
+                if len(trajectory_shape["post_discharge_samples"]) < 24:
+                    trajectory_shape["post_discharge_samples"].append(
+                        {
+                            "subject_id": int(sid),
+                            "window_index": int(wi),
+                            "position": position_name,
+                            "opening_action": window.opening_action,
+                            "closing_action": window.closing_action,
+                            "prev_type": str(prev_type_name),
+                            "next_type": str(next_type_name),
+                            "prev_gap_bucket": _gap_bucket_name(prev_gap_h),
+                            "next_gap_bucket": _gap_bucket_name(next_gap_h),
+                            "duration_bucket": _gap_bucket_name(duration_h),
+                            "carry_class": carry_key,
+                            "token_categories": {str(k): int(v) for k, v in token_categories.items()},
+                        }
+                    )
+
             next_type = win_types[wi + 1] if wi + 1 < len(win_types) else None
             next_start = win_starts[wi + 1] if wi + 1 < len(win_starts) else None
             for chunk in window.chunks:
@@ -1474,6 +1818,8 @@ def _summarize_tokenization_and_collation(
             batch = collator(batch_timelines)
             numeric_mask_ones += int(batch["numeric_mask"].sum().item())
             attention_mask_ones += int(batch["attention_mask"].sum().item())
+            event_numeric_mask_ones += int(batch["event_numeric_mask"].sum().item())
+            event_attention_mask_ones += int(batch["event_attention_mask"].sum().item())
             window_mask_ones += int(batch["window_mask"].sum().item())
             chunk_mask_ones += int(batch["chunk_mask"].sum().item())
             win_mask = batch["window_mask"].to(dtype=torch.bool)
@@ -1493,6 +1839,8 @@ def _summarize_tokenization_and_collation(
         batch = collator(batch_timelines)
         numeric_mask_ones += int(batch["numeric_mask"].sum().item())
         attention_mask_ones += int(batch["attention_mask"].sum().item())
+        event_numeric_mask_ones += int(batch["event_numeric_mask"].sum().item())
+        event_attention_mask_ones += int(batch["event_attention_mask"].sum().item())
         window_mask_ones += int(batch["window_mask"].sum().item())
         chunk_mask_ones += int(batch["chunk_mask"].sum().item())
         win_mask = batch["window_mask"].to(dtype=torch.bool)
@@ -1532,6 +1880,18 @@ def _summarize_tokenization_and_collation(
                 "max_id": int(family_max_id[family]),
             }
             for family, ids in family_unique_ids.items()
+        },
+        "frame_payload_kind_counts": _as_plain_counter(frame_payload_kind_counts),
+        "frame_bundle_sizes_by_payload_kind": {
+            str(kind): _as_plain_counter(counter)
+            for kind, counter in frame_bundle_sizes_by_payload_kind.items()
+        },
+        "observation_frame_integrity": _as_plain_counter(observation_frame_integrity),
+        "decoded_preview_kind_counts": _as_plain_counter(decoded_preview_kind_counts),
+        "decoded_observation_integrity": _as_plain_counter(decoded_observation_integrity),
+        "medication_frame_attr_presence": {
+            str(section): _as_plain_counter(counter)
+            for section, counter in medication_frame_attr_presence.items()
         },
         "measurement_effective_capture_by_path": {},
     }
@@ -1614,6 +1974,11 @@ def _summarize_tokenization_and_collation(
             if attention_mask_ones > 0
             else 0.0
         ),
+        "event_numeric_mask_density_vs_attended": (
+            float(event_numeric_mask_ones) / float(event_attention_mask_ones)
+            if event_attention_mask_ones > 0
+            else 0.0
+        ),
         "avg_windows_per_subject": (
             float(window_counts["windows_total_post_cap"]) / float(window_counts["subjects"])
             if window_counts["subjects"] > 0
@@ -1626,6 +1991,7 @@ def _summarize_tokenization_and_collation(
         ),
         "window_type_raw_counts": _as_plain_counter(window_type_raw_counts),
         "window_type_clamped_counts": _as_plain_counter(window_type_clamped_counts),
+        "window_type_fallback_source_counts": _as_plain_counter(window_type_fallback_sources),
         "window_marker_usage": {
             "chunks_with_markers": int(window_marker_totals.get("chunks_with_markers", 0)),
             "marker_tokens_total": int(window_marker_totals.get("marker_tokens_total", 0)),
@@ -1648,6 +2014,30 @@ def _summarize_tokenization_and_collation(
             "first_token_window_type_attr": _as_plain_counter(unknown_window_first_window_type_attr),
             "first_token_struct_label_id": _as_plain_counter(unknown_window_first_struct_label),
             "samples": unknown_window_samples,
+        },
+        "trajectory_shape_analysis": {
+            "history_prefix_total": int(trajectory_shape["history_prefix_total"]),
+            "history_prefix_position_counts": _as_plain_counter(trajectory_shape["history_prefix_position_counts"]),
+            "history_prefix_next_type_counts": _as_plain_counter(trajectory_shape["history_prefix_next_type_counts"]),
+            "history_prefix_prev_gap_buckets": _as_plain_counter(trajectory_shape["history_prefix_prev_gap_buckets"]),
+            "history_prefix_next_gap_buckets": _as_plain_counter(trajectory_shape["history_prefix_next_gap_buckets"]),
+            "history_prefix_duration_buckets": _as_plain_counter(trajectory_shape["history_prefix_duration_buckets"]),
+            "history_prefix_token_categories": _as_plain_counter(trajectory_shape["history_prefix_token_categories"]),
+            "history_prefix_samples": list(trajectory_shape["history_prefix_samples"]),
+            "post_discharge_total": int(trajectory_shape["post_discharge_total"]),
+            "post_discharge_position_counts": _as_plain_counter(trajectory_shape["post_discharge_position_counts"]),
+            "post_discharge_next_type_counts": _as_plain_counter(trajectory_shape["post_discharge_next_type_counts"]),
+            "post_discharge_prev_gap_buckets": _as_plain_counter(trajectory_shape["post_discharge_prev_gap_buckets"]),
+            "post_discharge_next_gap_buckets": _as_plain_counter(trajectory_shape["post_discharge_next_gap_buckets"]),
+            "post_discharge_duration_buckets": _as_plain_counter(trajectory_shape["post_discharge_duration_buckets"]),
+            "post_discharge_token_categories": _as_plain_counter(trajectory_shape["post_discharge_token_categories"]),
+            "post_discharge_same_day_carry": _as_plain_counter(trajectory_shape["post_discharge_same_day_carry"]),
+            "post_discharge_samples": list(trajectory_shape["post_discharge_samples"]),
+            "residual_unknown_total": int(trajectory_shape["residual_unknown_total"]),
+            "residual_unknown_position_counts": _as_plain_counter(trajectory_shape["residual_unknown_position_counts"]),
+            "residual_unknown_prev_type_counts": _as_plain_counter(trajectory_shape["residual_unknown_prev_type_counts"]),
+            "residual_unknown_next_type_counts": _as_plain_counter(trajectory_shape["residual_unknown_next_type_counts"]),
+            "residual_unknown_samples": list(trajectory_shape["residual_unknown_samples"]),
         },
         "attended_tokens": int(attention_mask_ones),
         "active_windows": int(window_mask_ones),
@@ -1678,13 +2068,33 @@ def _print_summary(payload: Mapping[str, Any], *, top_k: int) -> None:
     print("Measurement effective capture:", timeline.get("measurement_effective_capture_by_path", {}))
     if timeline.get("observation_base_outcomes"):
         print("Observation base outcomes:", timeline.get("observation_base_outcomes", {}))
+    if timeline.get("observation_frame_integrity"):
+        print("Observation frame integrity:", timeline.get("observation_frame_integrity", {}))
+    if timeline.get("decoded_observation_integrity"):
+        print("Decoded observation integrity:", timeline.get("decoded_observation_integrity", {}))
+    if raw.get("medication_raw_attr_presence"):
+        print("Medication raw attr presence:", raw.get("medication_raw_attr_presence", {}))
+    if timeline.get("medication_frame_attr_presence"):
+        print("Medication frame attr presence:", timeline.get("medication_frame_attr_presence", {}))
     print("Average tokens per emitted event:", timeline["avg_tokens_per_emitted_event_by_category"])
+    if timeline.get("frame_payload_kind_counts"):
+        print("Frame payload kinds:", timeline.get("frame_payload_kind_counts", {}))
     print("Semantic effective capture by category:", timeline.get("semantic_effective_capture_by_category", {}))
     print("Collation windows:", coll["windows"])
     print("Collation chunks:", coll.get("chunks", {}))
     print("Collation truncation:", coll["truncation"])
     print("Collation numeric_mask_density_vs_attended:", f"{coll['numeric_mask_density_vs_attended']:.4f}")
+    print("Collation event_numeric_mask_density_vs_attended:", f"{coll['event_numeric_mask_density_vs_attended']:.4f}")
     print("Collation window_type_unk_frac:", f"{coll['window_type_unk_frac']:.4f}")
+    if coll.get("window_type_fallback_source_counts"):
+        print("Window type fallback sources:", coll.get("window_type_fallback_source_counts", {}))
+    traj = coll.get("trajectory_shape_analysis", {})
+    if traj:
+        print("Trajectory shape history_prefix_total:", int(traj.get("history_prefix_total", 0)))
+        print("Trajectory shape history_prefix_next_type_counts:", traj.get("history_prefix_next_type_counts", {}))
+        print("Trajectory shape post_discharge_total:", int(traj.get("post_discharge_total", 0)))
+        print("Trajectory shape post_discharge_same_day_carry:", traj.get("post_discharge_same_day_carry", {}))
+        print("Trajectory shape residual_unknown_total:", int(traj.get("residual_unknown_total", 0)))
     print("Collation window markers:", coll.get("window_marker_usage", {}))
     unknown_diag = coll.get("unknown_window_diagnostics", {})
     if unknown_diag:
