@@ -1128,11 +1128,13 @@ def _audit_subject_tokenization(
 
     for item in decoded_timeline:
         decoded_preview_kind_counts[str(item.get("kind", "<unk>"))] += 1
+        label = item.get("label")
+        label_str = label if isinstance(label, str) else ""
         if item.get("kind") == "observation_bundle":
             decoded_observation_integrity["bundle"] += 1
-        elif item.get("label", "").startswith("OBS_CODE::"):
+        elif label_str.startswith("OBS_CODE::"):
             decoded_observation_integrity["stray_code_token"] += 1
-        elif item.get("label", "").startswith("OBS_VAL::"):
+        elif label_str.startswith("OBS_VAL::"):
             decoded_observation_integrity["stray_value_token"] += 1
 
     for frame in timeline:
