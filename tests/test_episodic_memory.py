@@ -1,6 +1,89 @@
 import torch
 
 
+def test_episodic_memory_age_decay_uses_boundary_hours() -> None:
+    from src.ehr_hier.transformer.episodic_memory import (
+        AETEpisodicMemory,
+        EpisodicMemoryState,
+        PatientMemoryState,
+    )
+
+    class _Cfg:
+        d_model = 2
+        special_type_id = 0
+        exact_memory_slots = 2
+        exact_memory_static_slots = 0
+        exact_memory_persistent_slots = 0
+        exact_memory_episodic_slots = 2
+        exact_memory_write_per_window = 0
+        exact_memory_retrieve_k = 1
+        exact_memory_static_retrieve_k = 0
+        exact_memory_persistent_retrieve_k = 0
+        exact_memory_episodic_retrieve_k = 1
+        exact_memory_max_same_group = 2
+        exact_memory_age_decay = 1.0
+        exact_memory_rule_write_scale = 0.0
+        exact_memory_rule_retrieval_scale = 0.0
+        exact_memory_learned_write_scale = 0.0
+        exact_memory_first_occurrence_bonus = 0.0
+        exact_memory_chronic_bonus = 0.0
+        exact_memory_static_feature_ids = ""
+
+    module = AETEpisodicMemory(_Cfg)
+    with torch.no_grad():
+        module.query_proj.weight.copy_(torch.eye(2))
+        module.query_proj.bias.zero_()
+
+    prev_state = PatientMemoryState(
+        static=EpisodicMemoryState.empty(
+            batch_size=1,
+            slots=0,
+            d_model=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+        persistent=EpisodicMemoryState.empty(
+            batch_size=1,
+            slots=0,
+            d_model=2,
+            device=torch.device("cpu"),
+            dtype=torch.float32,
+        ),
+        episodic=EpisodicMemoryState(
+            keys=torch.tensor([[[1.0, 0.0], [1.0, 0.0]]], dtype=torch.float32),
+            values=torch.tensor([[[1.0, 0.0], [0.0, 1.0]]], dtype=torch.float32),
+            scores=torch.tensor([[1.0, 1.0]], dtype=torch.float32),
+            event_ids=torch.tensor([[101, 202]], dtype=torch.long),
+            group_ids=torch.tensor([[1, 1]], dtype=torch.long),
+            age_bases=torch.tensor([[0.0, 10.0]], dtype=torch.float32),
+            rule_scores=torch.zeros((1, 2), dtype=torch.float32),
+            valid_mask=torch.tensor([[True, True]]),
+        ),
+    )
+
+    out = module(
+        event_states=torch.zeros((1, 1, 1, 1, 2), dtype=torch.float32),
+        event_input_ids=torch.tensor([[[[1]]]], dtype=torch.long),
+        event_time_ids=torch.tensor([[[[0.0]]]], dtype=torch.float32),
+        event_attention_mask=torch.ones((1, 1, 1, 1), dtype=torch.long),
+        event_type_ids=torch.tensor([[[[1]]]], dtype=torch.long),
+        event_payload_ids=torch.tensor([[[[1]]]], dtype=torch.long),
+        query_states=torch.tensor([[[1.0, 0.0]]], dtype=torch.float32),
+        window_mask=torch.tensor([[1]], dtype=torch.long),
+        window_start_times=torch.tensor([[12.0]], dtype=torch.float32),
+        semantic_duration_hours=torch.tensor([[1.0]], dtype=torch.float32),
+        prev_memory_state=prev_state,
+    )
+
+    assert out.retrieval_counts.tolist() == [[1]]
+    assert out.retrieved_event_ids_by_bank["episodic"][0, 0, 0].item() == 202
+    assert out.next_state is not None
+    assert torch.allclose(
+        out.next_state.episodic.age_bases[0, :2],
+        torch.tensor([0.0, 10.0], dtype=torch.float32),
+    )
+
+
 def test_episodic_memory_is_causal_and_tracks_exact_event_ids() -> None:
     from src.ehr_hier.data.event_frames import EVENT_PAYLOAD_KIND_TO_ID
     from src.ehr_hier.data.token_types import TokenCategory

@@ -105,6 +105,12 @@ class AETLossModule(nn.Module):
         )
         self.register_buffer("_token_family_loss_weights", token_family_loss_weights, persistent=False)
 
+    def set_prefer_unified_token_loss(self, enabled: bool) -> None:
+        self.prefer_unified_token_loss = bool(enabled)
+
+    def set_weights(self, weights: dict[str, float]) -> None:
+        self.weights = {str(k): float(v) for k, v in dict(weights).items()}
+
     @staticmethod
     def _build_marker_info(vocab_config: dict) -> dict[str, int]:
         offsets_raw = vocab_config.get("offsets", {})
@@ -1403,14 +1409,18 @@ class AETLossModule(nn.Module):
         logs = {}
 
         logits_token = head_outputs.get("logits_token", None)
+        compute_token_loss = (
+            logits_token is not None
+            and float(self.weights.get("token", 0.0)) > 0.0
+        )
         using_unified_token_loss = (
-            logits_token is not None and bool(self.prefer_unified_token_loss)
+            compute_token_loss and bool(self.prefer_unified_token_loss)
         )
 
         marker_type_mask_all, marker_end_mask_all, marker_continue_mask_all = self._marker_masks(target_ids)
         marker_any_mask_all = marker_type_mask_all | marker_end_mask_all | marker_continue_mask_all
 
-        if using_unified_token_loss:
+        if compute_token_loss:
             token_loss, token_logs, ar_stats = self._compute_autoregressive_ce_lane(
                 logits=logits_token,
                 target_ids=target_ids,
@@ -1427,6 +1437,8 @@ class AETLossModule(nn.Module):
             logs["candidate_nonmarker_special_targets"] = int(ar_stats["candidate_nonmarker_special_targets"])
             logs["ignored_nonmarker_special_targets"] = int(ar_stats["ignored_nonmarker_special_targets"])
             logs["frac_unrouted"] = 0.0
+            logs["token_loss_mode_unified"] = 1.0 if using_unified_token_loss else 0.0
+            logs["token_loss_mode_aux"] = 0.0 if using_unified_token_loss else 1.0
 
         event_target_ids = targets_dict.get("event_input_ids", None)
         event_attention_mask = targets_dict.get("event_attention_mask", None)
@@ -1534,7 +1546,8 @@ class AETLossModule(nn.Module):
             ("logits_transition_boundary" in head_outputs)
             or ("logits_boundary_next_window_type" in head_outputs)
         )
-        if not using_unified_token_loss:
+        has_switched_head_outputs = any(head_key in head_outputs for head_key in self.routing.keys())
+        if (not using_unified_token_loss) and has_switched_head_outputs:
             for head_key, blocks in self.routing.items():
                 if head_key not in head_outputs:
                     continue

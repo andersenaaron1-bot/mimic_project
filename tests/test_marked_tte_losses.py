@@ -1,6 +1,58 @@
 import torch
 
 
+def test_marked_event_losses_can_stay_primary_with_aux_token_ce() -> None:
+    from ehr_hier.transformer.loss import AETLossModule
+
+    vocab_config = {
+        "total_size": 32,
+        "size_special": 16,
+        "size_rvq": 4,
+        "size_meas_labels": 4,
+        "size_meds": 8,
+        "offsets": {"SPECIAL": 0, "RVQ": 100, "MEAS": 200, "MED": 1000},
+        "window_markers": {
+            "type_token_offset": 10,
+            "num_types": 4,
+            "end_token_id": 14,
+            "continue_token_id": 15,
+        },
+    }
+
+    head_outputs = {
+        "logits_token": torch.zeros((1, 1, 1, 3, 32), dtype=torch.float32),
+        "logits_event_family": torch.zeros((1, 1, 1, 2, 8), dtype=torch.float32),
+    }
+    head_outputs["logits_token"][0, 0, 0, 0, 6] = 20.0
+    head_outputs["logits_token"][0, 0, 0, 1, 7] = 20.0
+    head_outputs["logits_event_family"][0, 0, 0, 0, 2] = 20.0
+
+    targets = {
+        "input_ids": torch.tensor([[[[5, 6, 7]]]], dtype=torch.long),
+        "attention_mask": torch.ones((1, 1, 1, 3), dtype=torch.long),
+        "token_type_ids": torch.ones((1, 1, 1, 3), dtype=torch.long),
+        "event_input_ids": torch.tensor([[[[21, 22]]]], dtype=torch.long),
+        "event_attention_mask": torch.ones((1, 1, 1, 2), dtype=torch.long),
+        "event_type_ids": torch.tensor([[[[1, 2]]]], dtype=torch.long),
+    }
+
+    criterion = AETLossModule(
+        vocab_config=vocab_config,
+        weights={"token": 0.05, "event_family": 1.0},
+        strict_routing=False,
+        prefer_unified_token_loss=False,
+    )
+    loss, logs = criterion(head_outputs, targets)
+
+    assert torch.isfinite(loss)
+    assert logs["loss_token"] < 1e-3
+    assert logs["loss_event_family"] < 1e-3
+    assert logs["token_loss_mode_unified"] == 0.0
+    assert logs["token_loss_mode_aux"] == 1.0
+    assert logs["n_token_supervised"] == 2
+    assert logs["n_event_family_supervised"] == 1
+
+
 def test_loss_adds_event_numeric_value_nll_term() -> None:
     from ehr_hier.data.event_frames import EVENT_PAYLOAD_KIND_TO_ID
     from ehr_hier.transformer.loss import AETLossModule

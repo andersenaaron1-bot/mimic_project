@@ -991,6 +991,8 @@ class AdaptiveEpisodicTransformer(nn.Module):
                 event_demographic_feature_ids=event_demographic_feature_ids,
                 query_states=shifted_context,
                 window_mask=window_mask,
+                window_start_times=window_start_times,
+                semantic_duration_hours=semantic_duration_hours,
                 prev_memory_state=prev_memory_state,
                 event_memory_rule_scores=event_memory_rule_scores,
                 event_memory_group_ids=event_memory_group_ids,

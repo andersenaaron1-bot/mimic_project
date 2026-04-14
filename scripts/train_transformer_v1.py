@@ -10,7 +10,7 @@ import sys
 from dataclasses import asdict, dataclass
 import os
 from pathlib import Path
-from typing import Any, Dict, Iterable, List
+from typing import Any, Dict, Iterable, List, Sequence
 
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -82,6 +82,91 @@ TOKEN_FAMILY_WEIGHT_PRESETS: Dict[str, Dict[str, float]] = {
         "special_marker": 0.75,
         "unk": 0.35,
     },
+}
+
+OBJECTIVE_PRESETS: Dict[str, Dict[str, Any]] = {
+    "legacy_v1": {
+        "prefer_unified_token_loss": True,
+        "token_family_weight_preset": "none",
+        "precedent_loss_start_step": 0,
+        "precedent_loss_ramp_steps": 0,
+        "loss_weights": {
+            "token": 1.0,
+            "event_token": 1.0,
+            "event_family": 1.0,
+            "event_payload": 1.0,
+            "event_concept": 1.0,
+            "event_dt": 1.0,
+            "event_value": 1.0,
+            "val": 0.0,
+            "transition": 1.0,
+            "win_boundary": 1.0,
+            "win": 0.5,
+            "len": 0.0,
+            "chunk": 0.0,
+            "time": 0.0,
+            "dt": 0.0,
+            "next_window_gap": 1.0,
+            "next_window_duration": 1.0,
+            "next_window_support": 0.5,
+            "precedent_future": 1.0,
+            "precedent_contrast": 1.0,
+            "precedent_anchor": 0.25,
+        },
+    },
+    "world_model_mttee": {
+        "prefer_unified_token_loss": False,
+        "token_family_weight_preset": "none",
+        "precedent_loss_start_step": 2000,
+        "precedent_loss_ramp_steps": 2000,
+        "loss_weights": {
+            "token": 0.05,
+            "event_token": 0.0,
+            "event_family": 1.0,
+            "event_payload": 1.0,
+            "event_concept": 1.0,
+            "event_dt": 1.0,
+            "event_value": 1.0,
+            "val": 0.0,
+            "transition": 1.0,
+            "win_boundary": 1.0,
+            "win": 1.0,
+            "len": 0.0,
+            "chunk": 0.0,
+            "time": 0.0,
+            "dt": 0.0,
+            "next_window_gap": 1.0,
+            "next_window_duration": 1.0,
+            "next_window_support": 0.5,
+            "precedent_future": 1.0,
+            "precedent_contrast": 1.0,
+            "precedent_anchor": 0.25,
+        },
+    },
+}
+
+LOSS_WEIGHT_ARG_TO_KEY: Dict[str, str] = {
+    "token_loss_weight": "token",
+    "event_token_loss_weight": "event_token",
+    "event_family_loss_weight": "event_family",
+    "event_payload_loss_weight": "event_payload",
+    "event_concept_loss_weight": "event_concept",
+    "event_dt_loss_weight": "event_dt",
+    "event_value_loss_weight": "event_value",
+    "value_loss_weight": "val",
+    "transition_loss_weight": "transition",
+    "win_boundary_loss_weight": "win_boundary",
+    "win_loss_weight": "win",
+    "len_loss_weight": "len",
+    "chunk_loss_weight": "chunk",
+    "time_loss_weight": "time",
+    "dt_loss_weight": "dt",
+    "next_window_gap_loss_weight": "next_window_gap",
+    "next_window_duration_loss_weight": "next_window_duration",
+    "next_window_support_loss_weight": "next_window_support",
+    "precedent_future_loss_weight": "precedent_future",
+    "precedent_contrast_loss_weight": "precedent_contrast",
+    "precedent_anchor_loss_weight": "precedent_anchor",
 }
 
 
@@ -261,6 +346,93 @@ def resolve_token_family_weights(
             )
         resolved[family] = weight
     return resolved
+
+
+def _cli_flag_present(raw_argv: Sequence[str], flag: str) -> bool:
+    target = str(flag)
+    return any(
+        str(token) == target or str(token).startswith(target + "=")
+        for token in raw_argv
+    )
+
+
+def resolve_objective_configuration(
+    *,
+    args: argparse.Namespace,
+    raw_argv: Sequence[str],
+) -> Dict[str, Any]:
+    preset_key = str(getattr(args, "objective_preset", "legacy_v1"))
+    if preset_key not in OBJECTIVE_PRESETS:
+        raise KeyError(
+            f"Unknown objective preset {preset_key!r}; expected one of {sorted(OBJECTIVE_PRESETS)}"
+        )
+    preset = OBJECTIVE_PRESETS[preset_key]
+
+    prefer_unified = getattr(args, "prefer_unified_token_loss", None)
+    if prefer_unified is None:
+        prefer_unified = bool(preset["prefer_unified_token_loss"])
+
+    token_family_weight_preset = str(getattr(args, "token_family_weight_preset", "none"))
+    if not _cli_flag_present(raw_argv, "--token_family_weight_preset"):
+        token_family_weight_preset = str(preset["token_family_weight_preset"])
+
+    resolved_weights = dict(preset["loss_weights"])
+    for arg_name, weight_key in LOSS_WEIGHT_ARG_TO_KEY.items():
+        flag = f"--{arg_name}"
+        if _cli_flag_present(raw_argv, flag):
+            resolved_weights[weight_key] = float(getattr(args, arg_name))
+
+    precedent_loss_start_step = getattr(args, "precedent_loss_start_step", None)
+    if precedent_loss_start_step is None:
+        precedent_loss_start_step = int(preset["precedent_loss_start_step"])
+    precedent_loss_ramp_steps = getattr(args, "precedent_loss_ramp_steps", None)
+    if precedent_loss_ramp_steps is None:
+        precedent_loss_ramp_steps = int(preset["precedent_loss_ramp_steps"])
+
+    return {
+        "preset": preset_key,
+        "prefer_unified_token_loss": bool(prefer_unified),
+        "token_family_weight_preset": str(token_family_weight_preset),
+        "loss_weights": {str(k): float(v) for k, v in resolved_weights.items()},
+        "precedent_loss_start_step": int(precedent_loss_start_step),
+        "precedent_loss_ramp_steps": int(precedent_loss_ramp_steps),
+    }
+
+
+def precedent_loss_scale_for_step(
+    *,
+    global_step: int,
+    start_step: int,
+    ramp_steps: int,
+) -> float:
+    step = int(global_step)
+    start = max(0, int(start_step))
+    ramp = max(0, int(ramp_steps))
+    if start <= 0:
+        return 1.0 if ramp == 0 else min(1.0, float(max(0, step + 1)) / float(max(1, ramp)))
+    if step < start:
+        return 0.0
+    if ramp <= 0:
+        return 1.0
+    return min(1.0, float(step - start + 1) / float(ramp))
+
+
+def resolve_scheduled_loss_weights(
+    *,
+    base_weights: Dict[str, float],
+    global_step: int,
+    precedent_loss_start_step: int,
+    precedent_loss_ramp_steps: int,
+) -> tuple[Dict[str, float], Dict[str, float]]:
+    weights = {str(k): float(v) for k, v in dict(base_weights).items()}
+    precedent_scale = precedent_loss_scale_for_step(
+        global_step=int(global_step),
+        start_step=int(precedent_loss_start_step),
+        ramp_steps=int(precedent_loss_ramp_steps),
+    )
+    for key in ("precedent_future", "precedent_contrast", "precedent_anchor"):
+        weights[key] = float(weights.get(key, 0.0)) * float(precedent_scale)
+    return weights, {"precedent_loss_scale": float(precedent_scale)}
 
 
 def resolve_precompiled_num_workers(requested_num_workers: int) -> int:
@@ -551,14 +723,25 @@ def evaluate(
     *,
     model: AdaptiveEpisodicTransformer,
     criterion: AETLossModule,
+    base_loss_weights: Dict[str, float],
     dataloader: DataLoader,
     device: torch.device,
     autocast_enabled: bool,
     autocast_dtype: torch.dtype,
     max_batches: int | None = None,
     carry_across_segments: bool = False,
+    global_step: int = 0,
+    precedent_loss_start_step: int = 0,
+    precedent_loss_ramp_steps: int = 0,
 ) -> Dict[str, float]:
     model.eval()
+    scheduled_weights, schedule_logs = resolve_scheduled_loss_weights(
+        base_weights=base_loss_weights,
+        global_step=int(global_step),
+        precedent_loss_start_step=int(precedent_loss_start_step),
+        precedent_loss_ramp_steps=int(precedent_loss_ramp_steps),
+    )
+    criterion.set_weights(scheduled_weights)
     total_loss = 0.0
     n_batches = 0
     log_acc: Dict[str, float] = {}
@@ -596,6 +779,7 @@ def evaluate(
         return {"loss": float("nan")}
     out = {"loss": total_loss / float(n_batches)}
     out.update(_mean_logs(log_acc, n_batches))
+    out.update(schedule_logs)
     return out
 
 
@@ -635,7 +819,9 @@ def main() -> None:
     ap = argparse.ArgumentParser(
         description=(
             "First representative v1 trainer for the hierarchical transformer. "
-            "Uses the current tokenization/windowing contract and a unified autoregressive token loss."
+            "Uses the current tokenization/windowing contract with an explicit "
+            "objective preset for either legacy unified-token training or the "
+            "world-model marked event objective."
         )
     )
     ap.add_argument("--meds_reader_db", default=None)
@@ -723,6 +909,13 @@ def main() -> None:
     ap.add_argument("--disable_transition_bias", action="store_true")
     ap.add_argument("--emit_switched_heads", action="store_true")
     ap.add_argument("--global_context_mode", choices=["transformer", "latent_state"], default="latent_state")
+    ap.add_argument(
+        "--objective_preset",
+        choices=sorted(OBJECTIVE_PRESETS.keys()),
+        default="world_model_mttee",
+    )
+    ap.add_argument("--prefer_unified_token_loss", dest="prefer_unified_token_loss", action="store_true")
+    ap.add_argument("--disable_prefer_unified_token_loss", dest="prefer_unified_token_loss", action="store_false")
     ap.add_argument("--carry_state_across_segments", dest="carry_state_across_segments", action="store_true")
     ap.add_argument("--disable_carry_state_across_segments", dest="carry_state_across_segments", action="store_false")
     ap.add_argument("--enable_exact_memory", dest="enable_exact_memory", action="store_true")
@@ -797,6 +990,7 @@ def main() -> None:
         enable_next_window_gap_nll_head=True,
         enable_next_window_duration_nll_head=True,
         enable_next_window_support_head=True,
+        prefer_unified_token_loss=None,
     )
 
     ap.add_argument("--token_loss_weight", type=float, default=1.0)
@@ -831,6 +1025,8 @@ def main() -> None:
     ap.add_argument("--precedent_future_loss_weight", type=float, default=1.0)
     ap.add_argument("--precedent_contrast_loss_weight", type=float, default=1.0)
     ap.add_argument("--precedent_anchor_loss_weight", type=float, default=0.25)
+    ap.add_argument("--precedent_loss_start_step", type=int, default=None)
+    ap.add_argument("--precedent_loss_ramp_steps", type=int, default=None)
 
     ap.add_argument("--disable_residual_fallback", action="store_true")
     ap.add_argument("--residual_fallback_buckets", type=int, default=39999)
@@ -838,7 +1034,9 @@ def main() -> None:
     ap.add_argument("--proc_residual_offset", type=int, default=None)
     ap.add_argument("--med_residual_offset", type=int, default=None)
 
+    raw_argv = tuple(sys.argv[1:])
     args = ap.parse_args()
+    objective_cfg = resolve_objective_configuration(args=args, raw_argv=raw_argv)
 
     random.seed(int(args.seed))
     torch.manual_seed(int(args.seed))
@@ -1103,7 +1301,7 @@ def main() -> None:
         enable_next_window_support_head=bool(args.enable_next_window_support_head),
     )
     token_family_weights = resolve_token_family_weights(
-        preset=str(args.token_family_weight_preset),
+        preset=str(objective_cfg["token_family_weight_preset"]),
         overrides=args.token_family_weight,
     )
     model = AdaptiveEpisodicTransformer(model_cfg, vocab_config).to(device)
@@ -1111,30 +1309,10 @@ def main() -> None:
         vocab_config=vocab_config,
         token_family_weights=token_family_weights,
         strict_routing=True,
-        weights={
-            "token": float(args.token_loss_weight),
-            "event_token": float(args.event_token_loss_weight),
-            "event_family": float(args.event_family_loss_weight),
-            "event_payload": float(args.event_payload_loss_weight),
-            "event_concept": float(args.event_concept_loss_weight),
-            "event_dt": float(args.event_dt_loss_weight),
-            "event_value": float(args.event_value_loss_weight),
-            "val": float(args.value_loss_weight),
-            "transition": float(args.transition_loss_weight),
-            "win_boundary": float(args.win_boundary_loss_weight),
-            "win": float(args.win_loss_weight),
-            "len": float(args.len_loss_weight),
-            "chunk": float(args.chunk_loss_weight),
-            "time": float(args.time_loss_weight),
-            "dt": float(args.dt_loss_weight),
-            "next_window_gap": float(args.next_window_gap_loss_weight),
-            "next_window_duration": float(args.next_window_duration_loss_weight),
-            "next_window_support": float(args.next_window_support_loss_weight),
-            "precedent_future": float(args.precedent_future_loss_weight),
-            "precedent_contrast": float(args.precedent_contrast_loss_weight),
-            "precedent_anchor": float(args.precedent_anchor_loss_weight),
-        },
+        prefer_unified_token_loss=bool(objective_cfg["prefer_unified_token_loss"]),
+        weights=dict(objective_cfg["loss_weights"]),
     ).to(device)
+    base_loss_weights = dict(objective_cfg["loss_weights"])
     optimizer = torch.optim.AdamW(
         build_optimizer_param_groups(model, float(args.weight_decay)),
         lr=float(args.lr),
@@ -1169,6 +1347,7 @@ def main() -> None:
 
     run_meta = {
         "args": vars(args),
+        "objective": objective_cfg,
         "token_family_weights": token_family_weights,
         "model_config": asdict(model_cfg),
         "input_pipeline": pipeline_summary,
@@ -1190,12 +1369,16 @@ def main() -> None:
         latest_val_metrics = evaluate(
             model=model,
             criterion=criterion,
+            base_loss_weights=base_loss_weights,
             dataloader=eval_loader,
             device=device,
             autocast_enabled=autocast_enabled,
             autocast_dtype=autocast_dtype,
             max_batches=args.max_eval_batches,
             carry_across_segments=bool(args.carry_state_across_segments),
+            global_step=global_step,
+            precedent_loss_start_step=int(objective_cfg["precedent_loss_start_step"]),
+            precedent_loss_ramp_steps=int(objective_cfg["precedent_loss_ramp_steps"]),
         )
         eval_payload = {
             "event": "eval_only",
@@ -1230,6 +1413,13 @@ def main() -> None:
         pbar = tqdm(train_loader, desc=f"train epoch {epoch}")
         for batch_idx, batch in enumerate(pbar, start=1):
             tensor_batch = _move_batch_to_device(batch, device)
+            scheduled_weights, schedule_logs = resolve_scheduled_loss_weights(
+                base_weights=base_loss_weights,
+                global_step=global_step,
+                precedent_loss_start_step=int(objective_cfg["precedent_loss_start_step"]),
+                precedent_loss_ramp_steps=int(objective_cfg["precedent_loss_ramp_steps"]),
+            )
+            criterion.set_weights(scheduled_weights)
             prev_global_state, prev_memory_state = _resolve_carry_inputs(
                 tensor_batch=tensor_batch,
                 model=model,
@@ -1287,6 +1477,7 @@ def main() -> None:
                 "grad_norm": float(grad_norm),
                 "lr": float(optimizer.param_groups[0]["lr"]),
             }
+            step_metrics.update(schedule_logs)
             step_metrics.update(logs)
             with log_jsonl.open("a", encoding="utf-8") as fp:
                 fp.write(json.dumps(step_metrics) + "\n")
@@ -1295,12 +1486,16 @@ def main() -> None:
                 latest_val_metrics = evaluate(
                     model=model,
                     criterion=criterion,
+                    base_loss_weights=base_loss_weights,
                     dataloader=eval_loader,
                     device=device,
                     autocast_enabled=autocast_enabled,
                     autocast_dtype=autocast_dtype,
                     max_batches=args.max_eval_batches,
                     carry_across_segments=bool(args.carry_state_across_segments),
+                    global_step=global_step,
+                    precedent_loss_start_step=int(objective_cfg["precedent_loss_start_step"]),
+                    precedent_loss_ramp_steps=int(objective_cfg["precedent_loss_ramp_steps"]),
                 )
                 val_loss = float(latest_val_metrics.get("loss", float("inf")))
                 if best_val_loss is None or val_loss < float(best_val_loss):
@@ -1353,12 +1548,16 @@ def main() -> None:
             latest_val_metrics = evaluate(
                 model=model,
                 criterion=criterion,
+                base_loss_weights=base_loss_weights,
                 dataloader=eval_loader,
                 device=device,
                 autocast_enabled=autocast_enabled,
                 autocast_dtype=autocast_dtype,
                 max_batches=args.max_eval_batches,
                 carry_across_segments=bool(args.carry_state_across_segments),
+                global_step=global_step,
+                precedent_loss_start_step=int(objective_cfg["precedent_loss_start_step"]),
+                precedent_loss_ramp_steps=int(objective_cfg["precedent_loss_ramp_steps"]),
             )
             val_loss = float(latest_val_metrics.get("loss", float("inf")))
             if best_val_loss is None or val_loss < float(best_val_loss):

@@ -399,6 +399,14 @@ Already implemented:
     - coarse support profile
     with teacher forcing when observed next-window metadata is available
   - prompt-conditioned local fusion for the next window
+- Phase 5.5 core training/objective substrate is now in code:
+  - explicit `world_model_mttee` objective preset in
+    `scripts/train_transformer_v1.py`
+  - delayed precedent-loss curriculum in the trainer
+  - loss-module support for marked-primary supervision with dense token CE as
+    auxiliary rather than the preferred path
+  - patient-memory aging aligned to boundary hours instead of semantic-window
+    step count
 - the event-native marked loss path is implemented
 - the default symbolic contract prefers exact residual vocabularies or explicit
   `UNK`; production hash fallback is no longer implicit
@@ -406,6 +414,12 @@ Already implemented:
 Not yet implemented:
 
 - full `WindowStatePacket` usage across all long-range interfaces
+- implementation of the full Phase 5.5 family-level MTTE contract, especially:
+  - explicit family-by-family marked-event roles
+  - categorical/numeric attribute heads for medication and qualitative
+    observation payloads
+  - retirement of legacy RVQ / marker-token supervision from the primary
+    objective path wherever they only exist for dense-token compatibility
 - ANN-accelerated precedent lookup beyond the current dense exact store
 - chunk-refresh precedent queries during long generated windows
 - retrieval-conditioned latent updates
@@ -488,14 +502,21 @@ and their roles:
 1. Complete the migration from the legacy single-vector window summary to full
    `WindowStatePacket` usage across latent updates, memory interfaces, and
    retrieval.
-2. Evaluate the current dual-memory decoder path and compare:
+2. Implement Phase 5.5 objective/tokenization/time-substrate harmonization
+   before spending substantial LRZ budget on architecture comparisons.
+3. Run short shaping experiments to validate the revised primary loss geometry
+   before broad ablations:
+   - core marked objective only
+   - core marked objective + patient memory
+   - resumed dual-memory run with delayed precedent losses
+4. Evaluate the current dual-memory decoder path and compare:
    - no memory
    - patient memory only
    - precedent memory only
    - dual memory
-3. Add multi-step rollout evaluation on top of the current header-conditioned
+5. Add multi-step rollout evaluation on top of the current header-conditioned
    dual-memory path.
-4. Finalize the latent mechanism only after Phase 4 and Phase 5 clarify what
+6. Finalize the latent mechanism only after Phase 5.5 and Phase 5 clarify what
    retrieval and rollout actually demand from the frozen latent family.
 
 ## Concrete Implementation Path
@@ -1042,6 +1063,353 @@ Phase 5 is complete when:
   - latent + patient memory
   - latent + precedent memory
   - full dual memory
+
+### Phase 5.5. Objective, tokenization, and temporal-substrate harmonization
+
+Primary files:
+
+- `src/ehr_hier/transformer/loss.py`
+- `src/ehr_hier/transformer/model.py`
+- `src/ehr_hier/transformer/heads.py`
+- `src/ehr_hier/transformer/event_composer.py`
+- `src/ehr_hier/transformer/collator.py`
+- `src/ehr_hier/data/event_frames.py`
+- `src/ehr_hier/data/subject_timeline_builder.py`
+- `src/ehr_hier/transformer/global_state.py`
+- `src/ehr_hier/transformer/precedent_memory.py`
+- `src/ehr_hier/transformer/episodic_memory.py`
+- `scripts/train_transformer_v1.py`
+
+Implementation:
+
+This phase freezes the substrate on which all later architecture comparisons
+depend. The main questions are now:
+
+- what exactly counts as one marked event
+- which losses are primary versus auxiliary
+- how numeric value is attached to an event
+- which time variables are canonical and which are redundant views
+
+Phase 5.5 must be completed before broad LRZ ablations or final latent-family
+selection.
+
+#### Phase 5.5 primary objective
+
+The default world-model objective should be a **marked time-to-event objective**
+over the event-native lane, not dense token CE with marked heads treated as
+secondary add-ons.
+
+The primary loss stack should be:
+
+- event-family CE
+- event-payload CE
+- family-conditioned event-concept CE
+- event inter-arrival / next-event time NLL
+- numeric event-value NLL for measurement-like payloads
+- next-window type head
+- next-window gap NLL
+- next-window duration NLL
+- next-window support-profile BCE
+
+The auxiliary loss stack should be:
+
+- dense unified token CE only as stabilization, with low weight or disabled by
+  default once the marked path is stable
+- legacy switched token heads only for compatibility debugging
+- precedent future/contrast/anchor losses as delayed curriculum terms, not as
+  cold-start primary objectives
+
+The repo must no longer default to a regime where dense token CE is the
+preferred supervisory path whenever `logits_token` exists.
+
+#### Phase 5.5 event/value factorization contract
+
+Every clinically meaningful emitted object must map cleanly onto one marked
+event with one timestamp and one family assignment.
+
+The intended factorization is:
+
+- `family`:
+  coarse clinical event family
+- `payload`:
+  measurement-like versus symbolic subtype
+- `concept`:
+  family-conditioned discrete identity
+- `dt`:
+  time to the next event on the event lane
+- `value`:
+  conditional numeric payload only when the payload kind is numeric
+
+This means:
+
+- measurement code and measurement value belong to one marked event, not two
+  unrelated competing events
+- diagnoses, procedures, medications, and structural/process events are marked
+  events without numeric value supervision
+- exact-memory writes operate over event objects, not over detached value tokens
+
+Tokenization must therefore be re-audited so no family is forced into a
+single-dense-token formulation that contradicts the marked objective.
+
+#### Phase 5.5 tokenization audit requirements
+
+Re-audit all event families against the marked objective:
+
+- numeric measurements:
+  confirm that code, timestamp, and value are emitted as one event object whose
+  value head is conditional on the code-conditioned event representation, and
+  that legacy RVQ bundle tokens are not treated as the primary semantic target
+- qualitative/non-numeric measurements:
+  confirm that non-numeric observations enter as explicit observation event
+  frames rather than degenerate measurement-token fallbacks
+- symbolic diagnoses and procedures:
+  confirm that residual-vocab handling remains explicit at the event-concept
+  level and does not leak objective semantics back into dense token CE
+- medications:
+  confirm what constitutes one medication event and which modifiers should be
+  modeled as categorical or numeric attributes under that event rather than as
+  separate autoregressive token targets
+- structural/process events:
+  confirm that boundaries and overlays remain true marked events, not only
+  control tokens
+- special / demographic markers:
+  confirm which are event-lane objects, which are header/static-bank seeds, and
+  which should never be treated as ordinary autoregressive targets
+
+#### Phase 5.5 family-level MTTE contract
+
+The tokenization audit should freeze the following family-by-family target
+contract for the world-model objective.
+
+- `numeric_measurement` payload:
+  one marked event frame with:
+  - `family = measurement`
+  - `concept = measurement code`
+  - `dt = next event delta on the event lane`
+  - `value = one continuous standardized scalar`
+  The current cVAE/RVQ bundle may remain as a compatibility encoding path, but
+  it is not the primary semantic object. The primary training target is the
+  event-level continuous value. At generation time, the intended long-term path
+  is to generate the continuous value first and only optionally re-discretize
+  it for backward-compatibility exports.
+
+- `qualitative_observation` payload:
+  one marked event frame with:
+  - `family = observation`
+  - `concept = observation code`
+  - `dt = next event delta on the event lane`
+  - `categorical attributes = observation value / interpretation / status`
+  Qualitative observation fallback for non-numeric measurement must remain an
+  explicit observation event frame. It should not be reduced to an opaque
+  dense-token fallback. Observation value categories belong to explicit
+  attribute targets under the same event, not to detached continuation tokens.
+
+- `symbolic_code` payload for diagnoses:
+  one marked event frame with:
+  - `family = diagnosis`
+  - `concept = resolved diagnosis concept`
+  - `dt = next event delta on the event lane`
+  - `value = none`
+  Exact residual concepts are allowed as explicit concept targets under the
+  diagnosis family head. Hash-only residual fallback is not an acceptable
+  primary semantic target for the world-model regime.
+
+- `symbolic_code` payload for procedures:
+  one marked event frame with:
+  - `family = procedure`
+  - `concept = resolved procedure concept`
+  - `dt = next event delta on the event lane`
+  - `value = none`
+  The same residual policy as diagnoses applies: explicit residual concepts may
+  participate in the family-conditioned concept head; opaque hash fallback
+  should not be a primary marked target.
+
+- `symbolic_code` payload for medications:
+  one medication event frame with:
+  - `family = medication`
+  - `concept = resolved medication concept`
+  - `dt = next event delta on the event lane`
+  - `categorical attributes = route / formulation / administration-action-like context`
+  - `numeric attributes = dose / rate / duration when available`
+  Medication metadata should not be collapsed into one generic scalar `value`.
+  Dose, rate, and duration require typed conditional attribute heads if they
+  are supervised generatively. Start/end/stop semantics should not remain
+  semantically dependent on a second marker token in the primary objective;
+  they should be folded into medication action attributes or promoted to an
+  explicit process/structural event representation.
+
+- `structural` / `process` payloads:
+  one marked event frame with:
+  - `family = structural/process`
+  - `concept = explicit boundary / overlay / transition concept`
+  - `dt = next event delta on the event lane`
+  - `value = none`
+  These remain first-class marked events because they define semantic care
+  windows and intervention regime changes.
+
+- `demographic` / static-header payloads:
+  these are not ordinary autoregressive marked events for the main objective.
+  They should seed static memory, admission/header context, or control tokens.
+  They may remain present on the timeline for alignment/debugging, but they are
+  not the target object of ordinary concept/value generation.
+
+#### Phase 5.5 fallback and residual policy
+
+All canonical and fallback paths must still enter the model as sensible event
+frames rather than as semantically detached token leftovers.
+
+- non-numeric measurement fallback must become
+  `payload = qualitative_observation`
+  with an explicit observation concept and categorical observation-value
+  attributes
+- residual-exact diagnosis / procedure / medication mappings must remain
+  explicit concept targets within their own family heads
+- residual-hash fallbacks are allowed only as a last-resort compatibility path
+  and should be disabled for primary world-model shaping runs whenever possible
+- explicit `UNK` concepts are preferable to opaque hash buckets when the model
+  would otherwise be asked to learn a semantically meaningless marked target
+- legacy secondary bundle tokens that exist only for old dense-token decoding
+  must not define the primary marked-event semantics
+
+#### Phase 5.5 inference-alignment requirement
+
+The audit must also state how each family should be generated once the model is
+fully aligned to the marked objective.
+
+- numeric measurements:
+  generate `concept`, `dt`, and continuous `value`, then optionally
+  discretize/export through the old cVAE/RVQ path only if compatibility with
+  legacy token views is required
+- qualitative observations:
+  generate observation concept plus categorical value/status attributes within
+  the same event frame
+- diagnoses / procedures / structural/process:
+  generate only concept and timing
+- medications:
+  generate concept and timing first, then conditional categorical/numeric
+  attributes; do not treat medication attribute generation as ordinary dense
+  token continuation
+- static/demographic/header objects:
+  seed context and memory, not free-running event generation
+
+The tokenization audit should end with one explicit repo-level statement:
+
+- which families participate in marked concept prediction
+- which families participate in continuous value prediction
+- which families participate in categorical or typed attribute prediction
+- which families are header/static metadata only
+- which legacy dense-token targets remain auxiliary only
+
+#### Phase 5.5 temporal substrate contract
+
+Time must be made consistent across local MTTE modeling, latent drift,
+patient-memory aging, precedent retrieval, and window-header prediction.
+
+Adopt the following canonical clocks:
+
+- `event_dt`:
+  local inter-event delta on the event lane inside semantic windows
+- `window_start_h`:
+  absolute semantic-window start time on the patient timeline
+- `window_duration_h`:
+  duration of the current semantic window
+- `gap_prev_h`:
+  elapsed time between the previous semantic boundary and the current one
+- `memory_age_h`:
+  elapsed time since a patient-memory item was written, derived from boundary
+  times rather than an independent clock
+
+Use them as follows:
+
+- local marked generation supervises only `event_dt` on the event lane
+- `WindowStatePacket`, `NextWindowHeader`, and precedent keys use
+  `window_start_h`, `window_duration_h`, and `gap_prev_h`
+- latent drift uses boundary-level gaps, not raw token timestamps
+- patient-memory age decay uses `memory_age_h`
+- precedent retrieval uses boundary timing metadata only, not local token-time
+  sequences directly
+
+This phase should explicitly remove redundant time pathways where the same time
+quantity is injected twice under different names without a clear role.
+
+#### Phase 5.5 training curriculum
+
+The default training schedule should become phased:
+
+1. **Marked-objective warmup**
+   - train the event-family / payload / concept / dt / value path
+   - train next-window type / gap / duration / support heads
+   - keep dense token CE low-weight or off
+   - keep precedent metric losses off
+2. **Patient-memory integration**
+   - enable exact-memory retrieval/write with the same primary marked objective
+   - verify that memory improves generation without changing the basic loss
+     geometry
+3. **Precedent-metric curriculum**
+   - enable precedent future/contrast/anchor losses only after the marked path
+     and boundary heads are stable
+   - treat precedent losses as shaping terms on top of a functioning generative
+     model, not as early representation-learning substitutes
+
+This curriculum is the default answer to the identifiability problem:
+retrieval similarity should be learned after the model has a sensible future
+geometry, not before.
+
+#### Phase 5.5 concrete code changes
+
+Implement the phase in the following order:
+
+1. In `loss.py`:
+   - demote `prefer_unified_token_loss` from the default training path
+   - make the marked event losses the preferred primary path
+   - group losses into:
+     - primary marked
+     - primary boundary/header
+     - auxiliary token
+     - delayed precedent
+2. In `train_transformer_v1.py`:
+   - expose an explicit objective preset for the world-model regime
+   - add curriculum controls for when precedent losses turn on and at what
+     weight
+   - make dense token CE opt-in or clearly low-weight under that preset
+3. In `event_frames.py`, `subject_timeline_builder.py`, `collator.py`, and
+   `event_composer.py`:
+   - audit every family against the marked-event factorization above
+   - remove or document any tokenization choices that exist only for legacy
+     dense-token CE compatibility
+   - make explicit which fallback paths produce:
+     - numeric-measurement events
+     - qualitative-observation events
+     - symbolic concept events with explicit residual concepts
+   - identify which medication/observation attributes require dedicated heads
+     instead of being collapsed into one scalar or left implicit in token
+     bundles
+4. In `global_state.py`, `episodic_memory.py`, and `precedent_memory.py`:
+   - align every time-dependent operation to the canonical clocks above
+   - document which clock each module consumes
+5. In tests:
+   - add coverage proving that primary marked losses can run with dense token CE
+     disabled
+   - add coverage proving that numeric value supervision stays attached to
+     measurement-like marked events
+   - add coverage proving that boundary/header timing and memory-age timing are
+     derived consistently from the same timeline substrate
+
+#### Phase 5.5 deliverable
+
+Phase 5.5 is complete when:
+
+- the repo has one explicit world-model objective preset centered on marked
+  event generation
+- dense token CE is auxiliary rather than the default preferred path
+- every event family has an auditable marked-event/tokenization role
+- every canonical and fallback path enters the world-model objective as a
+  sensible event frame rather than as an opaque token-only artifact
+- time enters the model through one coherent substrate with no unresolved
+  duplication between local generation, latent drift, memory aging, and
+  precedent retrieval
+- short shaping runs can be launched without ambiguity about which losses are
+  meant to converge first
 
 ### Phase 6. Final latent mechanism selection
 

@@ -807,6 +807,8 @@ class AETEpisodicMemory(nn.Module):
         event_demographic_feature_ids: torch.Tensor | None = None,
         query_states: torch.Tensor,
         window_mask: torch.Tensor,
+        window_start_times: torch.Tensor | None = None,
+        semantic_duration_hours: torch.Tensor | None = None,
         prev_memory_state: PatientMemoryState | EpisodicMemoryState | None = None,
         event_memory_rule_scores: torch.Tensor | None = None,
         event_memory_group_ids: torch.Tensor | None = None,
@@ -849,8 +851,21 @@ class AETEpisodicMemory(nn.Module):
                 "window_mask must be (B,W) aligned with event_states; "
                 f"got {tuple(window_mask.shape)} vs {tuple(event_states.shape[:2])}"
             )
-
         B, W, C, E, D = event_states.shape
+        if window_start_times is None:
+            window_start_times = event_states.new_zeros((B, W))
+        elif window_start_times.shape != event_states.shape[:2]:
+            raise ValueError(
+                "window_start_times must be (B,W) aligned with event_states; "
+                f"got {tuple(window_start_times.shape)} vs {tuple(event_states.shape[:2])}"
+            )
+        if semantic_duration_hours is None:
+            semantic_duration_hours = event_states.new_zeros((B, W))
+        elif semantic_duration_hours.shape != event_states.shape[:2]:
+            raise ValueError(
+                "semantic_duration_hours must be (B,W) aligned with event_states; "
+                f"got {tuple(semantic_duration_hours.shape)} vs {tuple(event_states.shape[:2])}"
+            )
         device = event_states.device
         context = event_states.new_zeros((B, W, D))
         retrieval_counts = torch.zeros((B, W), device=device, dtype=torch.long)
@@ -1042,6 +1057,7 @@ class AETEpisodicMemory(nn.Module):
                 if not bool(window_mask[b, w].item()):
                     continue
 
+                current_query_h = float(window_start_times[b, w].item())
                 retrieved_contexts: list[torch.Tensor] = []
                 retrieved_ids_agg: list[torch.Tensor] = []
                 for bank, reservoir in (
@@ -1056,9 +1072,9 @@ class AETEpisodicMemory(nn.Module):
                         reservoir_ids=reservoir[3],
                         reservoir_groups=reservoir[4],
                         reservoir_age_bases=(
-                            reservoir[5]
+                            torch.zeros_like(reservoir[5])
                             if bank == PatientMemoryBank.STATIC
-                            else (reservoir[5] + float(w))
+                            else (current_query_h - reservoir[5]).clamp(min=0.0)
                         ),
                         reservoir_rule_scores=reservoir[6],
                         retrieve_k=self._bank_retrieve_k(bank),
@@ -1138,8 +1154,11 @@ class AETEpisodicMemory(nn.Module):
                     target[2] = torch.cat([target[2], top_scores[write_idx : write_idx + 1]], dim=0)
                     target[3] = torch.cat([target[3], new_ids[write_idx : write_idx + 1]], dim=0)
                     target[4] = torch.cat([target[4], new_groups[write_idx : write_idx + 1]], dim=0)
+                    current_window_end_h = float(window_start_times[b, w].item()) + float(
+                        semantic_duration_hours[b, w].item()
+                    )
                     target[5] = torch.cat(
-                        [target[5], top_scores.new_full((1,), fill_value=-float(w))],
+                        [target[5], top_scores.new_full((1,), fill_value=current_window_end_h)],
                         dim=0,
                     )
                     target[6] = torch.cat(
@@ -1211,11 +1230,7 @@ class AETEpisodicMemory(nn.Module):
                 bank_state.scores[b, :keep_count] = reservoir[2][keep_idx]
                 bank_state.event_ids[b, :keep_count] = reservoir[3][keep_idx]
                 bank_state.group_ids[b, :keep_count] = reservoir[4][keep_idx]
-                bank_state.age_bases[b, :keep_count] = (
-                    reservoir[5][keep_idx]
-                    if bank == PatientMemoryBank.STATIC
-                    else (reservoir[5][keep_idx] + float(valid_windows)).clamp(min=0.0)
-                )
+                bank_state.age_bases[b, :keep_count] = reservoir[5][keep_idx]
                 bank_state.rule_scores[b, :keep_count] = reservoir[6][keep_idx]
                 bank_state.valid_mask[b, :keep_count] = True
 
