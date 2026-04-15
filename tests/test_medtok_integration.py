@@ -455,11 +455,13 @@ def test_medtok_metadata_bundle(monkeypatch, tiny_vocabs):
     # Offsets: base tokens in med band; attrs stored inside EventToken
     assert med_vocab.offset <= first.value_id < 1_600_000
     assert first.cat_attrs == {
+        "med_group": first.cat_attrs["med_group"],
         "route": med_attr_vocabs["route"].encode("PO"),
         "form": med_attr_vocabs["form"].encode("TABLET"),
         "freq": med_attr_vocabs["freq"].encode("BID"),
         "unit": med_attr_vocabs["unit"].encode("MG"),
     }
+    assert first.cat_attrs["med_group"] >= 1_670_000
 
     # Numeric metadata normalized to [0,1]
     assert first.num_attrs["dosage"] == pytest.approx(med_numeric_attrs["dosage"].normalize(50.0))
@@ -512,6 +514,7 @@ def test_medtok_start_stop_markers(monkeypatch, tiny_vocabs):
     # First event
     assert tokens[0].value_id == base_id
     assert tokens[0].dt_from_prev_hours == 0.0
+    assert tokens[0].cat_attrs.get("event_marker") == 1  # START on base event
     assert tokens[1].value_id == marker_id
     assert tokens[1].dt_from_prev_hours == 0.0
     assert tokens[1].cat_attrs.get("event_marker") == 1  # START
@@ -519,6 +522,11 @@ def test_medtok_start_stop_markers(monkeypatch, tiny_vocabs):
     # Second event (dt progresses)
     assert tokens[2].value_id == base_id
     assert tokens[2].dt_from_prev_hours == 2.0
+    assert tokens[2].cat_attrs.get("event_marker") == 3  # STOP on base event
     assert tokens[3].value_id == marker_id
     assert tokens[3].dt_from_prev_hours == 0.0
     assert tokens[3].cat_attrs.get("event_marker") == 3  # STOP
+
+    assert frames[0].group_code is not None
+    assert frames[0].group_code.startswith("MED_GROUP::")
+    assert frames[0].semantic_label is not None

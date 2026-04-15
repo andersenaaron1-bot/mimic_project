@@ -66,7 +66,7 @@ class AETLossModule(nn.Module):
         self.prefer_unified_token_loss = bool(prefer_unified_token_loss)
         self.ignore_nonmarker_special_targets = bool(ignore_nonmarker_special_targets)
         self.special_type_id = int(special_type_id)
-        self.weights = weights or {
+        self.default_weights = {
             "token": 1.0,
             "event_token": 1.0,
             "event_family": 1.0,
@@ -74,6 +74,15 @@ class AETLossModule(nn.Module):
             "event_concept": 1.0,
             "event_dt": 1.0,
             "event_value": 1.0,
+            "event_med_group": 0.5,
+            "event_med_route": 0.25,
+            "event_med_form": 0.25,
+            "event_med_freq": 0.25,
+            "event_med_unit": 0.25,
+            "event_med_marker": 0.25,
+            "event_med_dosage": 0.25,
+            "event_med_rate": 0.25,
+            "event_med_duration": 0.25,
             "struct": 5.0,
             "rvq": 1.0,
             "meas": 1.0,
@@ -90,6 +99,9 @@ class AETLossModule(nn.Module):
             "next_window_duration": 1.0,
             "next_window_support": 0.5,
         }
+        self.weights = dict(self.default_weights)
+        if weights:
+            self.weights.update({str(k): float(v) for k, v in dict(weights).items()})
 
         self.ce_loss = nn.CrossEntropyLoss(reduction="none")
         self.mse_loss = nn.MSELoss(reduction="none")
@@ -109,7 +121,9 @@ class AETLossModule(nn.Module):
         self.prefer_unified_token_loss = bool(enabled)
 
     def set_weights(self, weights: dict[str, float]) -> None:
-        self.weights = {str(k): float(v) for k, v in dict(weights).items()}
+        merged = dict(self.default_weights)
+        merged.update({str(k): float(v) for k, v in dict(weights).items()})
+        self.weights = merged
 
     @staticmethod
     def _build_marker_info(vocab_config: dict) -> dict[str, int]:
@@ -201,6 +215,22 @@ class AETLossModule(nn.Module):
                 }
             )
         return event_routing
+
+    @staticmethod
+    def _sparse_family_meta(vocab_config: dict, family_name: str) -> dict[str, int]:
+        sparse_contract = vocab_config.get("sparse_vocab_contract", {})
+        if not isinstance(sparse_contract, dict):
+            return {}
+        families = sparse_contract.get("families", {})
+        if not isinstance(families, dict):
+            return {}
+        payload = families.get(str(family_name), {})
+        if not isinstance(payload, dict):
+            return {}
+        return {
+            "offset": int(payload.get("offset", 0)),
+            "size": int(payload.get("source_size", 0)),
+        }
 
     @classmethod
     def _build_token_family_group_ids(cls, vocab_config: dict) -> tuple[Tuple[str, ...], torch.Tensor]:
@@ -666,6 +696,42 @@ class AETLossModule(nn.Module):
             return feature.reshape(B * W, C * L)
         raise ValueError(f"feature must be 3D or 4D, got shape {tuple(feature.shape)}")
 
+    @staticmethod
+    def _flatten_sequence_logits(logits: torch.Tensor) -> torch.Tensor:
+        if logits.ndim == 4:
+            B, W, L, V = logits.shape
+            return logits.reshape(B * W, L, V)
+        if logits.ndim == 5:
+            B, W, C, L, V = logits.shape
+            return logits.reshape(B * W, C * L, V)
+        raise ValueError(f"logits must be 4D or 5D, got shape {tuple(logits.shape)}")
+
+    @staticmethod
+    def _next_content_feature_targets(
+        feature: torch.Tensor,
+        *,
+        content_mask: torch.Tensor,
+        feature_present_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        feature_flat = AETLossModule._flatten_sequence_feature(feature)
+        content_mask_flat = AETLossModule._flatten_sequence_feature(content_mask.to(dtype=torch.bool))
+        present_mask_flat = AETLossModule._flatten_sequence_feature(feature_present_mask.to(dtype=torch.bool))
+        next_feature = torch.zeros_like(feature_flat)
+        next_present = torch.zeros_like(present_mask_flat, dtype=torch.bool)
+        next_exists = torch.zeros_like(content_mask_flat, dtype=torch.bool)
+        last_feature = torch.zeros((feature_flat.shape[0],), device=feature_flat.device, dtype=feature_flat.dtype)
+        last_present = torch.zeros((feature_flat.shape[0],), device=feature_flat.device, dtype=torch.bool)
+        has = torch.zeros((feature_flat.shape[0],), device=feature_flat.device, dtype=torch.bool)
+        for i in range(feature_flat.shape[1] - 1, -1, -1):
+            next_feature[:, i] = last_feature
+            next_present[:, i] = last_present
+            next_exists[:, i] = has
+            cur = content_mask_flat[:, i]
+            last_feature = torch.where(cur, feature_flat[:, i], last_feature)
+            last_present = torch.where(cur, present_mask_flat[:, i], last_present)
+            has = has | cur
+        return next_feature, next_present, next_exists
+
     def _compute_autoregressive_ce_lane(
         self,
         *,
@@ -1044,6 +1110,200 @@ class AETLossModule(nn.Module):
 
         y_true = next_value.to(dtype=mu_flat.dtype)
         nll = 0.5 * ((y_true - mu_flat) / sigma_flat).square() + torch.log(sigma_flat)
+        loss = nll[supervise_mask].mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_event_sparse_attr_ce_lane(
+        self,
+        *,
+        pred_logits: torch.Tensor | None,
+        attr_targets: torch.Tensor | None,
+        attr_mask: torch.Tensor | None,
+        event_attention_mask: torch.Tensor | None,
+        event_type_ids: torch.Tensor | None,
+        family_name: str,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if (
+            pred_logits is None
+            or attr_targets is None
+            or attr_mask is None
+            or event_attention_mask is None
+            or event_type_ids is None
+        ):
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+
+        meta = self._sparse_family_meta(self.vocab_config, family_name)
+        offset = int(meta.get("offset", 0))
+        family_size = int(meta.get("size", 0))
+        if family_size <= 0:
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+        if pred_logits.shape[:-1] != attr_targets.shape or int(pred_logits.shape[-1]) != family_size:
+            raise ValueError(
+                f"{log_key} logits must match attr target shape with family size {family_size}; "
+                f"got {tuple(pred_logits.shape)} vs {tuple(attr_targets.shape)}"
+            )
+        if (
+            attr_mask.shape != attr_targets.shape
+            or event_attention_mask.shape != attr_targets.shape
+            or event_type_ids.shape != attr_targets.shape
+        ):
+            raise ValueError(f"{log_key} masks and ids must match attr target shape {tuple(attr_targets.shape)}")
+
+        content_mask = event_attention_mask.to(dtype=torch.bool) & (
+            event_type_ids != int(self.special_type_id)
+        )
+        next_target, next_present, next_exists = self._next_content_feature_targets(
+            attr_targets.to(dtype=torch.long),
+            content_mask=content_mask,
+            feature_present_mask=attr_mask.to(dtype=torch.bool),
+        )
+        pred_flat = self._flatten_sequence_logits(torch.nan_to_num(pred_logits, nan=0.0, posinf=0.0, neginf=0.0))
+        content_mask_flat = self._flatten_sequence_feature(content_mask)
+        supervise_mask = content_mask_flat & next_exists & next_present
+        if not supervise_mask.any():
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+
+        local_targets = (next_target - int(offset)).to(dtype=torch.long)
+        valid_targets = local_targets[supervise_mask]
+        if ((valid_targets < 0) | (valid_targets >= family_size)).any():
+            raise ValueError(
+                f"{log_key} encountered out-of-range targets after subtracting offset {offset}; "
+                f"sample={valid_targets[:8].tolist()}"
+            )
+        loss = self.ce_loss(pred_flat[supervise_mask], valid_targets).mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        preds = pred_flat.argmax(dim=-1)
+        acc = (preds[supervise_mask] == valid_targets).to(dtype=torch.float32).mean()
+        lane_logs[f"acc_{log_key.removeprefix('loss_')}"] = float(acc.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_event_local_attr_ce_lane(
+        self,
+        *,
+        pred_logits: torch.Tensor | None,
+        attr_targets: torch.Tensor | None,
+        attr_mask: torch.Tensor | None,
+        event_attention_mask: torch.Tensor | None,
+        event_type_ids: torch.Tensor | None,
+        num_classes: int,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if (
+            pred_logits is None
+            or attr_targets is None
+            or attr_mask is None
+            or event_attention_mask is None
+            or event_type_ids is None
+        ):
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+        if pred_logits.shape[:-1] != attr_targets.shape or int(pred_logits.shape[-1]) != int(num_classes):
+            raise ValueError(
+                f"{log_key} logits must match attr target shape with num_classes={num_classes}; "
+                f"got {tuple(pred_logits.shape)} vs {tuple(attr_targets.shape)}"
+            )
+        if (
+            attr_mask.shape != attr_targets.shape
+            or event_attention_mask.shape != attr_targets.shape
+            or event_type_ids.shape != attr_targets.shape
+        ):
+            raise ValueError(f"{log_key} masks and ids must match attr target shape {tuple(attr_targets.shape)}")
+
+        content_mask = event_attention_mask.to(dtype=torch.bool) & (
+            event_type_ids != int(self.special_type_id)
+        )
+        next_target, next_present, next_exists = self._next_content_feature_targets(
+            attr_targets.to(dtype=torch.long),
+            content_mask=content_mask,
+            feature_present_mask=attr_mask.to(dtype=torch.bool),
+        )
+        pred_flat = self._flatten_sequence_logits(torch.nan_to_num(pred_logits, nan=0.0, posinf=0.0, neginf=0.0))
+        content_mask_flat = self._flatten_sequence_feature(content_mask)
+        supervise_mask = content_mask_flat & next_exists & next_present
+        if not supervise_mask.any():
+            return pred_logits.new_zeros((), dtype=torch.float32), lane_logs
+        valid_targets = next_target[supervise_mask].to(dtype=torch.long)
+        if ((valid_targets < 0) | (valid_targets >= int(num_classes))).any():
+            raise ValueError(
+                f"{log_key} encountered out-of-range local targets; sample={valid_targets[:8].tolist()}"
+            )
+        loss = self.ce_loss(pred_flat[supervise_mask], valid_targets).mean()
+        total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
+        lane_logs[log_key] = float(loss.item())
+        preds = pred_flat.argmax(dim=-1)
+        acc = (preds[supervise_mask] == valid_targets).to(dtype=torch.float32).mean()
+        lane_logs[f"acc_{log_key.removeprefix('loss_')}"] = float(acc.item())
+        lane_logs[str(count_key or f"n_{log_key}_supervised")] = int(supervise_mask.sum().item())
+        return total_contrib, lane_logs
+
+    def _compute_event_sparse_attr_nll_lane(
+        self,
+        *,
+        pred_mu: torch.Tensor | None,
+        pred_sigma: torch.Tensor | None,
+        attr_values: torch.Tensor | None,
+        attr_mask: torch.Tensor | None,
+        event_attention_mask: torch.Tensor | None,
+        event_type_ids: torch.Tensor | None,
+        weight_key: str,
+        log_key: str,
+        count_key: str | None = None,
+    ) -> tuple[torch.Tensor, Dict[str, float]]:
+        lane_logs: Dict[str, float] = {}
+        if (
+            pred_mu is None
+            or pred_sigma is None
+            or attr_values is None
+            or attr_mask is None
+            or event_attention_mask is None
+            or event_type_ids is None
+        ):
+            return torch.zeros((), dtype=torch.float32), lane_logs
+        if float(self.weights.get(weight_key, 0.0)) <= 0.0:
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+        target_values = attr_values.squeeze(-1) if attr_values.ndim == pred_mu.ndim + 1 else attr_values
+        if pred_mu.shape != pred_sigma.shape or pred_mu.shape != target_values.shape:
+            raise ValueError(
+                f"{log_key} predictions must match attr target shape; "
+                f"got {tuple(pred_mu.shape)} / {tuple(pred_sigma.shape)} vs {tuple(target_values.shape)}"
+            )
+        if (
+            attr_mask.shape != pred_mu.shape
+            or event_attention_mask.shape != pred_mu.shape
+            or event_type_ids.shape != pred_mu.shape
+        ):
+            raise ValueError(f"{log_key} masks and ids must match prediction shape {tuple(pred_mu.shape)}")
+
+        content_mask = event_attention_mask.to(dtype=torch.bool) & (
+            event_type_ids != int(self.special_type_id)
+        )
+        next_values, next_present, next_exists = self._next_content_feature_targets(
+            target_values.to(dtype=pred_mu.dtype),
+            content_mask=content_mask,
+            feature_present_mask=attr_mask.to(dtype=torch.bool),
+        )
+        mu_flat = self._flatten_sequence_feature(torch.nan_to_num(pred_mu, nan=0.0, posinf=0.0, neginf=0.0))
+        sigma_flat = self._flatten_sequence_feature(torch.nan_to_num(pred_sigma, nan=1.0, posinf=1e6, neginf=1.0)).clamp(min=1e-4)
+        content_mask_flat = self._flatten_sequence_feature(content_mask)
+        supervise_mask = content_mask_flat & next_exists & next_present
+        if not supervise_mask.any():
+            return pred_mu.new_zeros((), dtype=torch.float32), lane_logs
+        nll = 0.5 * ((next_values.to(dtype=mu_flat.dtype) - mu_flat) / sigma_flat).square() + torch.log(sigma_flat)
         loss = nll[supervise_mask].mean()
         total_contrib = float(self.weights.get(weight_key, 1.0)) * loss
         lane_logs[log_key] = float(loss.item())
@@ -1447,6 +1707,24 @@ class AETLossModule(nn.Module):
         event_time_ids = targets_dict.get("event_time_ids", None)
         event_numeric_values = targets_dict.get("event_numeric_values", None)
         event_numeric_mask = targets_dict.get("event_numeric_mask", None)
+        event_med_group_ids = targets_dict.get("event_med_group_ids", None)
+        event_med_group_mask = targets_dict.get("event_med_group_mask", None)
+        event_med_route_ids = targets_dict.get("event_med_route_ids", None)
+        event_med_route_mask = targets_dict.get("event_med_route_mask", None)
+        event_med_form_ids = targets_dict.get("event_med_form_ids", None)
+        event_med_form_mask = targets_dict.get("event_med_form_mask", None)
+        event_med_freq_ids = targets_dict.get("event_med_freq_ids", None)
+        event_med_freq_mask = targets_dict.get("event_med_freq_mask", None)
+        event_med_unit_ids = targets_dict.get("event_med_unit_ids", None)
+        event_med_unit_mask = targets_dict.get("event_med_unit_mask", None)
+        event_med_marker_ids = targets_dict.get("event_med_marker_ids", None)
+        event_med_marker_mask = targets_dict.get("event_med_marker_mask", None)
+        event_med_dosage_values = targets_dict.get("event_med_dosage_values", None)
+        event_med_dosage_mask = targets_dict.get("event_med_dosage_mask", None)
+        event_med_rate_values = targets_dict.get("event_med_rate_values", None)
+        event_med_rate_mask = targets_dict.get("event_med_rate_mask", None)
+        event_med_duration_values = targets_dict.get("event_med_duration_values", None)
+        event_med_duration_mask = targets_dict.get("event_med_duration_mask", None)
         if (
             event_target_ids is not None
             and event_attention_mask is not None
@@ -1527,6 +1805,90 @@ class AETLossModule(nn.Module):
             logs["ignored_nonmarker_special_event_concept_targets"] = int(
                 event_concept_stats["ignored_nonmarker_special_targets"]
             )
+
+            event_med_group_loss, event_med_group_logs = self._compute_event_sparse_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_group", None),
+                attr_targets=event_med_group_ids,
+                attr_mask=event_med_group_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                family_name="med_group",
+                weight_key="event_med_group",
+                log_key="loss_event_med_group",
+                count_key="n_event_med_group_supervised",
+            )
+            total_loss = total_loss + event_med_group_loss
+            logs.update(event_med_group_logs)
+
+            event_med_route_loss, event_med_route_logs = self._compute_event_sparse_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_route", None),
+                attr_targets=event_med_route_ids,
+                attr_mask=event_med_route_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                family_name="med_route",
+                weight_key="event_med_route",
+                log_key="loss_event_med_route",
+                count_key="n_event_med_route_supervised",
+            )
+            total_loss = total_loss + event_med_route_loss
+            logs.update(event_med_route_logs)
+
+            event_med_form_loss, event_med_form_logs = self._compute_event_sparse_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_form", None),
+                attr_targets=event_med_form_ids,
+                attr_mask=event_med_form_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                family_name="med_form",
+                weight_key="event_med_form",
+                log_key="loss_event_med_form",
+                count_key="n_event_med_form_supervised",
+            )
+            total_loss = total_loss + event_med_form_loss
+            logs.update(event_med_form_logs)
+
+            event_med_freq_loss, event_med_freq_logs = self._compute_event_sparse_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_freq", None),
+                attr_targets=event_med_freq_ids,
+                attr_mask=event_med_freq_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                family_name="med_freq",
+                weight_key="event_med_freq",
+                log_key="loss_event_med_freq",
+                count_key="n_event_med_freq_supervised",
+            )
+            total_loss = total_loss + event_med_freq_loss
+            logs.update(event_med_freq_logs)
+
+            event_med_unit_loss, event_med_unit_logs = self._compute_event_sparse_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_unit", None),
+                attr_targets=event_med_unit_ids,
+                attr_mask=event_med_unit_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                family_name="med_unit",
+                weight_key="event_med_unit",
+                log_key="loss_event_med_unit",
+                count_key="n_event_med_unit_supervised",
+            )
+            total_loss = total_loss + event_med_unit_loss
+            logs.update(event_med_unit_logs)
+
+            event_med_marker_loss, event_med_marker_logs = self._compute_event_local_attr_ce_lane(
+                pred_logits=head_outputs.get("logits_event_med_marker", None),
+                attr_targets=event_med_marker_ids,
+                attr_mask=event_med_marker_mask,
+                event_attention_mask=event_attention_mask,
+                event_type_ids=event_token_type_ids,
+                num_classes=4,
+                weight_key="event_med_marker",
+                log_key="loss_event_med_marker",
+                count_key="n_event_med_marker_supervised",
+            )
+            total_loss = total_loss + event_med_marker_loss
+            logs.update(event_med_marker_logs)
 
         head_to_weight = {
             "logits_struct": "struct",
@@ -1902,6 +2264,48 @@ class AETLossModule(nn.Module):
         )
         total_loss = total_loss + event_value_loss.to(device=total_loss.device)
         logs.update(event_value_logs)
+
+        event_med_dosage_loss, event_med_dosage_logs = self._compute_event_sparse_attr_nll_lane(
+            pred_mu=head_outputs.get("pred_event_med_dosage_mu", None),
+            pred_sigma=head_outputs.get("pred_event_med_dosage_sigma", None),
+            attr_values=event_med_dosage_values,
+            attr_mask=event_med_dosage_mask,
+            event_attention_mask=event_attention_mask,
+            event_type_ids=event_token_type_ids,
+            weight_key="event_med_dosage",
+            log_key="loss_event_med_dosage_nll",
+            count_key="n_event_med_dosage_supervised",
+        )
+        total_loss = total_loss + event_med_dosage_loss.to(device=total_loss.device)
+        logs.update(event_med_dosage_logs)
+
+        event_med_rate_loss, event_med_rate_logs = self._compute_event_sparse_attr_nll_lane(
+            pred_mu=head_outputs.get("pred_event_med_rate_mu", None),
+            pred_sigma=head_outputs.get("pred_event_med_rate_sigma", None),
+            attr_values=event_med_rate_values,
+            attr_mask=event_med_rate_mask,
+            event_attention_mask=event_attention_mask,
+            event_type_ids=event_token_type_ids,
+            weight_key="event_med_rate",
+            log_key="loss_event_med_rate_nll",
+            count_key="n_event_med_rate_supervised",
+        )
+        total_loss = total_loss + event_med_rate_loss.to(device=total_loss.device)
+        logs.update(event_med_rate_logs)
+
+        event_med_duration_loss, event_med_duration_logs = self._compute_event_sparse_attr_nll_lane(
+            pred_mu=head_outputs.get("pred_event_med_duration_mu", None),
+            pred_sigma=head_outputs.get("pred_event_med_duration_sigma", None),
+            attr_values=event_med_duration_values,
+            attr_mask=event_med_duration_mask,
+            event_attention_mask=event_attention_mask,
+            event_type_ids=event_token_type_ids,
+            weight_key="event_med_duration",
+            log_key="loss_event_med_duration_nll",
+            count_key="n_event_med_duration_supervised",
+        )
+        total_loss = total_loss + event_med_duration_loss.to(device=total_loss.device)
+        logs.update(event_med_duration_logs)
 
         next_window_gap_loss, next_window_gap_logs = self._compute_next_window_gap_nll_lane(
             pred_mu=head_outputs.get("pred_next_window_gap_mu", None),

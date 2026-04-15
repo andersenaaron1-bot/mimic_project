@@ -86,6 +86,24 @@ class PreparedChunk:
     event_memory_group_ids: List[int]
     event_memory_first_flags: List[int]
     event_memory_chronic_flags: List[int]
+    event_med_group_ids: List[int]
+    event_med_group_mask: List[int]
+    event_med_route_ids: List[int]
+    event_med_route_mask: List[int]
+    event_med_form_ids: List[int]
+    event_med_form_mask: List[int]
+    event_med_freq_ids: List[int]
+    event_med_freq_mask: List[int]
+    event_med_unit_ids: List[int]
+    event_med_unit_mask: List[int]
+    event_med_marker_ids: List[int]
+    event_med_marker_mask: List[int]
+    event_med_dosage_values: List[float]
+    event_med_dosage_mask: List[int]
+    event_med_rate_values: List[float]
+    event_med_rate_mask: List[int]
+    event_med_duration_values: List[float]
+    event_med_duration_mask: List[int]
 
     def __iter__(self):
         yield self.ids
@@ -182,6 +200,24 @@ class AETHierarchicalCollator:
         batch_event_memory_group_ids: List[List[List[List[int]]]] = []
         batch_event_memory_first_flags: List[List[List[List[int]]]] = []
         batch_event_memory_chronic_flags: List[List[List[List[int]]]] = []
+        batch_event_med_group_ids: List[List[List[List[int]]]] = []
+        batch_event_med_group_mask: List[List[List[List[int]]]] = []
+        batch_event_med_route_ids: List[List[List[List[int]]]] = []
+        batch_event_med_route_mask: List[List[List[List[int]]]] = []
+        batch_event_med_form_ids: List[List[List[List[int]]]] = []
+        batch_event_med_form_mask: List[List[List[List[int]]]] = []
+        batch_event_med_freq_ids: List[List[List[List[int]]]] = []
+        batch_event_med_freq_mask: List[List[List[List[int]]]] = []
+        batch_event_med_unit_ids: List[List[List[List[int]]]] = []
+        batch_event_med_unit_mask: List[List[List[List[int]]]] = []
+        batch_event_med_marker_ids: List[List[List[List[int]]]] = []
+        batch_event_med_marker_mask: List[List[List[List[int]]]] = []
+        batch_event_med_dosage_values: List[List[List[List[float]]]] = []
+        batch_event_med_dosage_mask: List[List[List[List[int]]]] = []
+        batch_event_med_rate_values: List[List[List[List[float]]]] = []
+        batch_event_med_rate_mask: List[List[List[List[int]]]] = []
+        batch_event_med_duration_values: List[List[List[List[float]]]] = []
+        batch_event_med_duration_mask: List[List[List[List[int]]]] = []
         semantic_windows_total = 0
         semantic_windows_kept = 0
         semantic_windows_dropped = 0
@@ -278,6 +314,24 @@ class AETHierarchicalCollator:
             subj_event_memory_group_ids: List[List[List[int]]] = []
             subj_event_memory_first_flags: List[List[List[int]]] = []
             subj_event_memory_chronic_flags: List[List[List[int]]] = []
+            subj_event_med_group_ids: List[List[List[int]]] = []
+            subj_event_med_group_mask: List[List[List[int]]] = []
+            subj_event_med_route_ids: List[List[List[int]]] = []
+            subj_event_med_route_mask: List[List[List[int]]] = []
+            subj_event_med_form_ids: List[List[List[int]]] = []
+            subj_event_med_form_mask: List[List[List[int]]] = []
+            subj_event_med_freq_ids: List[List[List[int]]] = []
+            subj_event_med_freq_mask: List[List[List[int]]] = []
+            subj_event_med_unit_ids: List[List[List[int]]] = []
+            subj_event_med_unit_mask: List[List[List[int]]] = []
+            subj_event_med_marker_ids: List[List[List[int]]] = []
+            subj_event_med_marker_mask: List[List[List[int]]] = []
+            subj_event_med_dosage_values: List[List[List[float]]] = []
+            subj_event_med_dosage_mask: List[List[List[int]]] = []
+            subj_event_med_rate_values: List[List[List[float]]] = []
+            subj_event_med_rate_mask: List[List[List[int]]] = []
+            subj_event_med_duration_values: List[List[List[float]]] = []
+            subj_event_med_duration_mask: List[List[List[int]]] = []
             seen_memory_keys: set[str] = set()
 
             for wi, window in enumerate(chunked_windows):
@@ -308,6 +362,24 @@ class AETHierarchicalCollator:
                 chunk_event_memory_group_ids: List[List[int]] = []
                 chunk_event_memory_first_flags: List[List[int]] = []
                 chunk_event_memory_chronic_flags: List[List[int]] = []
+                chunk_event_med_group_ids: List[List[int]] = []
+                chunk_event_med_group_mask: List[List[int]] = []
+                chunk_event_med_route_ids: List[List[int]] = []
+                chunk_event_med_route_mask: List[List[int]] = []
+                chunk_event_med_form_ids: List[List[int]] = []
+                chunk_event_med_form_mask: List[List[int]] = []
+                chunk_event_med_freq_ids: List[List[int]] = []
+                chunk_event_med_freq_mask: List[List[int]] = []
+                chunk_event_med_unit_ids: List[List[int]] = []
+                chunk_event_med_unit_mask: List[List[int]] = []
+                chunk_event_med_marker_ids: List[List[int]] = []
+                chunk_event_med_marker_mask: List[List[int]] = []
+                chunk_event_med_dosage_values: List[List[float]] = []
+                chunk_event_med_dosage_mask: List[List[int]] = []
+                chunk_event_med_rate_values: List[List[float]] = []
+                chunk_event_med_rate_mask: List[List[int]] = []
+                chunk_event_med_duration_values: List[List[float]] = []
+                chunk_event_med_duration_mask: List[List[int]] = []
 
                 for ci, chunk in enumerate(window.chunks):
                     prepared = self._process_chunk(
@@ -348,6 +420,24 @@ class AETHierarchicalCollator:
                     chunk_event_memory_group_ids.append(prepared.event_memory_group_ids)
                     chunk_event_memory_first_flags.append(prepared.event_memory_first_flags)
                     chunk_event_memory_chronic_flags.append(prepared.event_memory_chronic_flags)
+                    chunk_event_med_group_ids.append(prepared.event_med_group_ids)
+                    chunk_event_med_group_mask.append(prepared.event_med_group_mask)
+                    chunk_event_med_route_ids.append(prepared.event_med_route_ids)
+                    chunk_event_med_route_mask.append(prepared.event_med_route_mask)
+                    chunk_event_med_form_ids.append(prepared.event_med_form_ids)
+                    chunk_event_med_form_mask.append(prepared.event_med_form_mask)
+                    chunk_event_med_freq_ids.append(prepared.event_med_freq_ids)
+                    chunk_event_med_freq_mask.append(prepared.event_med_freq_mask)
+                    chunk_event_med_unit_ids.append(prepared.event_med_unit_ids)
+                    chunk_event_med_unit_mask.append(prepared.event_med_unit_mask)
+                    chunk_event_med_marker_ids.append(prepared.event_med_marker_ids)
+                    chunk_event_med_marker_mask.append(prepared.event_med_marker_mask)
+                    chunk_event_med_dosage_values.append(prepared.event_med_dosage_values)
+                    chunk_event_med_dosage_mask.append(prepared.event_med_dosage_mask)
+                    chunk_event_med_rate_values.append(prepared.event_med_rate_values)
+                    chunk_event_med_rate_mask.append(prepared.event_med_rate_mask)
+                    chunk_event_med_duration_values.append(prepared.event_med_duration_values)
+                    chunk_event_med_duration_mask.append(prepared.event_med_duration_mask)
                     if chunk.tokens:
                         chunk_duration_hours.append(float(chunk.tokens[-1].t_from_start_hours) - float(chunk.start_time_hours))
                     else:
@@ -387,6 +477,24 @@ class AETHierarchicalCollator:
                 subj_event_memory_group_ids.append(chunk_event_memory_group_ids)
                 subj_event_memory_first_flags.append(chunk_event_memory_first_flags)
                 subj_event_memory_chronic_flags.append(chunk_event_memory_chronic_flags)
+                subj_event_med_group_ids.append(chunk_event_med_group_ids)
+                subj_event_med_group_mask.append(chunk_event_med_group_mask)
+                subj_event_med_route_ids.append(chunk_event_med_route_ids)
+                subj_event_med_route_mask.append(chunk_event_med_route_mask)
+                subj_event_med_form_ids.append(chunk_event_med_form_ids)
+                subj_event_med_form_mask.append(chunk_event_med_form_mask)
+                subj_event_med_freq_ids.append(chunk_event_med_freq_ids)
+                subj_event_med_freq_mask.append(chunk_event_med_freq_mask)
+                subj_event_med_unit_ids.append(chunk_event_med_unit_ids)
+                subj_event_med_unit_mask.append(chunk_event_med_unit_mask)
+                subj_event_med_marker_ids.append(chunk_event_med_marker_ids)
+                subj_event_med_marker_mask.append(chunk_event_med_marker_mask)
+                subj_event_med_dosage_values.append(chunk_event_med_dosage_values)
+                subj_event_med_dosage_mask.append(chunk_event_med_dosage_mask)
+                subj_event_med_rate_values.append(chunk_event_med_rate_values)
+                subj_event_med_rate_mask.append(chunk_event_med_rate_mask)
+                subj_event_med_duration_values.append(chunk_event_med_duration_values)
+                subj_event_med_duration_mask.append(chunk_event_med_duration_mask)
 
             batch_ids.append(subj_ids)
             batch_times.append(subj_times)
@@ -419,6 +527,24 @@ class AETHierarchicalCollator:
             batch_event_memory_group_ids.append(subj_event_memory_group_ids)
             batch_event_memory_first_flags.append(subj_event_memory_first_flags)
             batch_event_memory_chronic_flags.append(subj_event_memory_chronic_flags)
+            batch_event_med_group_ids.append(subj_event_med_group_ids)
+            batch_event_med_group_mask.append(subj_event_med_group_mask)
+            batch_event_med_route_ids.append(subj_event_med_route_ids)
+            batch_event_med_route_mask.append(subj_event_med_route_mask)
+            batch_event_med_form_ids.append(subj_event_med_form_ids)
+            batch_event_med_form_mask.append(subj_event_med_form_mask)
+            batch_event_med_freq_ids.append(subj_event_med_freq_ids)
+            batch_event_med_freq_mask.append(subj_event_med_freq_mask)
+            batch_event_med_unit_ids.append(subj_event_med_unit_ids)
+            batch_event_med_unit_mask.append(subj_event_med_unit_mask)
+            batch_event_med_marker_ids.append(subj_event_med_marker_ids)
+            batch_event_med_marker_mask.append(subj_event_med_marker_mask)
+            batch_event_med_dosage_values.append(subj_event_med_dosage_values)
+            batch_event_med_dosage_mask.append(subj_event_med_dosage_mask)
+            batch_event_med_rate_values.append(subj_event_med_rate_values)
+            batch_event_med_rate_mask.append(subj_event_med_rate_mask)
+            batch_event_med_duration_values.append(subj_event_med_duration_values)
+            batch_event_med_duration_mask.append(subj_event_med_duration_mask)
 
         out = self._pad_batch(
             batch_ids,
@@ -450,6 +576,24 @@ class AETHierarchicalCollator:
             batch_event_memory_group_ids,
             batch_event_memory_first_flags,
             batch_event_memory_chronic_flags,
+            batch_event_med_group_ids,
+            batch_event_med_group_mask,
+            batch_event_med_route_ids,
+            batch_event_med_route_mask,
+            batch_event_med_form_ids,
+            batch_event_med_form_mask,
+            batch_event_med_freq_ids,
+            batch_event_med_freq_mask,
+            batch_event_med_unit_ids,
+            batch_event_med_unit_mask,
+            batch_event_med_marker_ids,
+            batch_event_med_marker_mask,
+            batch_event_med_dosage_values,
+            batch_event_med_dosage_mask,
+            batch_event_med_rate_values,
+            batch_event_med_rate_mask,
+            batch_event_med_duration_values,
+            batch_event_med_duration_mask,
         )
         total_windows_base = max(1, int(semantic_windows_total))
         total_subjects_base = max(1, int(len(normalized_timelines)))
@@ -564,6 +708,38 @@ class AETHierarchicalCollator:
                 return value, 1
         return 0.0, 0
 
+    @staticmethod
+    def _extract_frame_categorical_id(
+        frame: EventFrame,
+        *,
+        attr_name: str,
+    ) -> tuple[int, int]:
+        raw = (frame.cat_attrs or {}).get(attr_name, None)
+        if raw is None:
+            return 0, 0
+        try:
+            value = int(raw)
+        except (TypeError, ValueError):
+            return 0, 0
+        return value, 1
+
+    @staticmethod
+    def _extract_frame_numeric_attr(
+        frame: EventFrame,
+        *,
+        attr_name: str,
+    ) -> tuple[float, int]:
+        raw = (frame.num_attrs or {}).get(attr_name, None)
+        if raw is None:
+            return 0.0, 0
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            return 0.0, 0
+        if not math.isfinite(value):
+            return 0.0, 0
+        return value, 1
+
     def _build_marker_frame(
         self,
         *,
@@ -649,6 +825,24 @@ class AETHierarchicalCollator:
                 event_memory_group_ids=[],
                 event_memory_first_flags=[],
                 event_memory_chronic_flags=[],
+                event_med_group_ids=[],
+                event_med_group_mask=[],
+                event_med_route_ids=[],
+                event_med_route_mask=[],
+                event_med_form_ids=[],
+                event_med_form_mask=[],
+                event_med_freq_ids=[],
+                event_med_freq_mask=[],
+                event_med_unit_ids=[],
+                event_med_unit_mask=[],
+                event_med_marker_ids=[],
+                event_med_marker_mask=[],
+                event_med_dosage_values=[],
+                event_med_dosage_mask=[],
+                event_med_rate_values=[],
+                event_med_rate_mask=[],
+                event_med_duration_values=[],
+                event_med_duration_mask=[],
             )
 
         w_start_abs = float(w_start_abs)
@@ -737,6 +931,24 @@ class AETHierarchicalCollator:
         event_memory_group_ids: List[int] = []
         event_memory_first_flags: List[int] = []
         event_memory_chronic_flags: List[int] = []
+        event_med_group_ids: List[int] = []
+        event_med_group_mask: List[int] = []
+        event_med_route_ids: List[int] = []
+        event_med_route_mask: List[int] = []
+        event_med_form_ids: List[int] = []
+        event_med_form_mask: List[int] = []
+        event_med_freq_ids: List[int] = []
+        event_med_freq_mask: List[int] = []
+        event_med_unit_ids: List[int] = []
+        event_med_unit_mask: List[int] = []
+        event_med_marker_ids: List[int] = []
+        event_med_marker_mask: List[int] = []
+        event_med_dosage_values: List[float] = []
+        event_med_dosage_mask: List[int] = []
+        event_med_rate_values: List[float] = []
+        event_med_rate_mask: List[int] = []
+        event_med_duration_values: List[float] = []
+        event_med_duration_mask: List[int] = []
         seen_exact_keys = seen_memory_keys if seen_memory_keys is not None else set()
 
         for tok in seq:
@@ -786,6 +998,74 @@ class AETHierarchicalCollator:
             event_memory_group_ids.append(int(memory_rule.group_id))
             event_memory_first_flags.append(int(memory_rule.first_occurrence))
             event_memory_chronic_flags.append(int(memory_rule.chronic_flag))
+            if int(frame.category_id) == int(TokenCategory.MEDICATION):
+                med_group_id, med_group_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="med_group",
+                )
+                med_route_id, med_route_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="route",
+                )
+                med_form_id, med_form_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="form",
+                )
+                med_freq_id, med_freq_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="freq",
+                )
+                med_unit_id, med_unit_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="unit",
+                )
+                med_marker_id, med_marker_mask = self._extract_frame_categorical_id(
+                    frame,
+                    attr_name="event_marker",
+                )
+                med_dosage_value, med_dosage_mask = self._extract_frame_numeric_attr(
+                    frame,
+                    attr_name="dosage",
+                )
+                med_rate_value, med_rate_mask = self._extract_frame_numeric_attr(
+                    frame,
+                    attr_name="rate",
+                )
+                med_duration_value, med_duration_mask = self._extract_frame_numeric_attr(
+                    frame,
+                    attr_name="duration_hours",
+                )
+            else:
+                med_group_id = med_group_mask = 0
+                med_route_id = med_route_mask = 0
+                med_form_id = med_form_mask = 0
+                med_freq_id = med_freq_mask = 0
+                med_unit_id = med_unit_mask = 0
+                med_marker_id = med_marker_mask = 0
+                med_dosage_value = 0.0
+                med_dosage_mask = 0
+                med_rate_value = 0.0
+                med_rate_mask = 0
+                med_duration_value = 0.0
+                med_duration_mask = 0
+            event_med_group_ids.append(int(med_group_id))
+            event_med_group_mask.append(int(med_group_mask))
+            event_med_route_ids.append(int(med_route_id))
+            event_med_route_mask.append(int(med_route_mask))
+            event_med_form_ids.append(int(med_form_id))
+            event_med_form_mask.append(int(med_form_mask))
+            event_med_freq_ids.append(int(med_freq_id))
+            event_med_freq_mask.append(int(med_freq_mask))
+            event_med_unit_ids.append(int(med_unit_id))
+            event_med_unit_mask.append(int(med_unit_mask))
+            event_med_marker_ids.append(int(med_marker_id))
+            event_med_marker_mask.append(int(med_marker_mask))
+            event_med_dosage_values.append(float(med_dosage_value))
+            event_med_dosage_mask.append(int(med_dosage_mask))
+            event_med_rate_values.append(float(med_rate_value))
+            event_med_rate_mask.append(int(med_rate_mask))
+            event_med_duration_values.append(float(med_duration_value))
+            event_med_duration_mask.append(int(med_duration_mask))
             if event_idx < len(prefix_frames):
                 event_times.append(0.0)
             else:
@@ -824,6 +1104,24 @@ class AETHierarchicalCollator:
             event_memory_group_ids=event_memory_group_ids,
             event_memory_first_flags=event_memory_first_flags,
             event_memory_chronic_flags=event_memory_chronic_flags,
+            event_med_group_ids=event_med_group_ids,
+            event_med_group_mask=event_med_group_mask,
+            event_med_route_ids=event_med_route_ids,
+            event_med_route_mask=event_med_route_mask,
+            event_med_form_ids=event_med_form_ids,
+            event_med_form_mask=event_med_form_mask,
+            event_med_freq_ids=event_med_freq_ids,
+            event_med_freq_mask=event_med_freq_mask,
+            event_med_unit_ids=event_med_unit_ids,
+            event_med_unit_mask=event_med_unit_mask,
+            event_med_marker_ids=event_med_marker_ids,
+            event_med_marker_mask=event_med_marker_mask,
+            event_med_dosage_values=event_med_dosage_values,
+            event_med_dosage_mask=event_med_dosage_mask,
+            event_med_rate_values=event_med_rate_values,
+            event_med_rate_mask=event_med_rate_mask,
+            event_med_duration_values=event_med_duration_values,
+            event_med_duration_mask=event_med_duration_mask,
         )
 
     def _process_window(
@@ -930,6 +1228,24 @@ class AETHierarchicalCollator:
         batch_event_memory_group_ids: List[List[List[List[int]]]],
         batch_event_memory_first_flags: List[List[List[List[int]]]],
         batch_event_memory_chronic_flags: List[List[List[List[int]]]],
+        batch_event_med_group_ids: List[List[List[List[int]]]],
+        batch_event_med_group_mask: List[List[List[List[int]]]],
+        batch_event_med_route_ids: List[List[List[List[int]]]],
+        batch_event_med_route_mask: List[List[List[List[int]]]],
+        batch_event_med_form_ids: List[List[List[List[int]]]],
+        batch_event_med_form_mask: List[List[List[List[int]]]],
+        batch_event_med_freq_ids: List[List[List[List[int]]]],
+        batch_event_med_freq_mask: List[List[List[List[int]]]],
+        batch_event_med_unit_ids: List[List[List[List[int]]]],
+        batch_event_med_unit_mask: List[List[List[List[int]]]],
+        batch_event_med_marker_ids: List[List[List[List[int]]]],
+        batch_event_med_marker_mask: List[List[List[List[int]]]],
+        batch_event_med_dosage_values: List[List[List[List[float]]]],
+        batch_event_med_dosage_mask: List[List[List[List[int]]]],
+        batch_event_med_rate_values: List[List[List[List[float]]]],
+        batch_event_med_rate_mask: List[List[List[List[int]]]],
+        batch_event_med_duration_values: List[List[List[List[float]]]],
+        batch_event_med_duration_mask: List[List[List[List[int]]]],
     ) -> Dict[str, Any]:
         B = len(batch_ids)
         W = max((len(x) for x in batch_ids), default=0)
@@ -968,6 +1284,24 @@ class AETHierarchicalCollator:
         event_memory_group_ids = torch.zeros((B, W, C, E), dtype=torch.long)
         event_memory_first_flags = torch.zeros((B, W, C, E), dtype=torch.long)
         event_memory_chronic_flags = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_group_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_group_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_route_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_route_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_form_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_form_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_freq_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_freq_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_unit_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_unit_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_marker_ids = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_marker_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_dosage_values = torch.zeros((B, W, C, E, 1), dtype=torch.float)
+        event_med_dosage_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_rate_values = torch.zeros((B, W, C, E, 1), dtype=torch.float)
+        event_med_rate_mask = torch.zeros((B, W, C, E), dtype=torch.long)
+        event_med_duration_values = torch.zeros((B, W, C, E, 1), dtype=torch.float)
+        event_med_duration_mask = torch.zeros((B, W, C, E), dtype=torch.long)
 
         for b in range(B):
             for w in range(len(batch_ids[b])):
@@ -1001,6 +1335,24 @@ class AETHierarchicalCollator:
                     event_memory_groups = batch_event_memory_group_ids[b][w][c]
                     event_memory_first = batch_event_memory_first_flags[b][w][c]
                     event_memory_chronic = batch_event_memory_chronic_flags[b][w][c]
+                    med_group_ids = batch_event_med_group_ids[b][w][c]
+                    med_group_mask = batch_event_med_group_mask[b][w][c]
+                    med_route_ids = batch_event_med_route_ids[b][w][c]
+                    med_route_mask = batch_event_med_route_mask[b][w][c]
+                    med_form_ids = batch_event_med_form_ids[b][w][c]
+                    med_form_mask = batch_event_med_form_mask[b][w][c]
+                    med_freq_ids = batch_event_med_freq_ids[b][w][c]
+                    med_freq_mask = batch_event_med_freq_mask[b][w][c]
+                    med_unit_ids = batch_event_med_unit_ids[b][w][c]
+                    med_unit_mask = batch_event_med_unit_mask[b][w][c]
+                    med_marker_ids = batch_event_med_marker_ids[b][w][c]
+                    med_marker_mask = batch_event_med_marker_mask[b][w][c]
+                    med_dosage_values = batch_event_med_dosage_values[b][w][c]
+                    med_dosage_mask = batch_event_med_dosage_mask[b][w][c]
+                    med_rate_values = batch_event_med_rate_values[b][w][c]
+                    med_rate_mask = batch_event_med_rate_mask[b][w][c]
+                    med_duration_values = batch_event_med_duration_values[b][w][c]
+                    med_duration_mask = batch_event_med_duration_mask[b][w][c]
                     seq_len = min(len(ids), L)
                     event_len = min(len(event_times), E)
                     chunk_mask[b, w, c] = 1
@@ -1049,6 +1401,78 @@ class AETHierarchicalCollator:
                         )
                         event_memory_chronic_flags[b, w, c, :event_len] = torch.tensor(
                             event_memory_chronic[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_group_ids[b, w, c, :event_len] = torch.tensor(
+                            med_group_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_group_mask[b, w, c, :event_len] = torch.tensor(
+                            med_group_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_route_ids[b, w, c, :event_len] = torch.tensor(
+                            med_route_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_route_mask[b, w, c, :event_len] = torch.tensor(
+                            med_route_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_form_ids[b, w, c, :event_len] = torch.tensor(
+                            med_form_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_form_mask[b, w, c, :event_len] = torch.tensor(
+                            med_form_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_freq_ids[b, w, c, :event_len] = torch.tensor(
+                            med_freq_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_freq_mask[b, w, c, :event_len] = torch.tensor(
+                            med_freq_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_unit_ids[b, w, c, :event_len] = torch.tensor(
+                            med_unit_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_unit_mask[b, w, c, :event_len] = torch.tensor(
+                            med_unit_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_marker_ids[b, w, c, :event_len] = torch.tensor(
+                            med_marker_ids[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_marker_mask[b, w, c, :event_len] = torch.tensor(
+                            med_marker_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_dosage_values[b, w, c, :event_len, :] = torch.tensor(
+                            med_dosage_values[:event_len],
+                            dtype=torch.float,
+                        ).unsqueeze(-1)
+                        event_med_dosage_mask[b, w, c, :event_len] = torch.tensor(
+                            med_dosage_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_rate_values[b, w, c, :event_len, :] = torch.tensor(
+                            med_rate_values[:event_len],
+                            dtype=torch.float,
+                        ).unsqueeze(-1)
+                        event_med_rate_mask[b, w, c, :event_len] = torch.tensor(
+                            med_rate_mask[:event_len],
+                            dtype=torch.long,
+                        )
+                        event_med_duration_values[b, w, c, :event_len, :] = torch.tensor(
+                            med_duration_values[:event_len],
+                            dtype=torch.float,
+                        ).unsqueeze(-1)
+                        event_med_duration_mask[b, w, c, :event_len] = torch.tensor(
+                            med_duration_mask[:event_len],
                             dtype=torch.long,
                         )
 
@@ -1109,6 +1533,24 @@ class AETHierarchicalCollator:
             "event_memory_group_ids": event_memory_group_ids,
             "event_memory_first_flags": event_memory_first_flags,
             "event_memory_chronic_flags": event_memory_chronic_flags,
+            "event_med_group_ids": event_med_group_ids,
+            "event_med_group_mask": event_med_group_mask,
+            "event_med_route_ids": event_med_route_ids,
+            "event_med_route_mask": event_med_route_mask,
+            "event_med_form_ids": event_med_form_ids,
+            "event_med_form_mask": event_med_form_mask,
+            "event_med_freq_ids": event_med_freq_ids,
+            "event_med_freq_mask": event_med_freq_mask,
+            "event_med_unit_ids": event_med_unit_ids,
+            "event_med_unit_mask": event_med_unit_mask,
+            "event_med_marker_ids": event_med_marker_ids,
+            "event_med_marker_mask": event_med_marker_mask,
+            "event_med_dosage_values": event_med_dosage_values,
+            "event_med_dosage_mask": event_med_dosage_mask,
+            "event_med_rate_values": event_med_rate_values,
+            "event_med_rate_mask": event_med_rate_mask,
+            "event_med_duration_values": event_med_duration_values,
+            "event_med_duration_mask": event_med_duration_mask,
         }
         if input_ids_global is not None:
             out["input_ids_global"] = input_ids_global

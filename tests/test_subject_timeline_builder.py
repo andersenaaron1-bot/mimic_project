@@ -48,7 +48,7 @@ class DummyEncoder:
         ]
 
 
-def test_subject_timeline_orders_and_attaches_numeric():
+def test_subject_timeline_orders_without_builder_side_med_numeric_injection():
     t0 = datetime(2024, 1, 1, 8, 0, 0)
     events = [
         SimpleNamespace(code="LAB//GLUCOSE", time=t0),
@@ -98,8 +98,9 @@ def test_subject_timeline_orders_and_attaches_numeric():
     assert pytest.approx(tokens[2].t_from_start_hours, rel=1e-6) == 2.0
     assert pytest.approx(tokens[3].t_from_start_hours, rel=1e-6) == 5.0
 
-    # Medication numeric_value should be attached when encoder omits it
-    assert tokens[2].num_attrs["numeric_value"] == 7.5
+    # Builder no longer injects generic medication numeric_value when the codec
+    # does not emit one.
+    assert "numeric_value" not in tokens[2].num_attrs
     # Structural boundaries should now carry explicit transition metadata even
     # on the fallback map path, with the hook retained only as a redundant split signal.
     assert tokens[3].cat_attrs["transition_action_id"] == TRANSITION_ACTION_TO_ID["open_next"]

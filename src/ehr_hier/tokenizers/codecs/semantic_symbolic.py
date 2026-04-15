@@ -19,6 +19,8 @@ class SymbolicEventFrameCodec(TokenBundleFrameCodec):
             token_encoder=token_encoder,
             payload_kind=payload_kind,
             concept_code_fn=self._resolve_concept_code,
+            group_code_fn=self._resolve_group_code,
+            semantic_label_fn=self._resolve_semantic_label,
         )
 
     def _resolve_concept_code(self, ev: Any) -> str | None:
@@ -33,6 +35,24 @@ class SymbolicEventFrameCodec(TokenBundleFrameCodec):
                 return str(source)
         code = getattr(ev, "code", None)
         return None if code is None else str(code)
+
+    def _resolve_group_code(self, ev: Any) -> str | None:
+        resolve = getattr(self.token_encoder, "resolve_event", None)
+        if callable(resolve):
+            resolution = resolve(ev)
+            group_code = getattr(resolution, "group_code", None)
+            if group_code is not None:
+                return str(group_code)
+        return None
+
+    def _resolve_semantic_label(self, ev: Any) -> str | None:
+        resolve = getattr(self.token_encoder, "resolve_event", None)
+        if callable(resolve):
+            resolution = resolve(ev)
+            semantic_label = getattr(resolution, "semantic_label", None)
+            if semantic_label is not None:
+                return str(semantic_label)
+        return None
 
 
 class OtherNoOpFrameCodec:

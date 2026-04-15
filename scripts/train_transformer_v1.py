@@ -507,7 +507,7 @@ class OnTheFlyTimelineDataset(Dataset):
             "encoders": self.encoders,
             "structural_codebook": self.structural_codebook,
             "window_hook_label": "window_boundary",
-            "attach_med_numeric": True,
+            "attach_med_numeric": False,
             "emit_global_demographic_tokens": self.emit_global_demographic_tokens,
             "special_token_offset": 0,
             "qual_obs_code_vocab": self.qual_obs_code_vocab,

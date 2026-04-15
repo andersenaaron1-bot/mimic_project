@@ -13,6 +13,7 @@ from src.ehr_hier.data.structural_codes import (
     structural_surface_vocab_codes,
 )
 from src.ehr_hier.tokenizers.medtok_loader import resolve_residual_fallback_vocab_path
+from src.ehr_hier.tokenizers.medication_ontology import medication_group_size_from_vocab_files
 
 
 DEFAULT_SPARSE_VOCAB_JSON = "artifacts/token_vocab_sparse_v1.json"
@@ -319,6 +320,7 @@ def build_sparse_vocab_contract(
     med_form_offset = _offset("med_form", 1_620_000)
     med_freq_offset = _offset("med_freq", 1_640_000)
     med_unit_offset = _offset("med_unit", 1_660_000)
+    med_group_offset = _offset("med_group", 1_670_000)
     med_dosage_offset = _offset("med_dosage", 1_680_000)
     med_rate_offset = _offset("med_rate", 1_700_000)
     med_duration_offset = _offset("med_duration", 1_720_000)
@@ -343,6 +345,10 @@ def build_sparse_vocab_contract(
     med_form_size = _vocab_size_from_json((medtok_attr / "form_vocab.json") if medtok_attr is not None else None) or 0
     med_freq_size = _vocab_size_from_json((medtok_attr / "freq_vocab.json") if medtok_attr is not None else None) or 0
     med_unit_size = _vocab_size_from_json((medtok_attr / "unit_vocab.json") if medtok_attr is not None else None) or 0
+    med_group_size = medication_group_size_from_vocab_files(
+        med_vocab_json=((medtok_dir / "med_vocab.json") if medtok_dir is not None else None),
+        residual_vocab_json=resolve_residual_fallback_vocab_path(medtok_dir, "medication"),
+    )
     meas_code_size_eff = (
         int(measurement_code_size)
         if measurement_code_size is not None
@@ -471,6 +477,11 @@ def build_sparse_vocab_contract(
             offset=med_unit_offset,
             source_size=med_unit_size,
             family_type="med_attr",
+        ),
+        "med_group": _family_entry(
+            offset=med_group_offset,
+            source_size=med_group_size,
+            family_type="med_group",
         ),
         "med_dosage": _family_entry(
             offset=med_dosage_offset,

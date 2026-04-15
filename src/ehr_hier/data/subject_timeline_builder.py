@@ -98,7 +98,7 @@ def build_subject_timeline(
     add_summary_tokens: Optional[List[EventFrame | EventToken]] = None,
     structural_event_map: Optional[Dict[str, float]] = None,
     window_hook_label: str = "window_boundary",
-    attach_med_numeric: bool = True,
+    attach_med_numeric: bool = False,
     structural_codebook: Optional[StructuralCodebook] = None,
     qual_obs_code_offset: int = 2_300_000,
     qual_obs_value_offset: int = 2_320_000,
@@ -128,7 +128,7 @@ def build_subject_timeline(
            - get corresponding encoder
            - compute dt_hours since previous emitted token
            - extend the token list with encoder outputs, carrying t_from_start
-           - attach medication numeric_value (if available) and window hooks
+           - attach codec-emitted sparse medication attrs and window hooks
 
     Parameters
     ----------
@@ -137,7 +137,9 @@ def build_subject_timeline(
     window_hook_label : str
         Label attached to EventToken.window_hook when an event hits the map.
     attach_med_numeric : bool
-        If True, copy ev.numeric_value into EventToken.num_attrs["numeric_value"] for meds.
+        Deprecated compatibility flag. Medication numeric metadata should be
+        emitted by the medication codec itself rather than copied into a generic
+        `numeric_value` field by the builder.
     emit_global_demographic_tokens : bool
         If True, emit lightweight global demographic tokens (sex, age bucket, BMI bucket,
         plus numeric height/weight specials)
@@ -374,22 +376,6 @@ def build_subject_timeline(
                 else None
             ),
         )
-
-    def _extract_med_numeric(ev: object) -> Optional[float]:
-        """
-        Pull raw numeric_value from MEDS medication events, guarding for NaN/None.
-        """
-        if not attach_med_numeric:
-            return None
-        if not hasattr(ev, "numeric_value"):
-            return None
-        try:
-            val = float(getattr(ev, "numeric_value"))
-        except (TypeError, ValueError):
-            return None
-        if not math.isfinite(val):
-            return None
-        return val
 
     def _t_from_start_hours(t: Optional[datetime]) -> float:
         if timeline_start is None or not isinstance(t, datetime):
@@ -638,9 +624,6 @@ def build_subject_timeline(
             if idx == 0 and routed_transition_attrs:
                 cat_attrs.update(routed_transition_attrs)
             num_attrs = dict(tok.num_attrs or {})
-            if category == TokenCategory.MEDICATION and attach_med_numeric:
-                if "numeric_value" not in num_attrs or num_attrs.get("numeric_value") is None:
-                    num_attrs["numeric_value"] = med_numeric_value
             adjusted_tokens.append(
                 EventToken(
                     value_id=int(tok.value_id),
@@ -658,6 +641,7 @@ def build_subject_timeline(
             payload_kind=frame.payload_kind,
             source_code=frame.source_code,
             concept_code=frame.concept_code,
+            group_code=frame.group_code,
             semantic_label=frame.semantic_label,
         )
 
@@ -847,7 +831,6 @@ def build_subject_timeline(
         t_from_start = _t_from_start_hours(t) if isinstance(t, datetime) else 0.0
 
         dt_budget = 0.0 if emitted_for_event else float(dt_hours)
-        med_numeric_value = _extract_med_numeric(ev) if category == TokenCategory.MEDICATION else None
         for frame_idx, frame in enumerate(codec_frames):
             emitted_for_event.append(
                 _materialize_codec_frame(
@@ -858,7 +841,7 @@ def build_subject_timeline(
                     dt_budget=(float(dt_budget) if frame_idx == 0 else 0.0),
                     routed_transition_attrs=routed_transition_attrs,
                     should_hook=should_hook,
-                    med_numeric_value=med_numeric_value,
+                    med_numeric_value=None,
                 )
             )
 

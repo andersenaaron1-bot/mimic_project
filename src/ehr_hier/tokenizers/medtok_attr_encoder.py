@@ -1,5 +1,6 @@
 from __future__ import annotations
 import ast
+import math
 import re
 import zlib
 from dataclasses import dataclass
@@ -9,6 +10,12 @@ from src.ehr_hier.data.token_types import EventToken, TokenCategory
 from src.ehr_hier.tokenizers.medtok_loader import CategoryVocab
 from src.ehr_hier.tokenizers.attr_bins import NumericBinConfig
 from src.ehr_hier.tokenizers.medtok_canonicalize import ensure_list
+from src.ehr_hier.tokenizers.medication_ontology import (
+    DEFAULT_MED_GROUP_OFFSET,
+    MEDICATION_CODE_SYSTEM_TO_ID,
+    build_medication_group_vocab,
+    build_medication_semantic_descriptor,
+)
 from src.ehr_hier.tokenizers.medtok_crosswalk import (
     crosswalk_candidate_keys,
 )
@@ -49,6 +56,9 @@ class MedTokResolution:
     stage: str
     matched_code: Optional[str] = None
     source_code: Optional[str] = None
+    group_code: Optional[str] = None
+    semantic_label: Optional[str] = None
+    code_system: Optional[str] = None
 
 
 def _category_name(category: TokenCategory | str | object) -> str:
@@ -201,6 +211,8 @@ class MedTokenWithAttrsEncoder:
         drop_unknowns: bool = False,
         fallback_to_raw: bool = True,
         residual_exact_vocab: Optional[CategoryVocab] = None,
+        med_group_vocab: Optional[CategoryVocab] = None,
+        med_group_offset: int = DEFAULT_MED_GROUP_OFFSET,
         residual_fallback_offset: Optional[int] = None,
         residual_fallback_buckets: int = 40_000,
         residual_tail_policy: Optional[str] = None,
@@ -223,6 +235,7 @@ class MedTokenWithAttrsEncoder:
         self.drop_unknowns = drop_unknowns
         self.fallback_to_raw = fallback_to_raw
         self.residual_exact_vocab = residual_exact_vocab
+        self.med_group_offset = int(med_group_offset)
         self.residual_fallback_offset = (
             int(residual_fallback_offset)
             if residual_fallback_offset is not None
@@ -243,8 +256,14 @@ class MedTokenWithAttrsEncoder:
         # START/END/STOP markers from MEDS-style medication/infusion/procedure events
         self._marker_attr = "event_marker"
         self._marker_to_id = {"START": 1, "END": 2, "STOP": 3}
+        self.med_group_vocab: Optional[CategoryVocab] = None
         if self.category == TokenCategory.MEDICATION:
             self._lexical_bridge = self._build_medication_lexical_bridge()
+            self.med_group_vocab = med_group_vocab or build_medication_group_vocab(
+                med_vocab=self.base_vocab,
+                residual_vocab=self.residual_exact_vocab,
+                offset=int(self.med_group_offset),
+            )
 
     def reset_state(self) -> None:
         return None  # stateless
@@ -675,7 +694,7 @@ class MedTokenWithAttrsEncoder:
         self._cache[cache_key] = unk
         return unk
 
-    def resolve_event(self, ev: Any) -> MedTokResolution:
+    def _resolve_event_core(self, ev: Any) -> MedTokResolution:
         raw_code = getattr(ev, "code", None)
         base_code, _ = self._strip_marker(raw_code)
         parent_codes = self._iter_parent_codes(ev)
@@ -683,18 +702,61 @@ class MedTokenWithAttrsEncoder:
         parent_codes = list(dict.fromkeys(parent_codes))
         return self.resolve_code(base_code, raw_code, parent_codes=parent_codes)
 
+    def resolve_event(self, ev: Any) -> MedTokResolution:
+        resolution = self._resolve_event_core(ev)
+        if self.category != TokenCategory.MEDICATION:
+            return resolution
+        raw_code = getattr(ev, "code", None)
+        _, marker = self._strip_marker(raw_code)
+        descriptor = build_medication_semantic_descriptor(
+            ev=ev,
+            matched_code=resolution.matched_code,
+            source_code=resolution.source_code,
+            resolution_stage=resolution.stage,
+            marker=marker,
+            med_group_vocab=self.med_group_vocab,
+            categorical_attr_vocabs=self.categorical_attrs,
+            numeric_attr_cfgs=self.numeric_attrs,
+        )
+        return MedTokResolution(
+            base_gid=resolution.base_gid,
+            stage=resolution.stage,
+            matched_code=resolution.matched_code,
+            source_code=resolution.source_code,
+            group_code=descriptor.group_code,
+            semantic_label=descriptor.semantic_label,
+            code_system=descriptor.code_system,
+        )
+
+    def resolve_group_code(self, ev: Any) -> Optional[str]:
+        return self.resolve_event(ev).group_code
+
+    def resolve_semantic_label(self, ev: Any) -> Optional[str]:
+        return self.resolve_event(ev).semantic_label
+
     def _encode_categorical_attrs(self, ev: Any) -> Dict[str, int]:
         cat_attrs: Dict[str, int] = {}
         for attr_name, vocab in self.categorical_attrs.items():
             val = getattr(ev, attr_name, None)
-            cat_attrs[attr_name] = vocab.encode(val)
+            if val is None:
+                continue
+            text = str(val).strip()
+            if not text:
+                continue
+            cat_attrs[attr_name] = vocab.encode(text.upper())
         return cat_attrs
 
     def _encode_numeric_attrs(self, ev: Any) -> Dict[str, float]:
         num_attrs: Dict[str, float] = {}
         for attr_name, cfg in self.numeric_attrs.items():
             val = getattr(ev, attr_name, None)
-            num_attrs[attr_name] = cfg.normalize(val)
+            try:
+                parsed = float(val)
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(parsed):
+                continue
+            num_attrs[attr_name] = float(cfg.normalize(parsed))
         return num_attrs
 
     def encode_event(self, ev: Any, dt_hours: float) -> List[EventToken]:
@@ -704,7 +766,7 @@ class MedTokenWithAttrsEncoder:
         parent_codes.extend(self._lookup_parent_codes(raw_code=raw_code, base_code=base_code))
         # de-dupe preserving order
         parent_codes = list(dict.fromkeys(parent_codes))
-        resolution = self.resolve_code(base_code, raw_code, parent_codes=parent_codes)
+        resolution = self.resolve_event(ev)
         base_gid = resolution.base_gid
         if base_gid is None:
             return []
@@ -716,6 +778,40 @@ class MedTokenWithAttrsEncoder:
             elif resolution.stage == "residual_hash":
                 cat_attrs["residual_fallback_hash"] = 1
         num_attrs = self._encode_numeric_attrs(ev)
+        if self.category == TokenCategory.MEDICATION:
+            descriptor = build_medication_semantic_descriptor(
+                ev=ev,
+                matched_code=resolution.matched_code,
+                source_code=resolution.source_code,
+                resolution_stage=resolution.stage,
+                marker=marker,
+                med_group_vocab=self.med_group_vocab,
+                categorical_attr_vocabs=self.categorical_attrs,
+                numeric_attr_cfgs=self.numeric_attrs,
+            )
+            cat_attrs = {}
+            for attr_name, value in descriptor.categorical_attrs.items():
+                if attr_name == "event_marker_label":
+                    continue
+                vocab = self.categorical_attrs.get(attr_name, None)
+                if vocab is not None:
+                    cat_attrs[attr_name] = vocab.encode(value)
+            if descriptor.group_code is not None and self.med_group_vocab is not None:
+                cat_attrs["med_group"] = self.med_group_vocab.encode(descriptor.group_code)
+            code_system_id = int(
+                MEDICATION_CODE_SYSTEM_TO_ID.get(str(descriptor.code_system).upper(), 0)
+            )
+            if code_system_id > 0:
+                cat_attrs["med_code_system_id"] = code_system_id
+            if self._is_residual_gid(base_gid):
+                cat_attrs["residual_fallback"] = 1
+                if resolution.stage == "residual_exact":
+                    cat_attrs["residual_fallback_exact"] = 1
+                elif resolution.stage == "residual_hash":
+                    cat_attrs["residual_fallback_hash"] = 1
+            num_attrs = dict(descriptor.numeric_attrs)
+        if marker in self._marker_to_id:
+            cat_attrs[self._marker_attr] = int(self._marker_to_id[marker])
 
         tokens = [
             EventToken(

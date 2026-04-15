@@ -32,12 +32,14 @@ class TokenBundleFrameCodec:
         token_encoder: Any,
         payload_kind: EventPayloadKind | str,
         concept_code_fn: Callable[[Any], str | None] | None = None,
+        group_code_fn: Callable[[Any], str | None] | None = None,
         semantic_label_fn: Callable[[Any], str | None] | None = None,
     ) -> None:
         self.category = category
         self.token_encoder = token_encoder
         self.payload_kind = payload_kind
         self._concept_code_fn = concept_code_fn
+        self._group_code_fn = group_code_fn
         self._semantic_label_fn = semantic_label_fn
 
     def __getattr__(self, name: str) -> Any:
@@ -65,6 +67,11 @@ class TokenBundleFrameCodec:
             return self._semantic_label_fn(ev)
         return None
 
+    def _group_code(self, ev: Any) -> str | None:
+        if self._group_code_fn is not None:
+            return self._group_code_fn(ev)
+        return None
+
     def encode_frame(self, ev: Any, dt_hours: float) -> list[EventFrame]:
         tokens = self.encode_event(ev, dt_hours)
         if not tokens:
@@ -75,6 +82,7 @@ class TokenBundleFrameCodec:
                 payload_kind=self.payload_kind,
                 source_code=self._source_code(ev),
                 concept_code=self._concept_code(ev),
+                group_code=self._group_code(ev),
                 semantic_label=self._semantic_label(ev),
             )
         ]

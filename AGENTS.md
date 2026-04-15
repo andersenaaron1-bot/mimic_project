@@ -47,9 +47,26 @@ split design centers.
 The model objective remains explicitly marked and typed:
 
 - discrete marks use family-, payload-, and family-conditioned concept CE
-- numeric measurement marks use continuous likelihood on the event lane
+- numeric or typed continuous marks use continuous likelihood on the event lane
 - event timing and inter-window gap timing use continuous-time NLL terms
 - dense token CE remains only as an auxiliary stabilization path
+
+The repo should no longer interpret "value" as one universal scalar shared by
+all families. The correct world-model object is a **family-specific structured
+mark**:
+
+- one event timestamp
+- one family
+- one concept
+- optional categorical attributes
+- optional continuous attributes
+
+This means the marked objective can be:
+
+- discrete-only for diagnoses/procedures
+- discrete plus scalar continuous for numeric measurements
+- discrete plus categorical attributes for qualitative observations
+- mixed discrete/continuous structured marks for medications
 
 ## Target Architecture
 
@@ -502,21 +519,24 @@ and their roles:
 1. Complete the migration from the legacy single-vector window summary to full
    `WindowStatePacket` usage across latent updates, memory interfaces, and
    retrieval.
-2. Implement Phase 5.5 objective/tokenization/time-substrate harmonization
-   before spending substantial LRZ budget on architecture comparisons.
-3. Run short shaping experiments to validate the revised primary loss geometry
+2. Implement the Phase 5.5 medication structured-mark refactor under the
+   MEDS-transformed event view before recompiling timelines.
+3. Complete the rest of Phase 5.5 objective/tokenization/time-substrate
+   harmonization before spending substantial LRZ budget on architecture
+   comparisons.
+4. Run short shaping experiments to validate the revised primary loss geometry
    before broad ablations:
    - core marked objective only
    - core marked objective + patient memory
    - resumed dual-memory run with delayed precedent losses
-4. Evaluate the current dual-memory decoder path and compare:
+5. Evaluate the current dual-memory decoder path and compare:
    - no memory
    - patient memory only
    - precedent memory only
    - dual memory
-5. Add multi-step rollout evaluation on top of the current header-conditioned
+6. Add multi-step rollout evaluation on top of the current header-conditioned
    dual-memory path.
-6. Finalize the latent mechanism only after Phase 5.5 and Phase 5 clarify what
+7. Finalize the latent mechanism only after Phase 5.5 and Phase 5 clarify what
    retrieval and rollout actually demand from the frozen latent family.
 
 ## Concrete Implementation Path
@@ -1099,6 +1119,27 @@ The default world-model objective should be a **marked time-to-event objective**
 over the event-native lane, not dense token CE with marked heads treated as
 secondary add-ons.
 
+This should be read as:
+
+- `log p(dt | history)`
+- `log p(mark | dt, history)`
+
+where `mark` is **family-specific**, not one universal scalar payload. The
+primary marked regime is therefore:
+
+- diagnoses / procedures / structural-process:
+  discrete marks
+- numeric measurements:
+  discrete concept plus scalar continuous value
+- qualitative observations:
+  discrete code plus discrete value/status attributes
+- medications:
+  hierarchical mixed marks with:
+  - medication group
+  - exact medication concept
+  - categorical attributes
+  - sparse continuous attributes when actually observed
+
 The primary loss stack should be:
 
 - event-family CE
@@ -1137,19 +1178,29 @@ The intended factorization is:
   family-conditioned discrete identity
 - `dt`:
   time to the next event on the event lane
-- `value`:
-  conditional numeric payload only when the payload kind is numeric
+- `mark/value`:
+  family-specific payload, which may be:
+  - no value beyond concept
+  - one continuous scalar
+  - one or more categorical attributes
+  - mixed categorical and sparse continuous attributes
 
 This means:
 
 - measurement code and measurement value belong to one marked event, not two
   unrelated competing events
-- diagnoses, procedures, medications, and structural/process events are marked
-  events without numeric value supervision
+- diagnoses, procedures, and structural/process events are primarily discrete
+  marked events
+- medications are marked events with structured mixed marks rather than one
+  scalar `value`
 - exact-memory writes operate over event objects, not over detached value tokens
 
 Tokenization must therefore be re-audited so no family is forced into a
 single-dense-token formulation that contradicts the marked objective.
+
+The repo should therefore stop using "the value part" as if there is one
+shared numeric slot for every family. The correct target is the
+**family-conditioned mark distribution**.
 
 #### Phase 5.5 tokenization audit requirements
 
@@ -1168,7 +1219,8 @@ Re-audit all event families against the marked objective:
 - medications:
   confirm what constitutes one medication event and which modifiers should be
   modeled as categorical or numeric attributes under that event rather than as
-  separate autoregressive token targets
+  separate autoregressive token targets, and confirm which shared medication
+  group/ontology parent can be recovered from the MEDS-transformed event view
 - structural/process events:
   confirm that boundaries and overlays remain true marked events, not only
   control tokens
@@ -1255,16 +1307,25 @@ contract for the world-model objective.
 - `symbolic_code` payload for medications:
   one medication event frame with:
   - `family = medication`
+  - `group = resolved medication group / ontology parent`
   - `concept = resolved medication concept`
   - `dt = next event delta on the event lane`
-  - `categorical attributes = route / formulation / administration-action-like context`
-  - `numeric attributes = dose / rate / duration when available`
+  - `categorical attributes = route / formulation / frequency / unit / administration-action-like context / code-system-like source`
+  - `continuous attributes = dose / rate / duration / doses-per-24h when actually observed`
   Medication metadata should not be collapsed into one generic scalar `value`.
-  Dose, rate, and duration require typed conditional attribute heads if they
-  are supervised generatively. Start/end/stop semantics should not remain
-  semantically dependent on a second marker token in the primary objective;
-  they should be folded into medication action attributes or promoted to an
-  explicit process/structural event representation.
+  Medication is the canonical mixed-mark family in this repo.
+
+  The primary medication mark factorization should be:
+
+  - `p(med_group | history, dt)`
+  - `p(med_concept | med_group, history, dt)`
+  - `p(categorical_attrs | med_group, med_concept, history, dt)`
+  - `p(continuous_attrs | med_group, med_concept, history, dt, observed_mask)`
+
+  Start/end/stop semantics should not remain semantically dependent on a
+  second generic marker token in the primary objective; they should be folded
+  into medication action attributes or promoted to an explicit
+  process/structural event representation.
 
 - `structural` / `process` payloads:
   one marked event frame with:
@@ -1314,9 +1375,10 @@ fully aligned to the marked objective.
 - diagnoses / procedures / structural/process:
   generate only concept and timing
 - medications:
-  generate concept and timing first, then conditional categorical/numeric
-  attributes; do not treat medication attribute generation as ordinary dense
-  token continuation
+  generate medication group and concept first, then conditional
+  categorical/numeric attributes; do not treat medication attribute generation
+  as ordinary dense token continuation and do not force all medication context
+  through one scalar `numeric_value`
 - static/demographic/header objects:
   seed context and memory, not free-running event generation
 
@@ -1327,6 +1389,91 @@ The tokenization audit should end with one explicit repo-level statement:
 - which families participate in categorical or typed attribute prediction
 - which families are header/static metadata only
 - which legacy dense-token targets remain auxiliary only
+
+#### Phase 5.5 structured-mark implementation rule
+
+The world-model objective should be treated as a **family-conditioned
+structured-mark objective**, not as one scalar value head plus CE heads.
+
+Holistic rule:
+
+- every event gets one time prediction
+- every event gets one family prediction
+- every family gets its own mark factorization
+
+Default family-level mark forms:
+
+- diagnoses:
+  `concept`
+- procedures:
+  `concept`
+- structural/process:
+  `concept + categorical transition attrs`
+- qualitative observations:
+  `code + categorical observation value`
+- numeric measurements:
+  `concept + scalar continuous value`
+- medications:
+  `group + concept + categorical attrs + sparse continuous attrs`
+
+This is natively compatible with marked point-process modeling because mark
+spaces may be discrete, continuous, or vector-valued. The repo should not
+collapse these different mark forms into one universal scalar abstraction.
+
+#### Phase 5.5 medication refactor under MEDS-transformed events
+
+Medication handling must remain compatible with the current `meds_reader`
+pipeline and therefore must be implemented against the **MEDS-transformed event
+view**, not by assuming direct raw-table joins against MIMIC tables.
+
+The medication refactor should read whatever fields are exposed on the MEDS
+event object, including when available:
+
+- `code`
+- `time`
+- `formulary_drug_cd` or `product_code`
+- `ndc`
+- `gsn`
+- `drug_name_generic`
+- `drug`
+- `medication`
+- `route`, `form`, `freq`, `unit`
+- dosage/rate/duration-like numeric fields when actually present
+
+The resolver should build one `MedicationSemanticDescriptor` from those MEDS
+fields and then derive:
+
+- `exact_concept_code`
+- `group_code`
+- `code_system`
+- sparse categorical attrs
+- sparse continuous attrs with explicit observed masks
+
+Medication exact-concept precedence should be:
+
+1. MedTok concept hit
+2. local formulary/product-code concept
+3. normalized NDC concept
+4. GSN concept
+5. normalized generic-name concept
+6. residual exact surface concept
+
+Medication group precedence should be:
+
+1. normalized generic-name / ingredient group
+2. GSN group
+3. simplified MedTok alias group
+4. simplified residual exact surface group
+5. self-group fallback
+
+This creates semantic sharing for the non-MedTok majority without discarding
+exact identity.
+
+The medication refactor must also remove the current generic medication
+`numeric_value` injection as the default behavior. Medication continuous attrs
+should only be emitted when actually present in the MEDS event and should be
+supervised through typed masked heads, not through the universal measurement
+value lane.
 
 #### Phase 5.5 temporal substrate contract
 

@@ -28,6 +28,8 @@ frozen_ranges:
     offset: 1640000
   med_unit:
     offset: 1660000
+  med_group:
+    offset: 1670000
   med_dosage:
     offset: 1680000
   med_rate:

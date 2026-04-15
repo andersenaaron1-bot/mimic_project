@@ -258,6 +258,35 @@ def test_compact_timeline_roundtrip_preserves_event_fields() -> None:
     assert restored == ensure_event_frames(timeline)
 
 
+def test_compact_timeline_roundtrip_preserves_group_code() -> None:
+    from src.ehr_hier.data.event_frames import EventPayloadKind, build_event_frame
+
+    timeline = [
+        build_event_frame(
+            [
+                EventToken(
+                    value_id=1_400_001,
+                    category_id=int(TokenCategory.MEDICATION),
+                    t_from_start_hours=0.0,
+                    dt_from_prev_hours=0.0,
+                    cat_attrs={"med_group": 1_670_001, "route": 1_600_001},
+                    num_attrs={"dosage": 0.5},
+                )
+            ],
+            payload_kind=EventPayloadKind.SYMBOLIC_CODE,
+            concept_code="NDC//00000-0000",
+            group_code="MED_GROUP::FUROSEMIDE",
+            semantic_label="FUROSEMIDE",
+        )
+    ]
+
+    compact = serialize_timeline_compact(timeline)
+    restored = deserialize_timeline_compact(compact)
+
+    assert restored[0].group_code == "MED_GROUP::FUROSEMIDE"
+    assert restored[0].semantic_label == "FUROSEMIDE"
+
+
 def test_precompiled_dataset_loads_packed_shard_from_index(tmp_path: Path) -> None:
     shard_path = tmp_path / "shards" / "000000.ptz"
     train_timeline = _make_timeline(101, length=5)

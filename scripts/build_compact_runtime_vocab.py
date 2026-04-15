@@ -131,7 +131,7 @@ def _build_worker_runtime(*, args: argparse.Namespace, block_ranges: Sequence[tu
         "encoders": encoders,
         "structural_codebook": artifacts.structural_codebook,
         "window_hook_label": "window_boundary",
-        "attach_med_numeric": True,
+        "attach_med_numeric": False,
         "emit_global_demographic_tokens": True,
         "special_token_offset": 0,
         "qual_obs_code_vocab": artifacts.obs_code_vocab,

@@ -41,6 +41,19 @@ def build_event_concept_family_sizes(vocab_config: dict) -> Dict[str, int]:
     return family_sizes
 
 
+def build_sparse_family_size(vocab_config: dict, family_name: str) -> int:
+    sparse_contract = vocab_config.get("sparse_vocab_contract", {})
+    if not isinstance(sparse_contract, dict):
+        return 0
+    families = sparse_contract.get("families", {})
+    if not isinstance(families, dict):
+        return 0
+    payload = families.get(str(family_name), {})
+    if not isinstance(payload, dict):
+        return 0
+    return int(payload.get("source_size", 0))
+
+
 class AETPrecedentHeads(nn.Module):
     """
     Learned retrieval-space heads for Phase 4 precedent memory.
@@ -162,6 +175,68 @@ class AETOutputHeads(nn.Module):
                 if self.emit_event_heads and int(size) > 0
             }
         )
+        med_group_size = build_sparse_family_size(vocab_config, "med_group")
+        med_route_size = build_sparse_family_size(vocab_config, "med_route")
+        med_form_size = build_sparse_family_size(vocab_config, "med_form")
+        med_freq_size = build_sparse_family_size(vocab_config, "med_freq")
+        med_unit_size = build_sparse_family_size(vocab_config, "med_unit")
+        self.event_med_group_head = (
+            nn.Linear(d_model, med_group_size)
+            if self.emit_event_heads and med_group_size > 0
+            else None
+        )
+        self.event_med_route_head = (
+            nn.Linear(d_model, med_route_size)
+            if self.emit_event_heads and med_route_size > 0
+            else None
+        )
+        self.event_med_form_head = (
+            nn.Linear(d_model, med_form_size)
+            if self.emit_event_heads and med_form_size > 0
+            else None
+        )
+        self.event_med_freq_head = (
+            nn.Linear(d_model, med_freq_size)
+            if self.emit_event_heads and med_freq_size > 0
+            else None
+        )
+        self.event_med_unit_head = (
+            nn.Linear(d_model, med_unit_size)
+            if self.emit_event_heads and med_unit_size > 0
+            else None
+        )
+        self.event_med_marker_head = (
+            nn.Linear(d_model, 4)
+            if self.emit_event_heads
+            else None
+        )
+        self.event_med_dosage_nll_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 2),
+            )
+            if self.emit_event_heads
+            else None
+        )
+        self.event_med_rate_nll_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 2),
+            )
+            if self.emit_event_heads
+            else None
+        )
+        self.event_med_duration_nll_head = (
+            nn.Sequential(
+                nn.Linear(d_model, d_model // 2),
+                nn.GELU(),
+                nn.Linear(d_model // 2, 2),
+            )
+            if self.emit_event_heads
+            else None
+        )
 
         # 5. Attribute Regression Head (Side-Channel)
         # Predicts log1p(dosage) or log1p(duration)
@@ -221,4 +296,28 @@ class AETOutputHeads(nn.Module):
             out["logits_event_payload"] = self.event_payload_head(hidden_states)
         for family_name, head in self.event_concept_heads.items():
             out[f"logits_event_concept_{family_name}"] = head(hidden_states)
+        if self.event_med_group_head is not None:
+            out["logits_event_med_group"] = self.event_med_group_head(hidden_states)
+        if self.event_med_route_head is not None:
+            out["logits_event_med_route"] = self.event_med_route_head(hidden_states)
+        if self.event_med_form_head is not None:
+            out["logits_event_med_form"] = self.event_med_form_head(hidden_states)
+        if self.event_med_freq_head is not None:
+            out["logits_event_med_freq"] = self.event_med_freq_head(hidden_states)
+        if self.event_med_unit_head is not None:
+            out["logits_event_med_unit"] = self.event_med_unit_head(hidden_states)
+        if self.event_med_marker_head is not None:
+            out["logits_event_med_marker"] = self.event_med_marker_head(hidden_states)
+        if self.event_med_dosage_nll_head is not None:
+            raw = self.event_med_dosage_nll_head(hidden_states)
+            out["pred_event_med_dosage_mu"] = raw[..., 0]
+            out["pred_event_med_dosage_sigma"] = nn.functional.softplus(raw[..., 1]) + 0.1
+        if self.event_med_rate_nll_head is not None:
+            raw = self.event_med_rate_nll_head(hidden_states)
+            out["pred_event_med_rate_mu"] = raw[..., 0]
+            out["pred_event_med_rate_sigma"] = nn.functional.softplus(raw[..., 1]) + 0.1
+        if self.event_med_duration_nll_head is not None:
+            raw = self.event_med_duration_nll_head(hidden_states)
+            out["pred_event_med_duration_mu"] = raw[..., 0]
+            out["pred_event_med_duration_sigma"] = nn.functional.softplus(raw[..., 1]) + 0.1
         return out

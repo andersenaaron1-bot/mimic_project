@@ -85,6 +85,7 @@ class EventFrame:
     window_hook: Optional[str] = None
     source_code: Optional[str] = None
     concept_code: Optional[str] = None
+    group_code: Optional[str] = None
     semantic_label: Optional[str] = None
 
     def __post_init__(self) -> None:
@@ -106,6 +107,7 @@ def build_event_frame(
     payload_kind: EventPayloadKind | str | None = None,
     source_code: Optional[str] = None,
     concept_code: Optional[str] = None,
+    group_code: Optional[str] = None,
     semantic_label: Optional[str] = None,
 ) -> EventFrame:
     if not tokens:
@@ -125,6 +127,7 @@ def build_event_frame(
         window_hook=first.window_hook,
         source_code=source_code,
         concept_code=concept_code,
+        group_code=group_code,
         semantic_label=semantic_label,
     )
 
@@ -160,6 +163,7 @@ def clone_event_frame(
         window_hook=first.window_hook,
         source_code=frame.source_code,
         concept_code=frame.concept_code,
+        group_code=frame.group_code,
         semantic_label=frame.semantic_label,
     )
 
@@ -245,5 +249,6 @@ def slice_event_frame(
         window_hook=adjusted_tokens[0].window_hook,
         source_code=frame.source_code,
         concept_code=frame.concept_code,
+        group_code=frame.group_code,
         semantic_label=frame.semantic_label,
     )

@@ -189,6 +189,7 @@ def serialize_timeline_compact(
     payload_kind_ids = torch.zeros(frame_count, dtype=torch.int16)
     source_codes: list[str | None] = []
     concept_codes: list[str | None] = []
+    group_codes: list[str | None] = []
     semantic_labels: list[str | None] = []
 
     token_cursor = 0
@@ -205,6 +206,7 @@ def serialize_timeline_compact(
         payload_kind_ids[idx] = int(kind_id)
         source_codes.append(None if frame.source_code is None else str(frame.source_code))
         concept_codes.append(None if frame.concept_code is None else str(frame.concept_code))
+        group_codes.append(None if frame.group_code is None else str(frame.group_code))
         semantic_labels.append(None if frame.semantic_label is None else str(frame.semantic_label))
     frame_token_offsets[frame_count] = int(token_cursor)
 
@@ -219,6 +221,7 @@ def serialize_timeline_compact(
         "payload_kind_ids": payload_kind_ids,
         "source_codes": source_codes,
         "concept_codes": concept_codes,
+        "group_codes": group_codes,
         "semantic_labels": semantic_labels,
         **token_payload,
     }
@@ -233,6 +236,7 @@ def deserialize_timeline_compact(payload: Mapping[str, Any]) -> list[EventFrame]
     payload_kind_values = payload_kind_ids.tolist() if payload_kind_ids is not None else [0] * frame_count
     source_codes = list(payload.get("source_codes", []))
     concept_codes = list(payload.get("concept_codes", []))
+    group_codes = list(payload.get("group_codes", []))
     semantic_labels = list(payload.get("semantic_labels", []))
 
     frames: list[EventFrame] = []
@@ -249,6 +253,7 @@ def deserialize_timeline_compact(payload: Mapping[str, Any]) -> list[EventFrame]
                 payload_kind=kind,
                 source_code=source_codes[idx] if idx < len(source_codes) else None,
                 concept_code=concept_codes[idx] if idx < len(concept_codes) else None,
+                group_code=group_codes[idx] if idx < len(group_codes) else None,
                 semantic_label=semantic_labels[idx] if idx < len(semantic_labels) else None,
             )
         )
