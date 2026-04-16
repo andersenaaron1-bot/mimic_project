@@ -424,6 +424,13 @@ Already implemented:
     auxiliary rather than the preferred path
   - patient-memory aging aligned to boundary hours instead of semantic-window
     step count
+  - family-specific structured-mark supervision on the event lane rather than a
+    universal scalar-value interpretation
+  - medication structured-mark routing under the MEDS-transformed event view:
+    - exact medication concept
+    - shared `med_group`
+    - categorical medication attrs
+    - sparse continuous medication attrs with observed-only masking
 - the event-native marked loss path is implemented
 - the default symbolic contract prefers exact residual vocabularies or explicit
   `UNK`; production hash fallback is no longer implicit
@@ -432,9 +439,7 @@ Not yet implemented:
 
 - full `WindowStatePacket` usage across all long-range interfaces
 - implementation of the full Phase 5.5 family-level MTTE contract, especially:
-  - explicit family-by-family marked-event roles
-  - categorical/numeric attribute heads for medication and qualitative
-    observation payloads
+  - completion of qualitative-observation structured-mark supervision
   - retirement of legacy RVQ / marker-token supervision from the primary
     objective path wherever they only exist for dense-token compatibility
 - ANN-accelerated precedent lookup beyond the current dense exact store
@@ -514,29 +519,137 @@ and their roles:
   the precedent path should support typed marked generation rather than
   reducing retrieval to plain token prediction
 
+## Evaluation Gates
+
+The remaining roadmap should be driven by explicit evaluation gates rather than
+by adding more architectural surface area at once.
+
+### Gate 1. Phase 5.5 shaping gate
+
+Before any broad ablation matrix, confirm that the substrate is stable under the
+revised marked objective:
+
+- `core_marked_latent` must train without routing failures, NaNs, or obvious
+  objective collapse
+- the primary event-native heads must move in the right direction:
+  - event family
+  - event payload
+  - event concept
+  - event timing
+  - event value / structured-mark lanes
+  - next-window heads
+- medication structured-mark supervision must be judged from actual supervised
+  counts in logs rather than from nominal head availability
+- the measurement artifact stack is acceptable for shaping, but remains a
+  medium-priority substrate issue before a long final training campaign
+
+### Gate 2. Representative trajectory/window gate
+
+Before spending substantial LRZ budget on comparison runs, inspect a
+representative sample of timeline builds directly:
+
+- sample a few thousand trajectories from the current split
+- dump the semantic windows that were actually built
+- dump the per-chunk token traces that feed local modeling
+- inspect:
+  - `HISTORY_PREFIX`
+  - `POST_DISCHARGE`
+  - standard ED/inpatient/ICU trajectories
+  - medication-heavy windows
+  - measurement-heavy windows
+
+The purpose of this gate is to confirm that typical clinical trajectories are
+handled as intended under the current windowing and tokenization regime.
+
+### Gate 3. Memory-role gate
+
+Once the substrate is stable, compare memory roles while keeping the latent
+adapter fixed:
+
+- no memory
+- patient memory only
+- precedent memory only
+- dual memory
+
+This gate answers whether the next Phase 5 gains come mainly from:
+
+- exact patient-specific fact retention
+- analogical precedent support
+- or their interaction
+
+### Gate 4. Retrieval-role gate
+
+The role of retrieved precedent must be compared explicitly rather than treated
+as one monolithic mechanism. At minimum compare:
+
+- no precedent
+- boundary prior only
+- header-conditioned generation prompt only
+- boundary prior plus header-conditioned generation prompt
+
+This gate determines whether retrieved analogues help mainly through:
+
+- next-window/header prediction
+- local event generation
+- or both
+
+### Gate 5. Latent gate
+
+Latent-family comparison belongs after the memory-role and retrieval-role gates
+are clear.
+
+The latent should be judged on residual problems that remain after retrieval and
+decoder conditioning are working, especially:
+
+- long-gap drift
+- regime transitions
+- header prediction stability
+- precedent-query quality
+- rollout coherence across windows
+
+### Gate 6. Full-baseline gate
+
+Only after the earlier gates are clean should the repo spend long-budget runs on
+the first full baseline. That baseline should include:
+
+- the revised marked objective
+- representative trajectory/window validation
+- the chosen memory-role configuration
+- the chosen retrieval-role configuration
+- a clearly justified latent adapter choice for the current phase
+
 ## Immediate Priorities
 
-1. Complete the migration from the legacy single-vector window summary to full
-   `WindowStatePacket` usage across latent updates, memory interfaces, and
-   retrieval.
-2. Implement the Phase 5.5 medication structured-mark refactor under the
-   MEDS-transformed event view before recompiling timelines.
-3. Complete the rest of Phase 5.5 objective/tokenization/time-substrate
-   harmonization before spending substantial LRZ budget on architecture
-   comparisons.
-4. Run short shaping experiments to validate the revised primary loss geometry
+1. Run short shaping experiments to validate the revised primary loss geometry
    before broad ablations:
    - core marked objective only
    - core marked objective + patient memory
    - resumed dual-memory run with delayed precedent losses
-5. Evaluate the current dual-memory decoder path and compare:
+2. Run representative trajectory/window preview checks over a few thousand
+   sampled timelines so typical trajectory shapes can be inspected directly.
+3. Complete the remaining Phase 5.5 objective/tokenization/time-substrate
+   harmonization before spending substantial LRZ budget on architecture
+   comparisons, especially:
+   - qualitative-observation structured-mark supervision
+   - retirement of legacy dense-token-primary supervision where it is now only a
+     compatibility path
+   - eventual measurement-artifact refresh if longer training shows the current
+     cVAE routing coverage is limiting
+4. Evaluate the current dual-memory decoder path and compare:
    - no memory
    - patient memory only
    - precedent memory only
    - dual memory
+5. Compare retrieval roles explicitly:
+   - boundary prior only
+   - header-conditioned prompt only
+   - both together
 6. Add multi-step rollout evaluation on top of the current header-conditioned
    dual-memory path.
-7. Finalize the latent mechanism only after Phase 5.5 and Phase 5 clarify what
+7. Complete the migration from the legacy single-vector window summary to full
+   `WindowStatePacket` usage across latent updates, memory interfaces, and
+   retrieval.
+8. Finalize the latent mechanism only after Phase 5.5 and Phase 5 clarify what
    retrieval and rollout actually demand from the frozen latent family.
 
 ## Concrete Implementation Path
