@@ -82,13 +82,15 @@ timestamp() {
 
 resolve_context() {
   ART_HOST="${ART_HOST:-$(pick_latest_dir "$DSS_HOST/etl/pipeline_artifacts_*")}"
-  DB_HOST="${DB_HOST:-$(pick_latest_find "$DSS_HOST/etl" "mimiciv.db" -path '*/meds_reader_db_mimiciv_*/*')}"
+  DB_HOST="${DB_HOST:-$(pick_first_existing \
+    "$DSS_HOST/etl/meds_reader_db_mimiciv_20260226_033711/mimiciv.db" \
+    "$(find "$DSS_HOST/etl" -type f -path '*/meds_reader_db_mimiciv_*/mimiciv.db' 2>/dev/null | sort | tail -1 || true)")}"
   SPLITS_HOST="${SPLITS_HOST:-$(pick_first_existing \
     "$DSS_HOST/etl/mimiciv_20260224_0114_fresh_img023/out_plain/MEDS_cohort/metadata/subject_splits.parquet" \
-    "$(find "$DSS_HOST/etl" -path '*/MEDS_cohort/metadata/subject_splits.parquet' 2>/dev/null | sort | tail -1 || true)")}"
+    "$(find "$DSS_HOST/etl" -type f -path '*/MEDS_cohort/metadata/subject_splits.parquet' 2>/dev/null | sort | tail -1 || true)")}"
   CODES_PARQUET_HOST="${CODES_PARQUET_HOST:-$(pick_first_existing \
     "$DSS_HOST/etl/mimiciv_20260224_0114_fresh_img023/out_plain/MEDS_cohort/metadata/codes.parquet" \
-    "$(find "$DSS_HOST/etl" -path '*/MEDS_cohort/metadata/codes.parquet' 2>/dev/null | sort | tail -1 || true)")}"
+    "$(find "$DSS_HOST/etl" -type f -path '*/MEDS_cohort/metadata/codes.parquet' 2>/dev/null | sort | tail -1 || true)")}"
   MEDTOK_VOC_BASE_HOST="${MEDTOK_VOC_BASE_HOST:-$(pick_first_existing \
     "$DSS_HOST/etl/pipeline_artifacts_20260226_033711/medtok_compressed_v1" \
     "$(find "$DSS_HOST/etl" -maxdepth 3 -type d -name 'medtok_compressed_v1' 2>/dev/null | sort | tail -1 || true)")}"
@@ -104,7 +106,7 @@ resolve_context() {
     "/dss/artifacts/medtok/code2embeddings.json")}"
 
   [[ -n "$ART_HOST" && -d "$ART_HOST" ]] || lrz_die "Could not resolve ART_HOST."
-  [[ -n "$DB_HOST" && -f "$DB_HOST" ]] || lrz_die "Could not resolve DB_HOST."
+  [[ -n "$DB_HOST" && -e "$DB_HOST" ]] || lrz_die "Could not resolve DB_HOST."
   [[ -n "$SPLITS_HOST" && -f "$SPLITS_HOST" ]] || lrz_die "Could not resolve SPLITS_HOST."
   [[ -n "$CODES_PARQUET_HOST" && -f "$CODES_PARQUET_HOST" ]] || lrz_die "Could not resolve CODES_PARQUET_HOST."
   [[ -n "$MEDTOK_VOC_BASE_HOST" && -d "$MEDTOK_VOC_BASE_HOST" ]] || lrz_die "Could not resolve MEDTOK_VOC_BASE_HOST."
