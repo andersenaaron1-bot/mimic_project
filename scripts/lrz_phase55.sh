@@ -149,8 +149,12 @@ Subcommands:
 
   window-preview [--precomp-host HOST_PATH] [--max-subjects N]
                  [--sample-seed S] [--label LABEL]
-      Run representative semantic-window/chunk preview dumping using the phase55
-      sparse vocab from the chosen precompiled root. Updates:
+      Run fast representative window-sequence inspection directly from
+      precompiled timelines. Dumps only:
+        - ordered semantic window types
+        - boundary switch actions
+        - event frames that caused each switch
+      Updates:
         /dss/.../etl/window_preview_phase55_latest
 
   cleanup-report
@@ -318,8 +322,7 @@ subcmd_train_baseline() {
 }
 
 subcmd_window_preview() {
-  resolve_context
-  local precomp_host="${CURRENT_PHASE55_PRECOMP_HOST:-}"
+  local precomp_host="${CURRENT_PHASE55_PRECOMP_HOST:-$(pick_latest_dir "$DSS_HOST/etl/precompiled_transformer_v2_phase55_*")}"
   local label="train"
   local max_subjects="500"
   local sample_seed="13"
@@ -335,11 +338,6 @@ subcmd_window_preview() {
     esac
   done
   [[ -n "$precomp_host" && -d "$precomp_host" ]] || lrz_die "Set --precomp-host or create a phase55 precompile first."
-  local precomp_ct sparse_host sparse_ct
-  precomp_ct="$(host_to_ct "$precomp_host")"
-  sparse_host="$precomp_host/token_vocab_sparse_phase55.json"
-  sparse_ct="$(host_to_ct "$sparse_host")"
-  [[ -f "$sparse_host" ]] || lrz_die "Sparse vocab missing under precompile root: $sparse_host"
   if [[ -z "$out_host" ]]; then
     out_host="$DSS_HOST/etl/window_preview_phase55_${label}_${max_subjects}_$(timestamp)"
   fi
@@ -351,10 +349,10 @@ subcmd_window_preview() {
     --qos="$LRZ_CPU_QOS" \
     --cpus-per-task=16 \
     --mem=64G \
-    --time=03:00:00 \
+    --time=01:00:00 \
     --container-image="$IMAGE_CPU" \
     --container-mounts="$CPU_MOUNTS" \
-    bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/sample_window_previews.py --meds_reader_db '$DB' --splits_parquet '$SPLITS' --split train --max_subjects '$max_subjects' --sample_seed '$sample_seed' --progress_every 50 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$sparse_ct' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' --max_windows 32 --max_chunks_per_window 4 --max_len_per_window 96 --output_jsonl '$out_ct/window_previews_train_${max_subjects}.jsonl' --output_summary_json '$out_ct/window_previews_train_${max_subjects}_summary.json'"
+    bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/inspect_precompiled_window_sequences.py --precompiled_root '$precomp_host/train_full' --max_subjects '$max_subjects' --sample_seed '$sample_seed' --progress_every 50 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --output_jsonl '$out_ct/window_sequences_train_${max_subjects}.jsonl' --output_summary_json '$out_ct/window_sequences_train_${max_subjects}_summary.json'"
 
   update_latest_link "$out_host" "$DSS_HOST/etl/window_preview_phase55_latest"
   printf 'WINDOW_PREVIEW_HOST=%s\n' "$out_host"
