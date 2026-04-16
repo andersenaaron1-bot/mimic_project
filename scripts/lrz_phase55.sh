@@ -164,6 +164,16 @@ Subcommands:
       Updates:
         /dss/.../etl/window_preview_phase55_latest/window_sequence_report_*.json
 
+  window-transition-check [--input-host JSONL] [--top-k N]
+                          [--label LABEL]
+      Run the strict transition-driver attribution check over a window-preview
+      JSONL. This only scores transition-relevant sides of each action and
+      reports:
+        - transition-candidate opening/closing drivers
+        - TRANSFER_TO bundles that also contain ICU_ADMISSION
+        - terminal window-type distribution
+        - example terminal INPATIENT/UNK timelines
+
   cleanup-report
       Print redundant v1/v1-eval artifact candidates that can be removed after
       consolidation.
@@ -404,6 +414,41 @@ subcmd_window_preview_report() {
   printf 'WINDOW_PREVIEW_REPORT_CT=%s\n' "$report_ct"
 }
 
+subcmd_window_transition_check() {
+  local latest_host="${DSS_HOST}/etl/window_preview_phase55_latest"
+  local input_host=""
+  local top_k="40"
+  local label="window_transition_check"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --input-host) input_host="$2"; shift 2 ;;
+      --top-k) top_k="$2"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      *) lrz_die "Unknown window-transition-check arg: $1" ;;
+    esac
+  done
+  if [[ -z "$input_host" ]]; then
+    input_host="$(ls -t "${latest_host}"/window_sequences_train_*.jsonl 2>/dev/null | head -1 || true)"
+  fi
+  [[ -n "$input_host" && -f "$input_host" ]] || lrz_die "Set --input-host to a window sequence JSONL."
+  local report_host report_ct input_ct
+  report_host="$(dirname "$input_host")/${label}_$(timestamp).json"
+  report_ct="$(host_to_ct "$report_host")"
+  input_ct="$(host_to_ct "$input_host")"
+
+  srun -p "$LRZ_CPU_PARTITION" \
+    --qos="$LRZ_CPU_QOS" \
+    --cpus-per-task=4 \
+    --mem=16G \
+    --time=00:20:00 \
+    --container-image="$IMAGE_CPU" \
+    --container-mounts="$CPU_MOUNTS" \
+    bash -lc "set -euo pipefail; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/check_window_transition_integrity.py --input_jsonl '$input_ct' --top_k '$top_k' --output_json '$report_ct'"
+
+  printf 'WINDOW_TRANSITION_CHECK_HOST=%s\n' "$report_host"
+  printf 'WINDOW_TRANSITION_CHECK_CT=%s\n' "$report_ct"
+}
+
 print_cleanup_entry() {
   local path="$1"
   [[ -e "$path" ]] || return 0
@@ -449,6 +494,7 @@ main() {
     train-baseline) subcmd_train_baseline "$@" ;;
     window-preview) subcmd_window_preview "$@" ;;
     window-preview-report) subcmd_window_preview_report "$@" ;;
+    window-transition-check) subcmd_window_transition_check "$@" ;;
     cleanup-report) subcmd_cleanup_report "$@" ;;
     *) lrz_die "Unknown subcommand: $cmd" ;;
   esac
