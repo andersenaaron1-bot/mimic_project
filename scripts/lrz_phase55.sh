@@ -157,6 +157,13 @@ Subcommands:
       Updates:
         /dss/.../etl/window_preview_phase55_latest
 
+  window-preview-report [--input-host JSONL] [--top-k N]
+                        [--label LABEL]
+      Analyze a window-preview JSONL and summarize which frame sources are
+      actually causing switches, including suspicious close_open examples.
+      Updates:
+        /dss/.../etl/window_preview_phase55_latest/window_sequence_report_*.json
+
   cleanup-report
       Print redundant v1/v1-eval artifact candidates that can be removed after
       consolidation.
@@ -338,6 +345,8 @@ subcmd_window_preview() {
     esac
   done
   [[ -n "$precomp_host" && -d "$precomp_host" ]] || lrz_die "Set --precomp-host or create a phase55 precompile first."
+  local precomp_ct
+  precomp_ct="$(host_to_ct "$precomp_host")"
   if [[ -z "$out_host" ]]; then
     out_host="$DSS_HOST/etl/window_preview_phase55_${label}_${max_subjects}_$(timestamp)"
   fi
@@ -352,12 +361,47 @@ subcmd_window_preview() {
     --time=01:00:00 \
     --container-image="$IMAGE_CPU" \
     --container-mounts="$CPU_MOUNTS" \
-    bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/inspect_precompiled_window_sequences.py --precompiled_root '$precomp_host/train_full' --max_subjects '$max_subjects' --sample_seed '$sample_seed' --progress_every 50 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --output_jsonl '$out_ct/window_sequences_train_${max_subjects}.jsonl' --output_summary_json '$out_ct/window_sequences_train_${max_subjects}_summary.json'"
+    bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/inspect_precompiled_window_sequences.py --precompiled_root '$precomp_ct/train_full' --max_subjects '$max_subjects' --sample_seed '$sample_seed' --progress_every 50 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --output_jsonl '$out_ct/window_sequences_train_${max_subjects}.jsonl' --output_summary_json '$out_ct/window_sequences_train_${max_subjects}_summary.json'"
 
   update_latest_link "$out_host" "$DSS_HOST/etl/window_preview_phase55_latest"
   printf 'WINDOW_PREVIEW_HOST=%s\n' "$out_host"
   printf 'WINDOW_PREVIEW_CT=%s\n' "$out_ct"
   printf 'LATEST_LINK=%s\n' "$DSS_HOST/etl/window_preview_phase55_latest"
+}
+
+subcmd_window_preview_report() {
+  local latest_host="${DSS_HOST}/etl/window_preview_phase55_latest"
+  local input_host=""
+  local top_k="40"
+  local label="window_sequence_report"
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      --input-host) input_host="$2"; shift 2 ;;
+      --top-k) top_k="$2"; shift 2 ;;
+      --label) label="$2"; shift 2 ;;
+      *) lrz_die "Unknown window-preview-report arg: $1" ;;
+    esac
+  done
+  if [[ -z "$input_host" ]]; then
+    input_host="$(ls -t "${latest_host}"/window_sequences_train_*.jsonl 2>/dev/null | head -1 || true)"
+  fi
+  [[ -n "$input_host" && -f "$input_host" ]] || lrz_die "Set --input-host to a window sequence JSONL."
+  local report_host report_ct input_ct
+  report_host="$(dirname "$input_host")/${label}_$(timestamp).json"
+  report_ct="$(host_to_ct "$report_host")"
+  input_ct="$(host_to_ct "$input_host")"
+
+  srun -p "$LRZ_CPU_PARTITION" \
+    --qos="$LRZ_CPU_QOS" \
+    --cpus-per-task=4 \
+    --mem=16G \
+    --time=00:20:00 \
+    --container-image="$IMAGE_CPU" \
+    --container-mounts="$CPU_MOUNTS" \
+    bash -lc "set -euo pipefail; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/analyze_window_sequence_preview.py --input_jsonl '$input_ct' --top_k '$top_k' --output_json '$report_ct'"
+
+  printf 'WINDOW_PREVIEW_REPORT_HOST=%s\n' "$report_host"
+  printf 'WINDOW_PREVIEW_REPORT_CT=%s\n' "$report_ct"
 }
 
 print_cleanup_entry() {
@@ -404,6 +448,7 @@ main() {
     precompile) subcmd_precompile "$@" ;;
     train-baseline) subcmd_train_baseline "$@" ;;
     window-preview) subcmd_window_preview "$@" ;;
+    window-preview-report) subcmd_window_preview_report "$@" ;;
     cleanup-report) subcmd_cleanup_report "$@" ;;
     *) lrz_die "Unknown subcommand: $cmd" ;;
   esac
