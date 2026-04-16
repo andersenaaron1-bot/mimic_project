@@ -208,6 +208,16 @@ run_build_sparse_into_root() {
   printf '%s\n' "$sparse_host"
 }
 
+assert_train_baseline_surface() {
+  local help_text=""
+  help_text="$(python "$REPO/scripts/train_transformer_v1.py" --help 2>&1 || true)"
+  [[ "$help_text" == *"--objective_preset"* ]] || lrz_die "Current train_transformer_v1.py is missing --objective_preset. Pull the latest branch before training."
+  [[ "$help_text" == *"--global_context_mode"* ]] || lrz_die "Current train_transformer_v1.py is missing --global_context_mode. Pull the latest branch before training."
+  [[ "$help_text" == *"--carry_state_across_segments"* ]] || lrz_die "Current train_transformer_v1.py is missing --carry_state_across_segments. Pull the latest branch before training."
+  [[ "$help_text" == *"--disable_exact_memory"* ]] || lrz_die "Current train_transformer_v1.py is missing --disable_exact_memory. Pull the latest branch before training."
+  [[ "$help_text" == *"--disable_precedent_memory"* ]] || lrz_die "Current train_transformer_v1.py is missing --disable_precedent_memory. Pull the latest branch before training."
+}
+
 subcmd_show() {
   resolve_context
   cat <<EOF
@@ -297,6 +307,7 @@ subcmd_precompile() {
 
 subcmd_train_baseline() {
   resolve_context
+  assert_train_baseline_surface
   local precomp_host="${CURRENT_PHASE55_PRECOMP_HOST:-}"
   local label="core_marked_latent"
   local run_host=""
