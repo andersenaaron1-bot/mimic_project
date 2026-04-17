@@ -91,6 +91,19 @@ LEGACY_STRUCTURAL_BOUNDARY_PREFIXES = {
 }
 
 
+def _looks_transfer_discharge_like(code_str: Optional[str]) -> bool:
+    if code_str is None:
+        return False
+    upper = str(code_str).strip().upper()
+    if not upper.startswith("TRANSFER_TO//"):
+        return False
+    return (
+        "//DISCHARGE//" in upper
+        or upper.endswith("//DISCHARGE")
+        or "DISCHARGE LOUNGE" in upper
+    )
+
+
 def build_subject_timeline(
     db: mr.SubjectDatabase,
     subject_id: int,
@@ -290,6 +303,8 @@ def build_subject_timeline(
             attrs["transition_admission_like"] = 1
         if code_prefix == "TRANSFER_TO":
             attrs["transition_transfer_like"] = 1
+            if _looks_transfer_discharge_like(code_str):
+                attrs["transition_discharge_like"] = 1
         if code_prefix in {
             "HOSPITAL_DISCHARGE",
             "DISCHARGE",

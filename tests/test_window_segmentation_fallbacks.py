@@ -18,9 +18,22 @@ def test_segment_default_first_window_type_id_applies_to_leading_unknown_window(
             category_id=int(TokenCategory.STRUCTURAL),
             t_from_start_hours=1.0,
             dt_from_prev_hours=1.0,
-            cat_attrs={"window_type_id": 3},
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+                "transition_window_type_id": 3,
+                "window_type_id": 3,
+                "transition_transfer_like": 1,
+            },
             num_attrs={},
             window_hook="episode",
+        ),
+        EventToken(
+            value_id=202,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=2.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
         ),
     ]
     cfg = WindowSegmentationConfig(
@@ -45,9 +58,10 @@ def test_segment_leaves_unknown_trailing_window_untyped() -> None:
             t_from_start_hours=0.0,
             dt_from_prev_hours=0.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 2,
                 "window_type_id": 2,
+                "transition_transfer_like": 1,
             },
             num_attrs={},
             window_hook="episode",
@@ -65,7 +79,10 @@ def test_segment_leaves_unknown_trailing_window_untyped() -> None:
             category_id=int(TokenCategory.STRUCTURAL),
             t_from_start_hours=3.0,
             dt_from_prev_hours=1.0,
-            cat_attrs={"transition_action_id": TRANSITION_ACTION_TO_ID["close_current"]},
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_current"],
+                "transition_discharge_like": 1,
+            },
             num_attrs={},
             window_hook="episode",
         ),
@@ -99,10 +116,10 @@ def test_segment_assigns_post_discharge_window_between_discharge_and_next_opener
             t_from_start_hours=0.0,
             dt_from_prev_hours=0.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 3,
                 "window_type_id": 3,
-                "transition_admission_like": 1,
+                "transition_transfer_like": 1,
             },
             num_attrs={},
             window_hook="episode",
@@ -141,10 +158,10 @@ def test_segment_assigns_post_discharge_window_between_discharge_and_next_opener
             t_from_start_hours=6.0,
             dt_from_prev_hours=4.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 2,
                 "window_type_id": 2,
-                "transition_admission_like": 1,
+                "transition_transfer_like": 1,
             },
             num_attrs={},
             window_hook="episode",
@@ -179,9 +196,10 @@ def test_segment_does_not_create_post_discharge_window_after_death() -> None:
             t_from_start_hours=0.0,
             dt_from_prev_hours=0.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 4,
                 "window_type_id": 4,
+                "transition_transfer_like": 1,
             },
             num_attrs={},
             window_hook="episode",
@@ -355,3 +373,64 @@ def test_segment_allows_immediate_icu_admission_to_override_weak_transfer_suffix
     assert windows[0].window_type_id == 1
     assert windows[1].window_type_id == 4
     assert [tok.value_id for tok in windows[1].tokens[:2]] == [201, 202]
+
+
+def test_segment_treats_discharge_like_transfer_as_closer() -> None:
+    events = [
+        EventToken(
+            value_id=101,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=0.0,
+            dt_from_prev_hours=0.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+                "transition_window_type_id": 2,
+                "window_type_id": 2,
+                "transition_transfer_like": 1,
+            },
+            num_attrs={},
+            window_hook="episode",
+        ),
+        EventToken(
+            value_id=102,
+            category_id=int(TokenCategory.MEASUREMENT),
+            t_from_start_hours=1.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
+        ),
+        EventToken(
+            value_id=103,
+            category_id=int(TokenCategory.STRUCTURAL),
+            t_from_start_hours=2.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+                "transition_window_type_id": 2,
+                "window_type_id": 2,
+                "transition_transfer_like": 1,
+                "transition_discharge_like": 1,
+            },
+            num_attrs={},
+            window_hook="episode",
+        ),
+        EventToken(
+            value_id=104,
+            category_id=int(TokenCategory.DIAGNOSIS),
+            t_from_start_hours=3.0,
+            dt_from_prev_hours=1.0,
+            cat_attrs={},
+            num_attrs={},
+        ),
+    ]
+    cfg = WindowSegmentationConfig(
+        unk_window_type_id=0,
+        default_first_window_type_id=1,
+        post_discharge_window_type_id=6,
+    )
+
+    windows = segment_event_tokens(events, config=cfg)
+    assert len(windows) == 2
+    assert [window.window_type_id for window in windows] == [2, 6]
+    assert [tok.value_id for tok in windows[0].tokens] == [101, 102, 103]
+    assert [tok.value_id for tok in windows[1].tokens] == [104]

@@ -15,11 +15,16 @@ class WindowSegmentationConfig:
     """
     Runtime segmentation policy used by the collator and any future generation code.
 
-    The policy intentionally mirrors the bundle-based audit path:
-      1. detect transition candidates from explicit transition metadata
-      2. group nearby candidates into local bundles
-      3. merge sparse administrative transition chains
-      4. split the linear sequence with directional actions
+    The canonical v2 policy is intentionally conservative:
+      1. the leading unresolved prefix falls back to `default_first_window_type_id`
+      2. only transfer-like boundary tokens causally open typed care-regime windows
+      3. a tiny transfer lookahead may promote that opener to ICU/OR
+      4. discharge-/death-like transitions causally end the active regime
+      5. residue after a discharge-like close falls into `post_discharge_window_type_id`
+
+    Several legacy knobs remain in the config for compatibility with existing
+    manifests and audit scripts, but segmentation no longer uses generic
+    administrative chain-merging or same-site preservation rules.
     """
 
     bundle_gap_hours: float = 0.5
@@ -179,16 +184,16 @@ def _resolve_opening_window_type(
         )
     ]
     if specific_override_tokens:
-        source_tokens = [specific_override_tokens[0]]
+        source_tokens = [specific_override_tokens[-1]]
     else:
         preferred_tokens = [
-        tok for tok in opening_tokens
-        if _token_has_flag(tok, "transition_transfer_like")
+            tok for tok in opening_tokens
+            if _token_has_flag(tok, "transition_transfer_like")
         ]
         if preferred_tokens:
-            source_tokens = [preferred_tokens[0]]
+            source_tokens = [preferred_tokens[-1]]
         else:
-            source_tokens = [opening_tokens[0]]
+            source_tokens = [opening_tokens[-1]]
 
     explicit_ids = [
         int(type_id)
@@ -219,16 +224,16 @@ def _resolve_opening_window_site_id(opening_tokens: List[EventToken]) -> int:
         )
     ]
     if specific_override_tokens:
-        source_tokens = [specific_override_tokens[0]]
+        source_tokens = [specific_override_tokens[-1]]
     else:
         preferred_tokens = [
             tok for tok in opening_tokens
             if _token_has_flag(tok, "transition_transfer_like")
         ]
         if preferred_tokens:
-            source_tokens = [preferred_tokens[0]]
+            source_tokens = [preferred_tokens[-1]]
         else:
-            source_tokens = [opening_tokens[0]]
+            source_tokens = [opening_tokens[-1]]
 
     explicit_ids = [
         int(site_id)
@@ -286,170 +291,71 @@ def _apply_window_type_fallbacks(
     return out
 
 
-def _has_explicit_transition(tokens: List[EventToken]) -> bool:
-    return any(_cat_attr_int(tok, "transition_action_id") is not None for tok in tokens)
-
-
 def _token_has_flag(tok: EventToken, key: str) -> bool:
     val = _cat_attr_int(tok, key)
     return val is not None and int(val) != 0
 
 
-def _should_merge_transition_chain(
-    left_bundle: Dict[str, object],
-    right_bundle: Dict[str, object],
+def _token_is_transfer_opener(tok: EventToken) -> bool:
+    return bool(
+        _token_has_flag(tok, "transition_transfer_like")
+        and not _token_has_flag(tok, "transition_discharge_like")
+        and not _token_has_flag(tok, "transition_death_like")
+    )
+
+
+def _token_is_closer(tok: EventToken) -> bool:
+    return bool(
+        _token_has_flag(tok, "transition_discharge_like")
+        or _token_has_flag(tok, "transition_death_like")
+    )
+
+
+def _window_has_transition_signal(tokens: List[EventToken]) -> bool:
+    return any(
+        _token_transition_action(tok) in ACTIVE_TRANSITION_ACTIONS
+        or _token_has_flag(tok, "transition_discharge_like")
+        or _token_has_flag(tok, "transition_death_like")
+        for tok in tokens
+    )
+
+
+def _window_has_semantic_content(tokens: List[EventToken]) -> bool:
+    for tok in tokens:
+        if int(tok.category_id) != int(TokenCategory.STRUCTURAL):
+            return True
+        if _token_transition_action(tok) is None:
+            return True
+    return False
+
+
+def _collect_transfer_opening_tokens(
     events: List[EventToken],
     *,
+    start_idx: int,
     config: WindowSegmentationConfig,
-) -> bool:
-    if not config.merge_transition_chains:
-        return False
+) -> tuple[List[EventToken], int]:
+    opening_items = [events[int(start_idx)]]
+    anchor_time = float(events[int(start_idx)].t_from_start_hours)
+    lookahead_budget = max(0, int(config.bundle_max_index_gap))
+    idx = int(start_idx) + 1
 
-    left_tokens = events[int(left_bundle["start_idx"]) : int(left_bundle["end_idx"]) + 1]
-    right_tokens = events[int(right_bundle["start_idx"]) : int(right_bundle["end_idx"]) + 1]
-    if not (_has_explicit_transition(left_tokens) and _has_explicit_transition(right_tokens)):
-        return False
-    if any(
-        _token_has_flag(tok, "transition_discharge_like") or _token_has_flag(tok, "transition_death_like")
-        for tok in right_tokens
-    ):
-        return False
-    if (
-        any(_token_has_flag(tok, "transition_discharge_like") for tok in left_tokens)
-        and not any(_token_has_flag(tok, "transition_death_like") for tok in left_tokens)
-        and any(_token_has_flag(tok, "transition_admission_like") for tok in right_tokens)
-    ):
-        return False
+    while idx < len(events) and len(opening_items) - 1 < lookahead_budget:
+        tok = events[idx]
+        if int(tok.category_id) != int(TokenCategory.STRUCTURAL):
+            break
+        if max(0.0, float(tok.t_from_start_hours) - anchor_time) > float(config.bundle_gap_hours):
+            break
+        if not (
+            _token_is_transfer_opener(tok)
+            or _token_has_flag(tok, "transition_icu_like")
+            or _token_has_flag(tok, "transition_or_like")
+        ):
+            break
+        opening_items.append(tok)
+        idx += 1
 
-    start = int(left_bundle["end_idx"]) + 1
-    stop = int(right_bundle["start_idx"])
-    if stop < start:
-        return True
-
-    intervening = events[start:stop]
-    if len(intervening) > int(config.chain_max_intervening_tokens):
-        return False
-    if any(
-        tok.category_id in {
-            int(TokenCategory.MEASUREMENT),
-            int(TokenCategory.DIAGNOSIS),
-            int(TokenCategory.PROCEDURE),
-            int(TokenCategory.MEDICATION),
-        }
-        for tok in intervening
-    ):
-        return False
-
-    left_t = float(events[int(left_bundle["end_idx"])].t_from_start_hours)
-    right_t = float(events[int(right_bundle["start_idx"])].t_from_start_hours)
-    return max(0.0, right_t - left_t) <= float(config.chain_gap_hours)
-
-
-def _build_boundary_bundles(events: List[EventToken], *, config: WindowSegmentationConfig) -> List[Dict[str, object]]:
-    candidates: List[Dict[str, object]] = []
-    for idx, tok in enumerate(events):
-        action = _token_transition_action(tok)
-        if action in ACTIVE_TRANSITION_ACTIONS:
-            candidates.append({"idx": int(idx), "action": str(action)})
-
-    if not candidates:
-        return []
-
-    bundles: List[Dict[str, object]] = []
-    current: Dict[str, object] = {
-        "start_idx": int(candidates[0]["idx"]),
-        "end_idx": int(candidates[0]["idx"]),
-        "candidate_indices": [int(candidates[0]["idx"])],
-        "candidate_actions": [str(candidates[0]["action"])],
-    }
-
-    for cand in candidates[1:]:
-        idx = int(cand["idx"])
-        prev_idx = int(current["candidate_indices"][-1])  # type: ignore[index]
-        time_gap = abs(float(events[idx].t_from_start_hours) - float(events[prev_idx].t_from_start_hours))
-        idx_gap = idx - prev_idx
-        if idx_gap <= int(config.bundle_max_index_gap) and time_gap <= float(config.bundle_gap_hours):
-            current["end_idx"] = idx
-            current["candidate_indices"].append(idx)  # type: ignore[union-attr]
-            current["candidate_actions"].append(str(cand["action"]))  # type: ignore[union-attr]
-        else:
-            bundles.append(dict(current))
-            current = {
-                "start_idx": idx,
-                "end_idx": idx,
-                "candidate_indices": [idx],
-                "candidate_actions": [str(cand["action"])],
-            }
-    bundles.append(dict(current))
-
-    if not config.merge_transition_chains or len(bundles) < 2:
-        return bundles
-
-    merged: List[Dict[str, object]] = [dict(bundles[0])]
-    for bundle in bundles[1:]:
-        prev = merged[-1]
-        if _should_merge_transition_chain(prev, bundle, events, config=config):
-            prev["end_idx"] = int(bundle["end_idx"])
-            prev["candidate_indices"] = list(prev["candidate_indices"]) + list(bundle["candidate_indices"])  # type: ignore[index]
-            prev["candidate_actions"] = list(prev["candidate_actions"]) + list(bundle["candidate_actions"])  # type: ignore[index]
-        else:
-            merged.append(dict(bundle))
-    return merged
-
-
-def _resolve_bundle_action(
-    bundle_tokens: List[EventToken],
-    bundle_candidate_indices: List[int],
-    *,
-    bundle_start_idx: int,
-) -> tuple[str, List[EventToken], List[EventToken]]:
-    candidate_positions = [int(idx) - int(bundle_start_idx) for idx in bundle_candidate_indices]
-    transfer_like_positions = [
-        pos
-        for pos in candidate_positions
-        if 0 <= pos < len(bundle_tokens) and _token_has_flag(bundle_tokens[pos], "transition_transfer_like")
-    ]
-    candidate_actions = [
-        _token_transition_action(bundle_tokens[pos])
-        for pos in candidate_positions
-        if 0 <= pos < len(bundle_tokens)
-    ]
-    open_like_positions = [
-        pos
-        for pos, action in zip(candidate_positions, candidate_actions)
-        if action in {"open_next", "close_open"}
-    ]
-    close_like_positions = [
-        pos
-        for pos, action in zip(candidate_positions, candidate_actions)
-        if action in {"close_current", "close_open"}
-    ]
-
-    if transfer_like_positions:
-        bundle_action = "close_open"
-    elif "close_open" in candidate_actions or (open_like_positions and close_like_positions):
-        bundle_action = "close_open"
-    elif open_like_positions:
-        bundle_action = "open_next"
-    elif close_like_positions:
-        bundle_action = "close_current"
-    else:
-        bundle_action = "open_next"
-
-    if bundle_action == "open_next":
-        return bundle_action, [], list(bundle_tokens)
-    if bundle_action == "close_current":
-        return bundle_action, list(bundle_tokens), []
-
-    if transfer_like_positions:
-        pivot = min(transfer_like_positions)
-    else:
-        pivot = min(open_like_positions) if open_like_positions else max(0, len(bundle_tokens) - 1)
-    closing = list(bundle_tokens[:pivot])
-    opening = list(bundle_tokens[pivot:])
-    if not opening and closing:
-        opening.append(closing.pop())
-    return bundle_action, closing, opening
+    return opening_items, idx
 
 
 def _next_window_type_after_close(
@@ -469,22 +375,6 @@ def _next_window_type_after_close(
     return int(config.unk_window_type_id)
 
 
-def _bundle_opening_context(
-    opening_items: List[EventToken],
-    *,
-    config: WindowSegmentationConfig,
-) -> tuple[int, int]:
-    type_id = _resolve_opening_window_type(opening_items, config=config)
-    site_id = _resolve_opening_window_site_id(opening_items)
-    return int(type_id), int(site_id)
-
-
-def _bundle_time_hours(tokens: List[EventToken]) -> Optional[float]:
-    if not tokens:
-        return None
-    return float(tokens[0].t_from_start_hours)
-
-
 def segment_event_tokens(
     events: List[EventToken],
     *,
@@ -493,22 +383,6 @@ def segment_event_tokens(
     config = config or WindowSegmentationConfig()
     if not events:
         return []
-
-    bundles = _build_boundary_bundles(events, config=config)
-    if not bundles:
-        return _apply_window_type_fallbacks(
-            [
-                SegmentedWindow(
-                    tokens=list(events),
-                    window_type_id=_infer_window_type_from_tokens(list(events), unk_type_id=config.unk_window_type_id),
-                    start_time_hours=float(events[0].t_from_start_hours),
-                    window_site_id=_window_site_id_from_tokens(list(events)),
-                    opening_action=None,
-                    closing_action=None,
-                )
-            ],
-            config=config,
-        )
 
     windows: List[SegmentedWindow] = []
     current_tokens: List[EventToken] = []
@@ -529,9 +403,21 @@ def segment_event_tokens(
         effective_type_id = (
             int(current_type_id)
             if int(current_type_id) != int(config.unk_window_type_id)
-            else _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+            else (
+                _infer_window_type_from_tokens(current_tokens, unk_type_id=config.unk_window_type_id)
+                if not _window_has_transition_signal(current_tokens)
+                else int(config.unk_window_type_id)
+            )
         )
-        effective_site_id = int(current_site_id) if int(current_site_id) > 0 else _window_site_id_from_tokens(current_tokens)
+        effective_site_id = (
+            int(current_site_id)
+            if int(current_site_id) > 0
+            else (
+                _window_site_id_from_tokens(current_tokens)
+                if not _window_has_transition_signal(current_tokens)
+                else 0
+            )
+        )
         closing_items_local = list(closing_items or [])
         if closing_time_hours is None and closing_items_local:
             closing_time_hours_local = float(closing_items_local[-1].t_from_start_hours)
@@ -559,104 +445,56 @@ def segment_event_tokens(
             )
         )
 
-    cursor = 0
-    for bundle in bundles:
-        start_idx = int(bundle["start_idx"])
-        end_idx = int(bundle["end_idx"])
-        if cursor < start_idx:
-            current_tokens.extend(events[cursor:start_idx])
+    idx = 0
+    while idx < len(events):
+        tok = events[idx]
 
-        bundle_tokens = events[start_idx : end_idx + 1]
-        bundle_action, closing_items, opening_items = _resolve_bundle_action(
-            bundle_tokens,
-            list(bundle["candidate_indices"]),  # type: ignore[arg-type]
-            bundle_start_idx=start_idx,
-        )
-        opening_type_id, opening_site_id = _bundle_opening_context(opening_items, config=config)
-        preserve_in_window = bool(
-            config.preserve_same_site_within_window
-            and bundle_action in {"open_next", "close_open"}
-            and current_tokens
-            and int(opening_type_id) != int(config.unk_window_type_id)
-            and int(opening_type_id) == int(current_type_id)
-            and int(opening_site_id) > 0
-            and (
-                int(opening_site_id) == int(current_site_id)
-                or (
-                    not config.site_change_starts_new_window
-                    and int(current_site_id) > 0
-                )
-            )
-        )
-        if preserve_in_window:
-            break_idx = len(current_tokens) + len(closing_items)
-            if break_idx > 0:
-                current_chunk_breaks.append(int(break_idx))
-            current_tokens.extend(closing_items)
-            current_tokens.extend(opening_items)
-            if int(opening_site_id) > 0 and int(opening_site_id) != int(current_site_id):
-                current_site_id = int(opening_site_id)
-            cursor = end_idx + 1
-            continue
-
-        if bundle_action == "close_current":
-            current_tokens.extend(closing_items)
-            if current_tokens:
+        if _token_is_closer(tok):
+            current_tokens.append(tok)
+            if _window_has_semantic_content(current_tokens):
                 _emit_current_window(
-                    closing_action=bundle_action,
-                    closing_items=closing_items,
-                    closing_time_hours=_bundle_time_hours(closing_items),
+                    closing_action="close_current",
+                    closing_items=[tok],
+                    closing_time_hours=float(tok.t_from_start_hours),
                 )
             current_tokens = []
-            current_type_id = _next_window_type_after_close(
-                closing_items,
-                config=config,
-            )
+            current_type_id = _next_window_type_after_close([tok], config=config)
             current_site_id = 0
             current_opening_action = None
             current_opening_time_hours = None
             current_chunk_breaks = []
-        elif bundle_action == "open_next":
-            if current_tokens:
-                _emit_current_window(closing_action=None)
+            idx += 1
+            continue
+
+        if _token_is_transfer_opener(tok):
+            opening_items, next_idx = _collect_transfer_opening_tokens(
+                events,
+                start_idx=idx,
+                config=config,
+            )
+            opening_type_id = _resolve_opening_window_type(opening_items, config=config)
+            opening_site_id = _resolve_opening_window_site_id(opening_items)
+            if current_tokens and _window_has_semantic_content(current_tokens):
+                _emit_current_window(
+                    closing_action="close_open",
+                    closing_items=[],
+                    closing_time_hours=float(opening_items[0].t_from_start_hours),
+                )
             current_tokens = list(opening_items)
             current_type_id = int(opening_type_id)
             current_site_id = int(opening_site_id)
-            current_opening_action = bundle_action
-            current_opening_time_hours = _bundle_time_hours(opening_items)
+            current_opening_action = "close_open"
+            current_opening_time_hours = float(opening_items[0].t_from_start_hours)
             current_chunk_breaks = []
-        elif bundle_action == "close_open":
-            if not current_tokens and not closing_items:
-                current_tokens = list(opening_items)
-                current_type_id = int(opening_type_id)
-                current_site_id = int(opening_site_id)
-                current_opening_action = bundle_action
-                current_opening_time_hours = _bundle_time_hours(opening_items)
-                current_chunk_breaks = []
-            else:
-                current_tokens.extend(closing_items)
-                if current_tokens:
-                    _emit_current_window(
-                        closing_action=bundle_action,
-                        closing_items=closing_items,
-                        closing_time_hours=_bundle_time_hours(closing_items),
-                    )
-                current_tokens = list(opening_items)
-                current_type_id = int(opening_type_id)
-                current_site_id = int(opening_site_id)
-                current_opening_action = bundle_action
-                current_opening_time_hours = _bundle_time_hours(opening_items)
-                current_chunk_breaks = []
-        else:
-            raise ValueError(f"Unsupported bundle action: {bundle_action}")
+            idx = int(next_idx)
+            continue
 
-        cursor = end_idx + 1
-
-    if cursor < len(events):
-        current_tokens.extend(events[cursor:])
+        current_tokens.append(tok)
+        idx += 1
 
     if current_tokens:
-        _emit_current_window(closing_action=None)
+        if _window_has_semantic_content(current_tokens):
+            _emit_current_window(closing_action=None)
 
     return _apply_window_type_fallbacks(windows, config=config)
 

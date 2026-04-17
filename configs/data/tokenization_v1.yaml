@@ -76,9 +76,14 @@ window_markers:
   continue_token_id: 18
 
 window_segmentation:
+  # Simplified causal windowing:
+  # - leading unresolved prefix => HISTORY_PREFIX
+  # - only TRANSFER_TO opens typed care-regime windows
+  # - immediate ICU/OR markers may refine that transfer opener
+  # - discharge/death closers route later residue into POST_DISCHARGE
   bundle_gap_hours: 0.5
   bundle_max_index_gap: 2
-  merge_transition_chains: true
+  merge_transition_chains: false
   chain_gap_hours: 6.0
   chain_max_intervening_tokens: 16
   rebalance_dense_windows: true
@@ -88,5 +93,5 @@ window_segmentation:
   default_first_window_type: HISTORY_PREFIX
   post_discharge_window_type: POST_DISCHARGE
   propagate_prev_type_for_unknown_windows: false
-  preserve_same_site_within_window: true
-  site_change_starts_new_window: true
+  preserve_same_site_within_window: false
+  site_change_starts_new_window: false

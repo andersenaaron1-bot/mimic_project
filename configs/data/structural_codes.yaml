@@ -67,7 +67,7 @@ transition_map:
 
 window_types:
   "UNK": 0
-  "ED_ADMISSION": 1
+  "ED": 1
   "INPATIENT": 2
   "ICU": 3
   "OR": 4
@@ -75,7 +75,7 @@ window_types:
   "HISTORY_PREFIX": 6
 
 window_type_map:
-  "ED_REGISTRATION": "ED_ADMISSION"
+  "ED_REGISTRATION": "ED"
   "ADMISSION": "INPATIENT"
   "HOSPITAL_ADMISSION": "INPATIENT"
   "CAREUNIT_CHANGE": "INPATIENT"

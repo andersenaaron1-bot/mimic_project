@@ -119,8 +119,10 @@ class AETHierarchicalCollator:
     """
     Collates a batch of event-frame timelines into padded (B, W, L, ...) tensors.
 
-    - Windows are segmented with bundle-based transition logic.
-    - Explicit transition metadata is the canonical windowing signal.
+    - Windows are segmented with transfer-driven causal logic.
+    - Explicit transition metadata remains the canonical boundary signal.
+    - Only transfer-like tokens open typed windows; discharge/death closers move
+      later residue into POST_DISCHARGE when configured.
     - token.window_hook remains only as a fallback for older artifacts/tests.
     - Special (window-0) tokens are prefixed to every window.
     - Times are made relative to the start of each window.

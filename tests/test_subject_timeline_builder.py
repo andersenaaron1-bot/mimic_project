@@ -326,6 +326,41 @@ def test_routed_transfer_event_uses_prefix_transition_action_and_infers_ed_windo
     assert tok.value_id == struct_vocab.offset + struct_vocab.code2id["TRANSFER_TO"]
 
 
+def test_routed_transfer_to_discharge_marks_discharge_like_transition() -> None:
+    t0 = datetime(2024, 1, 1, 8, 0, 0)
+    events = [SimpleNamespace(code="TRANSFER_TO//discharge//UNKNOWN", time=t0)]
+    db = DummyDB({1: DummySubject(events)})
+
+    struct_vocab = CategoryVocab(
+        name="struct_raw",
+        offset=50,
+        code2id={"<UNK>": 0, "TRANSFER_TO": 1},
+    )
+    struct_enc = SimpleCategoricalEncoder(TokenCategory.STRUCTURAL, struct_vocab)
+
+    codebook = StructuralCodebook(
+        code2label={},
+        transition_map={"TRANSFER_TO": "close_open"},
+        window_type2id_map={"UNK": 0, "INPATIENT": 3},
+        window_type_map={"TRANSFER_TO": "INPATIENT"},
+    )
+
+    tokens = build_subject_timeline(
+        db,
+        subject_id=1,
+        encoders={TokenCategory.STRUCTURAL: struct_enc},
+        structural_codebook=codebook,
+        window_hook_label="episode",
+    )
+
+    assert len(tokens) == 1
+    tok = tokens[0]
+    assert tok.cat_attrs["transition_action_id"] == TRANSITION_ACTION_TO_ID["close_open"]
+    assert tok.cat_attrs["transition_transfer_like"] == 1
+    assert tok.cat_attrs["transition_discharge_like"] == 1
+    assert tok.window_hook == "episode"
+
+
 def test_routed_meds_birth_transition_is_suppressed_and_not_marked_as_boundary():
     t0 = datetime(2024, 1, 1, 8, 0, 0)
     events = [SimpleNamespace(code="MEDS_BIRTH", time=t0)]

@@ -2,6 +2,7 @@ import pytest
 
 
 def test_collator_can_end_windows_with_next_type_marker() -> None:
+    from ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 
@@ -14,7 +15,7 @@ def test_collator_can_end_windows_with_next_type_marker() -> None:
         num_attrs={},
     )
 
-    # Two windows, split by token2.window_hook.
+    # Two windows, split by a transfer-driven opener.
     token1 = EventToken(
         value_id=100,
         category_id=int(TokenCategory.MEASUREMENT),
@@ -28,7 +29,13 @@ def test_collator_can_end_windows_with_next_type_marker() -> None:
         category_id=int(TokenCategory.STRUCTURAL),
         t_from_start_hours=7.0,
         dt_from_prev_hours=2.0,
-        cat_attrs={"struct_label_id": 0, "window_type_id": 1},
+        cat_attrs={
+            "struct_label_id": 0,
+            "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+            "transition_window_type_id": 1,
+            "window_type_id": 1,
+            "transition_transfer_like": 1,
+        },
         num_attrs={},
         window_hook="episode",
     )

@@ -47,23 +47,23 @@ def _tok(
     )
 
 
-def test_same_site_transfer_stays_one_window_and_forces_chunk_break() -> None:
+def test_consecutive_transfer_burst_without_semantic_content_coalesces() -> None:
     events = [
         _tok(
             1,
             hour=0.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 2,
                 "window_type_id": 2,
                 "transition_site_id": 101,
                 "window_site_id": 101,
+                "transition_transfer_like": 1,
             },
         ),
-        _tok(2, hour=1.0, category=TokenCategory.MEASUREMENT),
         _tok(
             3,
-            hour=2.0,
+            hour=0.2,
             cat_attrs={
                 "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 2,
@@ -75,18 +75,15 @@ def test_same_site_transfer_stays_one_window_and_forces_chunk_break() -> None:
         ),
         _tok(4, hour=2.5, category=TokenCategory.MEASUREMENT),
     ]
-    cfg = WindowSegmentationConfig(
-        unk_window_type_id=0,
-        preserve_same_site_within_window=True,
-        site_change_starts_new_window=True,
-    )
+    cfg = WindowSegmentationConfig(unk_window_type_id=0)
 
     windows = segment_event_tokens(events, config=cfg)
 
     assert len(windows) == 1
     assert windows[0].window_type_id == 2
     assert windows[0].window_site_id == 101
-    assert windows[0].chunk_break_token_indices == [2]
+    assert windows[0].chunk_break_token_indices == []
+    assert [tok.value_id for tok in windows[0].tokens] == [1, 3, 4]
 
     chunked = chunk_segmented_windows(
         windows,
@@ -94,22 +91,22 @@ def test_same_site_transfer_stays_one_window_and_forces_chunk_break() -> None:
         max_chunks_per_window=8,
         config=cfg,
     )
-    assert len(chunked[0].chunks) == 2
-    assert [tok.value_id for tok in chunked[0].chunks[0].tokens] == [1, 2]
-    assert [tok.value_id for tok in chunked[0].chunks[1].tokens] == [3, 4]
+    assert len(chunked[0].chunks) == 1
+    assert [tok.value_id for tok in chunked[0].chunks[0].tokens] == [1, 3, 4]
 
 
-def test_site_change_within_same_macro_type_opens_new_window() -> None:
+def test_transfer_opener_after_semantic_content_starts_new_window() -> None:
     events = [
         _tok(
             1,
             hour=0.0,
             cat_attrs={
-                "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+                "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
                 "transition_window_type_id": 2,
                 "window_type_id": 2,
                 "transition_site_id": 101,
                 "window_site_id": 101,
+                "transition_transfer_like": 1,
             },
         ),
         _tok(2, hour=1.0, category=TokenCategory.MEASUREMENT),

@@ -31,7 +31,7 @@ DEFAULT_TRANSITION_ACTION_BY_PREFIX: Dict[str, str] = {
     "ED_OUT": "close_current",
 }
 DEFAULT_WINDOW_TYPE_NAME_BY_PREFIX: Dict[str, str] = {
-    "ED_REGISTRATION": "ED_ADMISSION",
+    "ED_REGISTRATION": "ED",
     "ADMISSION": "INPATIENT",
     "HOSPITAL_ADMISSION": "INPATIENT",
     "CAREUNIT_CHANGE": "INPATIENT",
@@ -41,8 +41,8 @@ DEFAULT_WINDOW_TYPE_NAME_BY_PREFIX: Dict[str, str] = {
 }
 DEFAULT_WINDOW_TYPE2ID_MAP: Dict[str, int] = {
     "UNK": 0,
-    "ED_ADMISSION": 1,
     "ED": 1,
+    "ED_ADMISSION": 1,
     "INPATIENT": 2,
     "ICU": 3,
     "OR": 4,
@@ -144,7 +144,7 @@ def _infer_macro_window_type_from_code(code_str: str) -> Optional[str]:
     upper = str(code_str).upper()
     prefix = upper.split("//", 1)[0]
     if prefix == "ED_REGISTRATION" or looks_ed_location(upper):
-        return "ED_ADMISSION"
+        return "ED"
     if prefix in {"ICU_ADMISSION", "ICU_DISCHARGE"} or looks_icu_location(upper):
         return "ICU"
     if prefix in {"STRUCT_START_OR", "STRUCT_END_OR"} or looks_or_location(upper):
@@ -173,7 +173,7 @@ def infer_transition_window_type_name_from_code(code: str | None) -> Optional[st
     prefix = upper.split("//", 1)[0]
     if prefix == "TRANSFER_TO":
         if looks_ed_location(upper):
-            return "ED_ADMISSION"
+            return "ED"
         if looks_icu_location(upper):
             return "ICU"
         if looks_or_location(upper):
@@ -254,8 +254,8 @@ def canonical_transition_site_name(*, code: str | None, macro_type: str | None) 
     if macro == "INPATIENT":
         canonical = _match_site_canonical(normalized, INPATIENT_SITE_CANONICALS)
         return f"{macro}::{canonical or normalized}"
-    if macro == "ED_ADMISSION":
-        return f"{macro}::ED"
+    if macro in {"ED", "ED_ADMISSION"}:
+        return "ED::ED"
     if macro == "OR":
         if normalized.startswith("OR ") or normalized == "OR":
             suffix = normalized[3:].strip()
@@ -415,7 +415,7 @@ class StructuralCodebook:
                 return self.window_type_map[prefix]
             if prefix == "TRANSFER_TO":
                 if looks_ed_location(upper):
-                    return "ED_ADMISSION"
+                    return "ED"
                 if looks_icu_location(upper):
                     return "ICU"
                 if looks_or_location(upper):
@@ -423,7 +423,7 @@ class StructuralCodebook:
                 if prefix in self.window_type_map:
                     return self.window_type_map[prefix]
             if looks_ed_location(upper):
-                return "ED_ADMISSION"
+                return "ED"
             if looks_icu_location(upper):
                 return "ICU"
             if looks_or_location(upper):

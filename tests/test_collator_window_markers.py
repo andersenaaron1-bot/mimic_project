@@ -2,6 +2,7 @@ import pytest
 
 
 def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
+    from ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
 
@@ -14,7 +15,7 @@ def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
         num_attrs={},
     )
 
-    # Two windows, split by token2.window_hook.
+    # Two windows, split by a transfer-driven opener.
     token1 = EventToken(
         value_id=100,
         category_id=int(TokenCategory.MEASUREMENT),
@@ -28,7 +29,13 @@ def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
         category_id=int(TokenCategory.STRUCTURAL),
         t_from_start_hours=7.0,
         dt_from_prev_hours=2.0,
-        cat_attrs={"struct_label_id": 0, "window_type_id": 1},
+        cat_attrs={
+            "struct_label_id": 0,
+            "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
+            "transition_window_type_id": 1,
+            "window_type_id": 1,
+            "transition_transfer_like": 1,
+        },
         num_attrs={},
         window_hook="episode",
     )
@@ -67,7 +74,7 @@ def test_collator_inserts_window_markers_and_emits_window_metadata() -> None:
     assert batch["chunk_mask"][0, :2, 0].tolist() == [1, 1]
 
 
-def test_collator_merges_sparse_transition_chain_and_uses_first_causal_opening_type() -> None:
+def test_collator_keeps_nontransfer_admin_markers_inside_leading_history_window() -> None:
     from ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
     from ehr_hier.data.token_types import EventToken, TokenCategory
     from ehr_hier.transformer.collator import AETHierarchicalCollator, WindowMarkerConfig
@@ -141,13 +148,13 @@ def test_collator_merges_sparse_transition_chain_and_uses_first_causal_opening_t
 
     batch = collator([[summary, ed_entry, admin_bridge, hospital_admission, meas, discharge]])
 
-    # One typed regime window rather than ED -> inpatient fragmentation.
+    # No transfer opener: everything stays inside one leading unresolved window.
     assert batch["window_mask"].shape[1] == 1
     assert batch["window_mask"][0].tolist() == [1]
-    assert batch["window_type_ids"][0, 0].item() == 2
+    assert batch["window_type_ids"][0, 0].item() == 0
     assert batch["window_start_times"][0, 0].item() == pytest.approx(0.0, rel=1e-6)
     w0 = batch["input_ids"][0, 0, 0, :8].tolist()
-    assert w0 == [1, 12, 300, 400, 301, 100, 302, 18]
+    assert w0 == [1, 10, 300, 400, 301, 100, 302, 18]
     assert batch["chunk_mask"][0, 0, 0].item() == 1
 
 
@@ -299,10 +306,10 @@ def test_collator_emits_post_discharge_window_chunk_when_tokens_follow_discharge
         t_from_start_hours=0.0,
         dt_from_prev_hours=0.0,
         cat_attrs={
-            "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+            "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
             "transition_window_type_id": 3,
             "window_type_id": 3,
-            "transition_admission_like": 1,
+            "transition_transfer_like": 1,
         },
         num_attrs={},
         window_hook="episode",
@@ -319,6 +326,14 @@ def test_collator_emits_post_discharge_window_chunk_when_tokens_follow_discharge
         num_attrs={},
         window_hook="episode",
     )
+    inpatient_meas = EventToken(
+        value_id=325,
+        category_id=int(TokenCategory.MEASUREMENT),
+        t_from_start_hours=1.0,
+        dt_from_prev_hours=1.0,
+        cat_attrs={},
+        num_attrs={"numeric_value": 2.5},
+    )
     post_dx = EventToken(
         value_id=350,
         category_id=int(TokenCategory.DIAGNOSIS),
@@ -333,10 +348,10 @@ def test_collator_emits_post_discharge_window_chunk_when_tokens_follow_discharge
         t_from_start_hours=6.0,
         dt_from_prev_hours=4.0,
         cat_attrs={
-            "transition_action_id": TRANSITION_ACTION_TO_ID["open_next"],
+            "transition_action_id": TRANSITION_ACTION_TO_ID["close_open"],
             "transition_window_type_id": 2,
             "window_type_id": 2,
-            "transition_admission_like": 1,
+            "transition_transfer_like": 1,
         },
         num_attrs={},
         window_hook="episode",
@@ -364,7 +379,7 @@ def test_collator_emits_post_discharge_window_chunk_when_tokens_follow_discharge
         ),
     )
 
-    batch = collator([[summary, admit, discharge, post_dx, readmit, meas]])
+    batch = collator([[summary, admit, inpatient_meas, discharge, post_dx, readmit, meas]])
 
     assert batch["window_mask"][0, :3].tolist() == [1, 1, 1]
     assert batch["window_type_ids"][0, :3].tolist() == [3, 6, 2]
