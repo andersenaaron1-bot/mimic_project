@@ -88,7 +88,7 @@ grep -q -- '--carry_state_across_segments' "$REPO/scripts/train_transformer_v1.p
 grep -q -- '--disable_exact_memory' "$REPO/scripts/train_transformer_v1.py" || { echo "Trainer surface is stale: missing --disable_exact_memory" >&2; exit 1; }
 grep -q -- '--disable_precedent_memory' "$REPO/scripts/train_transformer_v1.py" || { echo "Trainer surface is stale: missing --disable_precedent_memory" >&2; exit 1; }
 
-mkdir -p "$RUN_HOST/logs"
+mkdir -p "$RUN_HOST/logs" "$RUN_HOST/submit_meta"
 
 submit_run() {
   local name="$1"
@@ -98,16 +98,23 @@ submit_run() {
   local out_ct="$RUN_CT/$name"
   local log_host="$RUN_HOST/logs/${name}_%j.out"
   local runtime_ct="$out_ct/runtime_vocab.json"
+  local submit_host="$RUN_HOST/submit_meta/${name}.sbatch"
 
-  sbatch --parsable \
-    --job-name="$name" \
-    --partition="$GPU_PARTITION" \
-    --gres="$GPU_GRES" \
-    --cpus-per-task=8 \
-    --mem=64G \
-    --time=12:00:00 \
-    --output="$log_host" \
-    --wrap="set -euo pipefail; mkdir -p '$out_ct'; srun --ntasks=1 --container-image='$IMAGE_GPU' --container-mounts='$GPU_MOUNTS' bash -lc 'set -euo pipefail; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; export PYTHONPATH=$REPO_CT:/deps\${PYTHONPATH:+:\$PYTHONPATH}; cd $REPO_CT; python scripts/train_transformer_v1.py --precompiled_train_root $PRECOMP_CT/train_full --precompiled_eval_root $PRECOMP_CT/tuning_1024 --splits_parquet $SPLITS --train_split train --eval_split tuning --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json $SPARSE_V2_CT --medtok_vocab_dir $MEDTOK_VOC_FINAL_CT --medtok_crosswalk_json $CROSSWALK_JSON_CT --codes_parquet_parent_lookup $CODES_PARQUET --runtime_vocab_json $runtime_ct --code2id_pt $ART/code2id.pt --stats_pt $ART/stats.pt --cvae_ckpt $ART/cvae_ckpt.pt --tokenizer_ckpt $ART/value_tokenizer.pt --output_dir $out_ct --objective_preset world_model_mttee --global_context_mode $mode --carry_state_across_segments $exact_flag $precedent_flag --batch_size 8 --eval_batch_size 8 --num_workers 6 --prefetch_factor 4 --grad_accum_steps 2 --max_steps 5000 --save_every_steps 1000 --eval_every_steps 1000 --max_eval_batches 64 --d_model 256 --num_heads 4 --d_ff 512 --num_local_layers 2 --num_global_layers 2 --num_chunk_layers 1 --max_windows 24 --max_chunks_per_window 4 --max_len_per_window 96 --device cuda --amp_dtype bf16 2>&1 | tee $out_ct/train.log'"
+  cat >"$submit_host" <<EOF
+#!/usr/bin/env bash
+#SBATCH --job-name=$name
+#SBATCH --partition=$GPU_PARTITION
+#SBATCH --gres=$GPU_GRES
+#SBATCH --cpus-per-task=8
+#SBATCH --mem=64G
+#SBATCH --time=12:00:00
+#SBATCH --output=$log_host
+set -euo pipefail
+mkdir -p '$out_ct'
+srun --ntasks=1 --container-image='$IMAGE_GPU' --container-mounts='$GPU_MOUNTS' bash -lc "set -euo pipefail; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/train_transformer_v1.py --precompiled_train_root '$PRECOMP_CT/train_full' --precompiled_eval_root '$PRECOMP_CT/tuning_1024' --splits_parquet '$SPLITS' --train_split train --eval_split tuning --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$SPARSE_V2_CT' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --runtime_vocab_json '$runtime_ct' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' --output_dir '$out_ct' --objective_preset world_model_mttee --global_context_mode '$mode' --carry_state_across_segments $exact_flag $precedent_flag --batch_size 8 --eval_batch_size 8 --num_workers 6 --prefetch_factor 4 --grad_accum_steps 2 --max_steps 5000 --save_every_steps 1000 --eval_every_steps 1000 --max_eval_batches 64 --d_model 256 --num_heads 4 --d_ff 512 --num_local_layers 2 --num_global_layers 2 --num_chunk_layers 1 --max_windows 24 --max_chunks_per_window 4 --max_len_per_window 96 --device cuda --amp_dtype bf16 2>&1 | tee '$out_ct/train.log'"
+EOF
+  chmod 700 "$submit_host"
+  sbatch --parsable "$submit_host"
 }
 
 J_LATENT_NOMEM="$(submit_run fmv2_latent_nomemory latent_state --disable_exact_memory --disable_precedent_memory)"
