@@ -12,6 +12,9 @@ GPU_MOUNTS="${GPU_MOUNTS:-$REPO:$REPO_CT,$DSS_HOST:/dss,$DEPS_HOST:/deps}"
 IMAGE_GPU="${IMAGE_GPU:-docker://pytorch/pytorch:2.5.1-cuda12.4-cudnn9-runtime}"
 GPU_PARTITION="${GPU_PARTITION:-auto}"
 GPU_GRES="${GPU_GRES:-gpu:1}"
+AMP_DTYPE="${AMP_DTYPE:-bf16}"
+LRZ_PUBLIC_GPU_PARTITIONS_FAST="${LRZ_PUBLIC_GPU_PARTITIONS_FAST:-lrz-hgx-h100-94x4,lrz-hgx-a100-80x4,lrz-dgx-a100-80x8}"
+LRZ_PUBLIC_GPU_PARTITIONS_LEGACY="${LRZ_PUBLIC_GPU_PARTITIONS_LEGACY:-lrz-dgx-1-v100x8,lrz-dgx-1-p100x8,lrz-hpe-p100x4,lrz-v100x2}"
 
 ART="${ART:-/dss/etl/pipeline_artifacts_20260226_033711}"
 SPLITS="${SPLITS:-/dss/etl/mimiciv_20260224_0114_fresh_img023/out_plain/MEDS_cohort/metadata/subject_splits.parquet}"
@@ -46,6 +49,7 @@ normalize_partition_csv() {
 }
 
 discover_gpu_partitions() {
+  local allow_csv="$1"
   if ! command -v sinfo >/dev/null 2>&1; then
     return 1
   fi
@@ -56,6 +60,7 @@ discover_gpu_partitions() {
           print $1
         }
       ' \
+    | awk -v allow=",$allow_csv," 'index(allow, "," $0 ",") > 0 { print }' \
     | sort -u \
     | paste -sd, -
 }
@@ -64,12 +69,23 @@ resolve_gpu_partitions() {
   local requested="$1"
   if [[ -z "$requested" || "$requested" == "auto" ]]; then
     local discovered=""
-    discovered="$(discover_gpu_partitions || true)"
+    discovered="$(discover_gpu_partitions "$LRZ_PUBLIC_GPU_PARTITIONS_FAST" || true)"
     if [[ -n "$discovered" ]]; then
       normalize_partition_csv "$discovered"
       return 0
     fi
-    printf '%s\n' "lrz-hgx-h100-94x4"
+    printf '%s\n' "$LRZ_PUBLIC_GPU_PARTITIONS_FAST"
+    return 0
+  fi
+  if [[ "$requested" == "auto-public-legacy" || "$requested" == "auto-legacy" ]]; then
+    local allow_csv="$LRZ_PUBLIC_GPU_PARTITIONS_FAST,$LRZ_PUBLIC_GPU_PARTITIONS_LEGACY"
+    local discovered=""
+    discovered="$(discover_gpu_partitions "$allow_csv" || true)"
+    if [[ -n "$discovered" ]]; then
+      normalize_partition_csv "$discovered"
+      return 0
+    fi
+    normalize_partition_csv "$allow_csv"
     return 0
   fi
   normalize_partition_csv "$requested"
@@ -88,9 +104,17 @@ Submits the three immediate decision runs:
 Defaults:
   --precomp-host : latest /dss/.../etl/precompiled_transformer_v2_phase55_*
   --run-root-host: /dss/.../etl/fmv2_phase55_decision_<timestamp>
-  --gpu-partitions: auto, or comma/space-separated Slurm partitions
+  --gpu-partitions: auto, auto-public-legacy, or comma/space-separated Slurm partitions
   --dry-run      : generate and syntax-check sbatch files without submitting
   --print-gpu-partitions: print discovered GPU partitions and exit
+
+Default auto partitions are public LRZ non-MIG A100/H100 partitions from the
+repo-local LRZ compute docs:
+  lrz-hgx-h100-94x4,lrz-hgx-a100-80x4,lrz-dgx-a100-80x8
+
+MCML, test, and MIG partitions are intentionally excluded from auto. V100/P100
+legacy public partitions are excluded from auto because the default command uses
+bf16. To use them explicitly, set AMP_DTYPE=fp16.
 EOF
 }
 
@@ -110,6 +134,7 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+GPU_PARTITION_REQUESTED="$GPU_PARTITION"
 GPU_PARTITION="$(resolve_gpu_partitions "$GPU_PARTITION")"
 
 if [[ "$PRINT_GPU_PARTITIONS" == "1" ]]; then
@@ -144,6 +169,12 @@ grep -q -- '--disable_precedent_memory' "$REPO/scripts/train_transformer_v1.py" 
 [[ -n "$IMAGE_GPU" ]] || { echo "IMAGE_GPU is empty." >&2; exit 1; }
 [[ -n "$GPU_MOUNTS" && "$GPU_MOUNTS" != :* ]] || { echo "GPU_MOUNTS is empty or malformed: $GPU_MOUNTS" >&2; exit 1; }
 [[ -n "$GPU_PARTITION" ]] || { echo "GPU_PARTITION resolved empty." >&2; exit 1; }
+if [[ "$GPU_PARTITION_REQUESTED" == *legacy* || "$GPU_PARTITION" == *v100* || "$GPU_PARTITION" == *p100* ]]; then
+  [[ "$AMP_DTYPE" == "fp16" ]] || {
+    echo "Legacy V100/P100 partitions require AMP_DTYPE=fp16; current AMP_DTYPE=$AMP_DTYPE" >&2
+    exit 1
+  }
+fi
 [[ "$PRECOMP_CT" == /dss/* ]] || { echo "PRECOMP_CT should be a container /dss path, got $PRECOMP_CT" >&2; exit 1; }
 [[ "$RUN_CT" == /dss/* ]] || { echo "RUN_CT should be a container /dss path, got $RUN_CT" >&2; exit 1; }
 
@@ -172,7 +203,7 @@ submit_run() {
 #SBATCH --output=$log_host
 set -euo pipefail
 mkdir -p '$out_host'
-srun --ntasks=1 --container-image='$IMAGE_GPU' --container-mounts='$GPU_MOUNTS' bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/train_transformer_v1.py --precompiled_train_root '$PRECOMP_CT/train_full' --precompiled_eval_root '$PRECOMP_CT/tuning_1024' --splits_parquet '$SPLITS' --train_split train --eval_split tuning --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$SPARSE_V2_CT' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --runtime_vocab_json '$runtime_ct' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' --output_dir '$out_ct' --objective_preset world_model_mttee --global_context_mode '$mode' --carry_state_across_segments $exact_flag $precedent_flag --batch_size 8 --eval_batch_size 8 --num_workers 6 --prefetch_factor 4 --grad_accum_steps 2 --max_steps 5000 --save_every_steps 1000 --eval_every_steps 1000 --max_eval_batches 64 --d_model 256 --num_heads 4 --d_ff 512 --num_local_layers 2 --num_global_layers 2 --num_chunk_layers 1 --max_windows 24 --max_chunks_per_window 4 --max_len_per_window 96 --device cuda --amp_dtype bf16 2>&1 | tee '$out_ct/train.log'"
+srun --ntasks=1 --container-image='$IMAGE_GPU' --container-mounts='$GPU_MOUNTS' bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/train_transformer_v1.py --precompiled_train_root '$PRECOMP_CT/train_full' --precompiled_eval_root '$PRECOMP_CT/tuning_1024' --splits_parquet '$SPLITS' --train_split train --eval_split tuning --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$SPARSE_V2_CT' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --runtime_vocab_json '$runtime_ct' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' --output_dir '$out_ct' --objective_preset world_model_mttee --global_context_mode '$mode' --carry_state_across_segments $exact_flag $precedent_flag --batch_size 8 --eval_batch_size 8 --num_workers 6 --prefetch_factor 4 --grad_accum_steps 2 --max_steps 5000 --save_every_steps 1000 --eval_every_steps 1000 --max_eval_batches 64 --d_model 256 --num_heads 4 --d_ff 512 --num_local_layers 2 --num_global_layers 2 --num_chunk_layers 1 --max_windows 24 --max_chunks_per_window 4 --max_len_per_window 96 --device cuda --amp_dtype '$AMP_DTYPE' 2>&1 | tee '$out_ct/train.log'"
 EOF
   chmod 700 "$submit_host"
   bash -n "$submit_host"
@@ -193,6 +224,7 @@ J_LATENT_PATIENT="$(submit_run fmv2_latent_patient latent_state --enable_exact_m
 printf 'PRECOMP_HOST=%s\n' "$PRECOMP_HOST"
 printf 'RUN_HOST=%s\n' "$RUN_HOST"
 printf 'GPU_PARTITION=%s\n' "$GPU_PARTITION"
+printf 'AMP_DTYPE=%s\n' "$AMP_DTYPE"
 printf 'J_LATENT_NOMEM=%s\n' "$J_LATENT_NOMEM"
 printf 'J_TRANSFORMER_NOMEM=%s\n' "$J_TRANSFORMER_NOMEM"
 printf 'J_LATENT_PATIENT=%s\n' "$J_LATENT_PATIENT"
