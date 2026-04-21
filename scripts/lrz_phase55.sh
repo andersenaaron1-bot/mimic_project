@@ -137,7 +137,7 @@ Subcommands:
       Print the resolved canonical LRZ phase55 paths.
 
   precompile [--label LABEL] [--split train|tuning|both]
-             [--out-host HOST_PATH]
+             [--out-host HOST_PATH] [--dry-run]
       Build a fresh sparse vocab under the precompile root, then compile train
       and/or tuning precompiled timelines. Updates:
         /dss/.../etl/precompiled_transformer_v2_phase55_latest
@@ -193,7 +193,6 @@ run_build_sparse_into_root() {
   local sparse_host="$out_host/token_vocab_sparse_phase55.json"
   local sparse_ct="$out_ct/token_vocab_sparse_phase55.json"
   [[ -f "$sparse_host" ]] && {
-    printf '%s\n' "$sparse_host"
     return 0
   }
   mkdir -p "$out_host"
@@ -205,7 +204,6 @@ run_build_sparse_into_root() {
     --container-image="$IMAGE_CPU" \
     --container-mounts="$CPU_MOUNTS" \
     bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/build_sparse_vocab_contract.py --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_attr_dir artifacts/medtok_attrs --code2id_pt '$ART/code2id.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' --output_json '$sparse_ct' 2>&1 | tee '$out_ct/build_sparse_vocab_contract.log'"
-  printf '%s\n' "$sparse_host"
 }
 
 assert_train_baseline_surface() {
@@ -258,25 +256,53 @@ subcmd_precompile() {
   local label="medmark_fullsubject"
   local split="both"
   local out_host=""
+  local dry_run=0
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --label) label="$2"; shift 2 ;;
       --split) split="$2"; shift 2 ;;
       --out-host) out_host="$2"; shift 2 ;;
+      --dry-run|--validate-only) dry_run=1; shift ;;
       *) lrz_die "Unknown precompile arg: $1" ;;
     esac
   done
+  [[ "$split" == "train" || "$split" == "tuning" || "$split" == "both" ]] || lrz_die "Invalid --split: $split"
   if [[ -z "$out_host" ]]; then
     out_host="$DSS_HOST/etl/precompiled_transformer_v2_phase55_${label}_$(timestamp)"
   fi
   local out_ct
   out_ct="$(host_to_ct "$out_host")"
-  local sparse_host
-  sparse_host="$(run_build_sparse_into_root "$out_host" "$out_ct")"
-  local sparse_ct
-  sparse_ct="$(host_to_ct "$sparse_host")"
-
   mkdir -p "$out_host/logs"
+  touch "$out_host/.write_test" && rm -f "$out_host/.write_test"
+  [[ "$out_ct" == /dss/* ]] || lrz_die "Precompile container path should be under /dss, got: $out_ct"
+  [[ -n "$CPU_MOUNTS" && "$CPU_MOUNTS" != :* ]] || lrz_die "CPU_MOUNTS is empty or malformed: $CPU_MOUNTS"
+  [[ -n "$IMAGE_CPU" ]] || lrz_die "IMAGE_CPU is empty."
+
+  local sparse_host="$out_host/token_vocab_sparse_phase55.json"
+  local sparse_ct="$out_ct/token_vocab_sparse_phase55.json"
+
+  if [[ "$dry_run" == "1" ]]; then
+    cat <<EOF
+PRECOMP_HOST=$out_host
+PRECOMP_CT=$out_ct
+SPARSE_VOC_HOST=$sparse_host
+SPARSE_VOC_CT=$sparse_ct
+SPLIT=$split
+IMAGE_CPU=$IMAGE_CPU
+CPU_MOUNTS=$CPU_MOUNTS
+DB=$DB
+SPLITS=$SPLITS
+CODES_PARQUET=$CODES_PARQUET
+MEDTOK_VOC_FINAL_CT=$MEDTOK_VOC_FINAL_CT
+CROSSWALK_JSON_CT=$CROSSWALK_JSON_CT
+DRY_RUN=1; no jobs submitted.
+EOF
+    return 0
+  fi
+
+  run_build_sparse_into_root "$out_host" "$out_ct"
+  [[ -f "$sparse_host" ]] || lrz_die "Sparse vocab build did not create: $sparse_host"
+
   if [[ "$split" == "train" || "$split" == "both" ]]; then
     srun -p "$LRZ_CPU_PARTITION" \
       --qos="$LRZ_CPU_QOS" \
@@ -286,6 +312,8 @@ subcmd_precompile() {
       --container-image="$IMAGE_CPU" \
       --container-mounts="$CPU_MOUNTS" \
       bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/compile_timelines_v2.py --meds_reader_db '$DB' --splits_parquet '$SPLITS' --split train --output_dir '$out_ct/train_full' --num_workers 32 --num_output_shards 256 --chunksize 1 --progress_every 500 --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$sparse_ct' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' 2>&1 | tee '$out_ct/compile_train_full.log'"
+    [[ -f "$out_host/train_full/index.csv" ]] || lrz_die "Train compile did not create index.csv"
+    [[ -f "$out_host/train_full/manifest.json" ]] || lrz_die "Train compile did not create manifest.json"
   fi
   if [[ "$split" == "tuning" || "$split" == "both" ]]; then
     srun -p "$LRZ_CPU_PARTITION" \
@@ -296,6 +324,8 @@ subcmd_precompile() {
       --container-image="$IMAGE_CPU" \
       --container-mounts="$CPU_MOUNTS" \
       bash -lc "set -euo pipefail; mkdir -p '$out_ct'; export PYTHONPATH='$REPO_CT:/deps'\${PYTHONPATH:+':'\$PYTHONPATH}; cd '$REPO_CT'; python scripts/compile_timelines_v2.py --meds_reader_db '$DB' --splits_parquet '$SPLITS' --split tuning --max_subjects 1024 --sample_seed 1337 --output_dir '$out_ct/tuning_1024' --num_workers 16 --num_output_shards 64 --chunksize 1 --progress_every 100 --trajectory_mode full_subject --post_discharge_cutoff_days 31.0 --tokenization_yaml configs/data/tokenization_v1.yaml --structural_yaml configs/data/structural_codes.yaml --sparse_vocab_json '$sparse_ct' --medtok_vocab_dir '$MEDTOK_VOC_FINAL_CT' --medtok_crosswalk_json '$CROSSWALK_JSON_CT' --codes_parquet_parent_lookup '$CODES_PARQUET' --code2id_pt '$ART/code2id.pt' --stats_pt '$ART/stats.pt' --cvae_ckpt '$ART/cvae_ckpt.pt' --tokenizer_ckpt '$ART/value_tokenizer.pt' 2>&1 | tee '$out_ct/compile_tuning_1024.log'"
+    [[ -f "$out_host/tuning_1024/index.csv" ]] || lrz_die "Tuning compile did not create index.csv"
+    [[ -f "$out_host/tuning_1024/manifest.json" ]] || lrz_die "Tuning compile did not create manifest.json"
   fi
 
   update_latest_link "$out_host" "$DSS_HOST/etl/precompiled_transformer_v2_phase55_latest"

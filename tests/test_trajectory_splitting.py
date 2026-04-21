@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pandas as pd
 
+import src.ehr_hier.data.compile_dataset as compile_mod
 from src.ehr_hier.data.dataset import PrecompiledMEDSDataset
 from src.ehr_hier.data.precompiled_format import save_packed_shard, serialize_timeline_compact
 from src.ehr_hier.data.structural_codes import TRANSITION_ACTION_TO_ID
@@ -274,24 +275,15 @@ def test_precompiled_trajectory_dataset_rebuilds_slice_demographics(tmp_path: Pa
         subject_ids=[101],
         serialized_timelines=[serialize_timeline_compact(full_timeline, metadata=metadata)],
     )
-    pd.DataFrame(
-        [
-            {
-                "subject_id": 101,
-                "rel_path": "shards/000000.ptz",
-                "subject_idx": 0,
-                "trajectory_ord": 0,
-                "split": "train",
-            },
-            {
-                "subject_id": 101,
-                "rel_path": "shards/000000.ptz",
-                "subject_idx": 0,
-                "trajectory_ord": 1,
-                "split": "train",
-            },
-        ]
-    ).to_csv(tmp_path / "trajectory_index.csv", index=False)
+    rows = compile_mod._build_trajectory_index_records(
+        output_dir=str(tmp_path),
+        records=[{"subject_id": 101, "rel_path": "shards/000000.ptz", "subject_idx": 0}],
+        segmentation_config=segmentation_cfg,
+        trajectory_split_config=split_cfg,
+    )
+    rows_df = pd.DataFrame(rows)
+    rows_df["split"] = "train"
+    rows_df.to_csv(tmp_path / "trajectory_index.csv", index=False)
     (tmp_path / "manifest.json").write_text(
         '{"version": 2, "storage_format": "packed_shard_v2"}',
         encoding="utf-8",
@@ -301,8 +293,6 @@ def test_precompiled_trajectory_dataset_rebuilds_slice_demographics(tmp_path: Pa
         str(tmp_path),
         split="train",
         index_filename="trajectory_index.csv",
-        segmentation_config=segmentation_cfg,
-        trajectory_split_config=split_cfg,
     )
 
     assert len(ds) == 2
